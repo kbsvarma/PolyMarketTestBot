@@ -1,0 +1,15 @@
+{
+  "overall": "HEALTHY",
+  "components": [
+    {
+      "name": "auth",
+      "state": "HEALTHY",
+      "detail": "ok",
+      "observed_at": "2026-03-12T01:37:46.373825Z",
+      "age_seconds": 0.0,
+      "metadata": {}
+    }
+  ],
+  "summary": "auth:HEALTHY",
+  "checked_at": "2026-03-12T01:37:46.373837Z"
+}

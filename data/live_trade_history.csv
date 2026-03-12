@@ -1,0 +1,1 @@
+position_id,market_id,token_id,wallet_address,category,entry_style,entry_price,quantity,notional,fees_paid,realized_pnl,unrealized_pnl,entry_reason,exit_reason,cluster_confirmed,hedge_suspicion_score,opened_at,closed

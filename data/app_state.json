@@ -1,0 +1,20 @@
+{
+  "mode": "LIVE",
+  "paused": false,
+  "pause_reason": "",
+  "system_status": "LIVE_READY",
+  "kill_switch": false,
+  "manual_live_enable": false,
+  "manual_resume_required": false,
+  "live_health_state": "DEGRADED",
+  "live_readiness_last_result": {},
+  "last_transition_reason": "ready",
+  "watched_market_tradability_cache": {},
+  "unresolved_live_order_ids": [],
+  "allowance_visible": false,
+  "allowance_sufficient": false,
+  "heartbeat_ok": false,
+  "balance_visible": false,
+  "reconciliation_clean": false,
+  "status": "LIVE_READY"
+}

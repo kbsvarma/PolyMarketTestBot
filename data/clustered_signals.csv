@@ -1,0 +1,2 @@
+cluster_id,market_id,token_id,side,wallet_count,cluster_strength,first_seen,last_seen,category,wallets
+3d28c9fba8aa90af5d8f775a,market-1,token-1,BUY,2,0.6667,2026-03-12T01:37:46.309969Z,2026-03-12T01:37:56.309969Z,politics,"['0x0', '0x1']"

@@ -1,0 +1,16 @@
+position_id,market_id,token_id,wallet_address,category,entry_style,entry_price,quantity,notional,fees_paid,realized_pnl,unrealized_pnl,entry_reason,exit_reason,cluster_confirmed,hedge_suspicion_score,opened_at,closed
+,market-0,token-0,0xWALLET00,crypto price,FOLLOW_TAKER,0.49,0.0,0.3969,0.0,0.0,0.0,No entry style passed all checks.,,False,0.466,2026-03-12T00:55:10.534840+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET01,crypto price,FOLLOW_TAKER,0.49,0.0,0.391608,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4567,2026-03-12T00:55:10.534930+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET02,crypto price,FOLLOW_TAKER,0.49,0.0,0.386316,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4474,2026-03-12T00:55:10.534970+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET00,crypto price,FOLLOW_TAKER,0.49,0.0,0.3969,0.0,0.0,0.0,No entry style passed all checks.,,False,0.466,2026-03-12T00:55:49.347893+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET01,crypto price,FOLLOW_TAKER,0.49,0.0,0.391608,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4567,2026-03-12T00:55:49.348013+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET02,crypto price,FOLLOW_TAKER,0.49,0.0,0.386316,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4474,2026-03-12T00:55:49.348056+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET00,crypto price,FOLLOW_TAKER,0.49,0.0,0.3969,0.0,0.0,0.0,No entry style passed all checks.,,False,0.466,2026-03-12T01:18:59.405599+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET01,crypto price,FOLLOW_TAKER,0.49,0.0,0.391608,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4567,2026-03-12T01:18:59.405731+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET02,crypto price,FOLLOW_TAKER,0.49,0.0,0.386316,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4474,2026-03-12T01:18:59.405915+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET00,crypto price,FOLLOW_TAKER,0.49,0.0,0.3969,0.0,0.0,0.0,No entry style passed all checks.,,False,0.466,2026-03-12T01:19:17.915404+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET01,crypto price,FOLLOW_TAKER,0.49,0.0,0.391608,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4567,2026-03-12T01:19:17.915459+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET02,crypto price,FOLLOW_TAKER,0.49,0.0,0.386316,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4474,2026-03-12T01:19:17.915502+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET00,crypto price,FOLLOW_TAKER,0.49,0.0,0.3969,0.0,0.0,0.0,No entry style passed all checks.,,False,0.466,2026-03-12T01:36:02.830831+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET01,crypto price,FOLLOW_TAKER,0.49,0.0,0.391608,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4567,2026-03-12T01:36:02.830943+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE
+,market-0,token-0,0xWALLET02,crypto price,FOLLOW_TAKER,0.49,0.0,0.386316,0.0,0.0,0.0,No entry style passed all checks.,,False,0.4474,2026-03-12T01:36:02.830981+00:00,True,SKIPPED,NO_VALID_ENTRY_STYLE

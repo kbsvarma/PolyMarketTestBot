@@ -1,0 +1,2 @@
+entry_style,signal_count,fill_rate,missed_trade_rate,avg_slippage,avg_fees,realized_pnl,unrealized_pnl,pnl_by_wallet,pnl_by_category,pnl_by_delay_bucket
+0.0,15,0.0,0.0,0.006,0.0,0.0,0.0,,,5s:0.0|15s:0.0|30s:0.0|60s:0.0

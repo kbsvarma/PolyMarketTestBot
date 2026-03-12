@@ -1,0 +1,12 @@
+{
+  "research_wallets": [
+    "0xWALLET00",
+    "0xWALLET01",
+    "0xWALLET02",
+    "0xWALLET03",
+    "0xWALLET04"
+  ],
+  "category_rows": 10,
+  "replay_rows": 120,
+  "message": "Research snapshot generated."
+}
