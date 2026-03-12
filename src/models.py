@@ -49,6 +49,12 @@ class SourceQuality(str, Enum):
     SYNTHETIC_FALLBACK = "SYNTHETIC_FALLBACK"
 
 
+class TrustLevel(str, Enum):
+    TRUSTWORTHY = "TRUSTWORTHY"
+    DEGRADED = "DEGRADED"
+    NOT_TRUSTWORTHY = "NOT_TRUSTWORTHY"
+
+
 class PaperReadiness(str, Enum):
     STRONG = "STRONG"
     DEGRADED = "DEGRADED"

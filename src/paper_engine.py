@@ -48,6 +48,7 @@ class PaperTradingEngine:
                         "source_quality": decision.context.get("source_quality", ""),
                         "trust_level": decision.context.get("trust_level", ""),
                         "fallback_used": decision.context.get("fallback_used", False),
+                        "counts_as_trustworthy_approval": decision.context.get("counts_as_trustworthy_approval", False),
                         "discovery_state": decision.context.get("discovery_state", ""),
                         "scoring_state": decision.context.get("scoring_state", ""),
                         "style_evaluations": decision.context.get("style_evaluations", []),
@@ -128,6 +129,7 @@ class PaperTradingEngine:
                     "source_quality": decision.context.get("source_quality", ""),
                     "trust_level": decision.context.get("trust_level", ""),
                     "fallback_used": decision.context.get("fallback_used", False),
+                    "counts_as_trustworthy_approval": decision.context.get("counts_as_trustworthy_approval", False),
                     "style_evaluations": decision.context.get("style_evaluations", []),
                 },
             )
