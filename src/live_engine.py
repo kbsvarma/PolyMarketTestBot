@@ -71,6 +71,14 @@ class LiveTradingEngine:
             checks["allowance_detail"] = str(exc)
 
         try:
+            wallet_balances = await self.client.get_wallet_stablecoin_balances()
+            checks["wallet_balance_visible"] = True
+            checks["wallet_balance_detail"] = str(wallet_balances)
+        except Exception as exc:
+            checks["wallet_balance_visible"] = False
+            checks["wallet_balance_detail"] = str(exc)
+
+        try:
             open_orders = await self.client.get_open_orders()
             checks["open_orders_visible"] = True
             checks["open_orders_detail"] = f"{len(open_orders)} orders visible"
@@ -93,7 +101,10 @@ class LiveTradingEngine:
             tradability = []
             for market in list(markets.values())[:3]:
                 tradability.append(await self.market_data.get_tradability(market.market_id, market.token_id))
-            checks["tradability_ok"] = all(bool(item.get("tradable")) for item in tradability) if tradability else False
+            checks["tradability_ok"] = all(
+                isinstance(item, dict) and bool(item.get("market_id")) and bool(item.get("token_id")) and "tradable" in item
+                for item in tradability
+            ) if tradability else False
             checks["tradability_detail"] = str(tradability)
             checks["rest_ok"] = True
             checks["rest_detail"] = "REST and websocket checks passed."
@@ -112,14 +123,48 @@ class LiveTradingEngine:
         health = await self.collect_health()
         checks = await self.startup_validation()
         readiness = build_readiness_result(self.config, self.state, health, checks)
+        positions_payload: list[dict] = []
+        try:
+            positions_payload = await self.client.get_positions()
+        except Exception:
+            positions_payload = []
+        portfolio_current_value = sum(float(item.get("currentValue") or 0.0) for item in positions_payload)
+        portfolio_initial_value = sum(float(item.get("initialValue") or 0.0) for item in positions_payload)
+        connected_proxy_wallet = ""
+        if positions_payload:
+            connected_proxy_wallet = str(positions_payload[0].get("proxyWallet") or "")
+        wallet_stablecoin_balances: dict[str, object] = {}
+        try:
+            wallet_stablecoin_balances = await self.client.get_wallet_stablecoin_balances()
+        except Exception:
+            wallet_stablecoin_balances = {}
         self.state.update_system_status(
             live_health_state=health.overall.value,
             live_readiness_last_result=readiness.model_dump(mode="json"),
             heartbeat_ok=not any(component.name == "heartbeat" and component.state != HealthState.HEALTHY for component in health.components),
             balance_visible=bool(checks.get("balance_visible", False)),
+            balance_detail=str(checks.get("balance_detail", "")),
             allowance_visible=bool(checks.get("allowance_sufficient", False)),
             allowance_sufficient=bool(checks.get("allowance_sufficient", False)),
+            allowance_detail=str(checks.get("allowance_detail", "")),
+            auth_detail=str(checks.get("auth_detail", "")),
+            open_orders_visible=bool(checks.get("open_orders_visible", False)),
+            open_orders_detail=str(checks.get("open_orders_detail", "")),
+            positions_visible=bool(checks.get("positions_visible", False)),
+            positions_detail=str(checks.get("positions_detail", "")),
+            connected_funder_wallet=self.config.env.polymarket_funder,
+            connected_proxy_wallet=connected_proxy_wallet,
+            wallet_balance_visible=bool(checks.get("wallet_balance_visible", False)),
+            wallet_balance_detail=str(checks.get("wallet_balance_detail", "")),
+            wallet_usdc_balance=float(wallet_stablecoin_balances.get("usdc", 0.0) or 0.0),
+            wallet_usdce_balance=float(wallet_stablecoin_balances.get("usdce", 0.0) or 0.0),
+            wallet_total_stablecoins=float(wallet_stablecoin_balances.get("total_stablecoins", 0.0) or 0.0),
+            portfolio_position_value=portfolio_current_value,
+            portfolio_cost_basis=portfolio_initial_value,
+            tradability_ok=bool(checks.get("tradability_ok", False)),
+            tradability_detail=str(checks.get("tradability_detail", "")),
             reconciliation_clean=bool(checks.get("reconciliation_clean", False)),
+            reconciliation_summary=(await self.reconcile()).model_dump(mode="json"),
             live_last_reconciled_at=datetime.now(timezone.utc).isoformat(),
         )
         if self.config.mode.value == "LIVE":

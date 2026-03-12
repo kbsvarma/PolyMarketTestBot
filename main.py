@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.alerts import AlertManager
@@ -10,6 +11,7 @@ from src.config import AppConfig, ensure_runtime_files, load_config
 from src.geoblock import GeoblockChecker
 from src.live_engine import LiveTradingEngine
 from src.logger import setup_logging
+from src.logger import logger
 from src.paper_engine import PaperTradingEngine
 from src.reporting import ReportWriter
 from src.scheduler import AppScheduler
@@ -31,7 +33,12 @@ async def run() -> None:
     alerts = AlertManager(config, root / "logs")
     geoblock = GeoblockChecker(config)
     eligibility = geoblock.preflight_status()
-    state.update_system_status(mode=config.mode.value, eligibility=eligibility.model_dump())
+    state.update_system_status(
+        mode=config.mode.value,
+        system_status=config.mode.value,
+        status=config.mode.value,
+        eligibility=eligibility.model_dump(),
+    )
 
     discovery = WalletDiscoveryService(config, root / "data")
     scorer = WalletScoringService(config, root / "data")
@@ -44,7 +51,15 @@ async def run() -> None:
     reporter = ReportWriter(config, root / "data", state)
     analytics = AnalyticsEngine(config, root / "data")
 
-    if config.mode.value == "LIVE":
+    has_wallet_credentials = bool(
+        config.env.polymarket_private_key
+        and config.env.polymarket_funder
+        and config.env.polymarket_api_key
+        and config.env.polymarket_api_secret
+        and config.env.polymarket_api_passphrase
+    )
+
+    if config.mode.value == "LIVE" or has_wallet_credentials:
         await live_engine.refresh_live_status()
 
     wallets = await discovery.run_discovery_cycle()
@@ -58,14 +73,48 @@ async def run() -> None:
     scheduler = AppScheduler(config)
 
     async def cycle() -> None:
-        watched_wallets = approved_wallets.live_wallets if config.mode.value == "LIVE" else approved_wallets.paper_wallets
+        cycle_started_at = datetime.now(timezone.utc).isoformat()
+        state_snapshot = state.read()
+        state.update_system_status(bot_loop_running=True, last_cycle_started_at=cycle_started_at)
+        if config.mode.value == "LIVE":
+            watched_wallets = approved_wallets.live_wallets
+        else:
+            watched_wallets = approved_wallets.paper_wallets or approved_wallets.research_wallets[: config.wallet_selection.approved_paper_wallets]
+            if not watched_wallets:
+                watched_wallets = [
+                    wallet
+                    for wallet in state_snapshot.get("last_cycle_watched_wallets", [])
+                    if isinstance(wallet, str) and not wallet.upper().startswith("0XWALLET")
+                ]
+        logger.info(
+            "Cycle start mode={} paper_run_enabled={} watched_wallet_count={} watched_wallets={}",
+            config.mode.value,
+            state_snapshot.get("paper_run_enabled", False),
+            len(watched_wallets),
+            watched_wallets,
+        )
         detections = await monitor.poll_wallets(watched_wallets)
         decisions = await strategy.process_detections(detections, approved_wallets, scored_wallets)
-        paper_engine.handle_decisions(decisions)
+        if config.mode.value != "PAPER" or state_snapshot.get("paper_run_enabled", False):
+            await paper_engine.handle_decisions(decisions)
         await live_engine.handle_decisions(decisions)
         reporter.write_daily_summary(scored_wallets, decisions)
         analytics.write_strategy_comparison()
         alerts.emit_health_alerts(state.read())
+        state.update_system_status(
+            bot_loop_running=True,
+            last_cycle_completed_at=datetime.now(timezone.utc).isoformat(),
+            last_cycle_detection_count=len(detections),
+            last_cycle_decision_count=len(decisions),
+            last_cycle_watched_wallets=watched_wallets,
+        )
+        logger.info(
+            "Cycle complete mode={} detections={} decisions={} paper_run_enabled={}",
+            config.mode.value,
+            len(detections),
+            len(decisions),
+            state_snapshot.get("paper_run_enabled", False),
+        )
 
     await cycle()
 

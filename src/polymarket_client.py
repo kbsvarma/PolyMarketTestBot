@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any
 
 try:
@@ -10,9 +11,12 @@ except ImportError:  # pragma: no cover
 
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams, OrderArgs, OrderType
 except ImportError:  # pragma: no cover
     ClobClient = None
+    ApiCreds = None
+    AssetType = None
+    BalanceAllowanceParams = None
     OrderArgs = None
     OrderType = None
 
@@ -47,36 +51,107 @@ class PolymarketClient:
         self.data_url = config.endpoints.data_base_url.rstrip("/")
         self.headers = {"User-Agent": config.endpoints.user_agent}
         self.client = httpx.AsyncClient(timeout=12.0, headers=self.headers) if httpx else None
+        self._sdk_init_error = ""
         self._sdk_client = self._build_sdk_client()
 
     def _build_sdk_client(self) -> Any:
         if ClobClient is None:
+            self._sdk_init_error = "py-clob-client import failed."
             return None
         if not self.config.env.polymarket_private_key:
+            self._sdk_init_error = "POLYMARKET_PRIVATE_KEY is missing."
             return None
         try:
+            creds = None
+            if (
+                ApiCreds is not None
+                and self.config.env.polymarket_api_key
+                and self.config.env.polymarket_api_secret
+                and self.config.env.polymarket_api_passphrase
+            ):
+                creds = ApiCreds(
+                    api_key=self.config.env.polymarket_api_key,
+                    api_secret=self.config.env.polymarket_api_secret,
+                    api_passphrase=self.config.env.polymarket_api_passphrase,
+                )
             client = ClobClient(
                 host=self.base_url,
                 chain_id=self.config.env.polymarket_chain_id,
                 key=self.config.env.polymarket_private_key,
-                creds=None,
+                creds=creds,
                 funder=self.config.env.polymarket_funder or None,
             )
-            if hasattr(client, "create_or_derive_api_creds"):
+            if creds is not None and hasattr(client, "set_api_creds"):
+                client.set_api_creds(creds)
+            elif hasattr(client, "create_or_derive_api_creds"):
                 creds = client.create_or_derive_api_creds()
                 client.set_api_creds(creds)
+            self._sdk_init_error = ""
             return client
-        except Exception:
+        except Exception as exc:
+            self._sdk_init_error = str(exc)
             return None
 
     async def close(self) -> None:
         if self.client:
             await self.client.aclose()
 
+    async def _rpc_call(self, method: str, params: list[Any]) -> Any:
+        if not self.client:
+            raise RuntimeError("httpx unavailable")
+        candidates = [
+            self.config.env.polygon_rpc_url,
+            "https://polygon-bor-rpc.publicnode.com",
+            "https://polygon.drpc.org",
+        ]
+        last_error = "Polygon RPC request failed."
+        for url in dict.fromkeys(candidates):
+            try:
+                response = await self.client.post(
+                    url,
+                    json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if "error" in payload:
+                    last_error = str(payload["error"])
+                    continue
+                return payload.get("result")
+            except Exception as exc:
+                last_error = str(exc)
+        raise RuntimeError(last_error)
+
+    async def _erc20_balance(self, wallet_address: str, token_address: str, decimals: int = 6) -> float:
+        if not wallet_address or not token_address:
+            return 0.0
+        wallet = wallet_address.lower().replace("0x", "").rjust(64, "0")
+        data = f"0x70a08231{wallet}"
+        result = await self._rpc_call(
+            "eth_call",
+            [{"to": token_address, "data": data}, "latest"],
+        )
+        if not result:
+            return 0.0
+        raw_value = int(result, 16)
+        return float(Decimal(raw_value) / Decimal(10**decimals))
+
+    async def get_wallet_stablecoin_balances(self) -> dict[str, Any]:
+        if not self.config.env.polymarket_funder:
+            return {"wallet_address": "", "usdc": 0.0, "usdce": 0.0, "total_stablecoins": 0.0}
+        usdc = await self._erc20_balance(self.config.env.polymarket_funder, self.config.env.polygon_usdc_address)
+        usdce = await self._erc20_balance(self.config.env.polymarket_funder, self.config.env.polygon_usdce_address)
+        return {
+            "wallet_address": self.config.env.polymarket_funder,
+            "usdc": usdc,
+            "usdce": usdce,
+            "total_stablecoins": usdc + usdce,
+        }
+
     async def health_check(self) -> HealthStatus:
         if self._mode_value() == "LIVE":
             if self._sdk_client is None:
-                return HealthStatus(ok=False, detail="py-clob-client not available or live credentials are incomplete.")
+                detail = self._sdk_init_error or "py-clob-client not available or live credentials are incomplete."
+                return HealthStatus(ok=False, detail=detail)
             missing = [
                 name
                 for name, value in {
@@ -155,6 +230,7 @@ class PolymarketClient:
             (f"{self.data_url}/activity", {"user": wallet_address, "limit": limit}),
             (f"{self.data_url}/trades", {"user": wallet_address, "limit": limit}),
             (f"{self.gamma_url}/activity", {"address": wallet_address, "limit": limit}),
+            (f"{self.gamma_url}/trades", {"address": wallet_address, "limit": limit}),
         ]
         for url, params in candidates:
             try:
@@ -166,7 +242,7 @@ class PolymarketClient:
                 continue
         if self._live_mode():
             raise RuntimeError(f"Unable to fetch real wallet activity for {wallet_address} in LIVE mode.")
-        return self._fallback_wallet_activity(wallet_address)
+        return self._fallback_wallet_activity(wallet_address) if self._mode_value() == "RESEARCH" else []
 
     async def fetch_leaderboard(self, limit: int = 50) -> list[dict[str, Any]]:
         candidates = [
@@ -183,7 +259,44 @@ class PolymarketClient:
                 continue
         if self._live_mode():
             raise RuntimeError("Unable to fetch real leaderboard in LIVE mode.")
-        return [{"wallet_address": f"0xWALLET{i:02d}", "profit_pct": 0.08 + i * 0.01, "volume": 800 + i * 120} for i in range(10)]
+        return []
+
+    async def fetch_top_holders(self, market_ids: list[str], per_market_limit: int = 10) -> list[dict[str, Any]]:
+        if not market_ids:
+            return []
+        candidates = [
+            (f"{self.data_url}/holders", {"market": ",".join(market_ids), "limit": per_market_limit, "minBalance": 1}),
+        ]
+        for url, params in candidates:
+            try:
+                payload = await self._get_json(url, params=params)
+                rows = payload if isinstance(payload, list) else payload.get("data", payload.get("holders", []))
+                if rows:
+                    return rows
+            except Exception:
+                continue
+        if self._live_mode():
+            raise RuntimeError("Unable to fetch top holders in LIVE mode.")
+        return []
+
+    async def fetch_recent_public_activity(self, limit: int = 200) -> list[dict[str, Any]]:
+        candidates = [
+            (f"{self.data_url}/activity", {"limit": limit}),
+            (f"{self.data_url}/trades", {"limit": limit}),
+            (f"{self.gamma_url}/activity", {"limit": limit}),
+            (f"{self.gamma_url}/trades", {"limit": limit}),
+        ]
+        for url, params in candidates:
+            try:
+                payload = await self._get_json(url, params=params)
+                rows = payload if isinstance(payload, list) else payload.get("history", payload.get("data", []))
+                if rows:
+                    return rows
+            except Exception:
+                continue
+        if self._live_mode():
+            raise RuntimeError("Unable to fetch public recent activity in LIVE mode.")
+        return []
 
     async def get_orderbook(self, token_id: str) -> OrderbookSnapshot:
         try:
@@ -209,7 +322,8 @@ class PolymarketClient:
             return {"cash_usd": self.config.bankroll.live_bankroll_reference, "source": "reference"}
         try:
             if hasattr(self._sdk_client, "get_balance_allowance"):
-                payload = self._sdk_client.get_balance_allowance({"asset_type": "COLLATERAL"})
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL) if BalanceAllowanceParams and AssetType else None
+                payload = self._sdk_client.get_balance_allowance(params)
             elif hasattr(self._sdk_client, "get_balance"):
                 payload = self._sdk_client.get_balance()
             else:
@@ -227,7 +341,8 @@ class PolymarketClient:
             return {"available": self.config.bankroll.live_bankroll_reference, "sufficient": True, "source": "reference"}
         try:
             if hasattr(self._sdk_client, "get_balance_allowance"):
-                payload = self._sdk_client.get_balance_allowance({"asset_type": "COLLATERAL"})
+                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL) if BalanceAllowanceParams and AssetType else None
+                payload = self._sdk_client.get_balance_allowance(params)
                 available = float(payload.get("available") or payload.get("balance") or payload.get("allowance") or 0.0)
                 return {"available": available, "sufficient": available > 0, "raw": payload}
             if hasattr(self._sdk_client, "get_balance"):

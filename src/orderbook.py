@@ -21,6 +21,7 @@ def estimate_fill(orderbook: OrderbookSnapshot, target_notional: float, max_slip
     total_depth = sum(level.price * level.size for level in orderbook.asks)
     remaining = target_notional
     cost = 0.0
+    filled_size = 0.0
     filled_notional = 0.0
     consumed = 0.0
     for level in orderbook.asks:
@@ -28,14 +29,16 @@ def estimate_fill(orderbook: OrderbookSnapshot, target_notional: float, max_slip
         take = min(level_notional, remaining)
         if take <= 0:
             break
+        take_size = take / max(level.price, 1e-9)
         cost += take
+        filled_size += take_size
         filled_notional += take
         consumed += level_notional
         remaining -= take
         if remaining <= 1e-9:
             break
     fillable = remaining <= 1e-9
-    executable_price = cost / filled_notional if filled_notional else best_ask
+    executable_price = cost / filled_size if filled_size else best_ask
     slippage_pct = (executable_price - best_ask) / max(best_ask, 1e-6)
     reason = "OK" if fillable and slippage_pct <= max_slippage_pct else "Insufficient depth or slippage too high."
     return FillEstimate(

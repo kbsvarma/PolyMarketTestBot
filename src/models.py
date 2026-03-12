@@ -245,6 +245,7 @@ class Position(BaseModel):
     source_exit_following_enabled: bool = False
     exit_state: str = ""
     last_reconciled_at: datetime | None = None
+    closed_at: datetime | None = None
     source_wallet: str = ""
     entry_time: datetime | None = None
     entry_size: float = 0.0

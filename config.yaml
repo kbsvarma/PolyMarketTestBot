@@ -1,4 +1,4 @@
-mode: RESEARCH
+mode: PAPER
 runtime:
   ui_refresh_seconds: 15
   discovery_interval_minutes: 45

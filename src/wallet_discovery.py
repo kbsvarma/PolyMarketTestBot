@@ -19,9 +19,29 @@ class WalletDiscoveryService:
 
     async def run_discovery_cycle(self) -> list[WalletMetrics]:
         leaderboard = await self.client.fetch_leaderboard(limit=20)
+        leaderboard = [item for item in leaderboard if not self._is_placeholder_wallet(item)]
         markets = await self.client.fetch_markets(limit=60)
         market_by_id = {market.market_id: market for market in markets}
         categories = self.config.categories.tracked or ["politics", "crypto price", "macro / economics"]
+        leaderboard_addresses = {
+            str(
+                item.get("wallet_address")
+                or item.get("wallet")
+                or item.get("address")
+                or item.get("proxyWallet")
+                or item.get("user")
+                or ""
+            )
+            for item in leaderboard
+        }
+        leaderboard_addresses.discard("")
+
+        if not leaderboard_addresses:
+            holder_candidates = await self._discover_from_market_holders(markets)
+            leaderboard = holder_candidates
+        if not leaderboard:
+            activity_candidates = await self._discover_from_recent_activity()
+            leaderboard = activity_candidates
 
         wallets: list[WalletMetrics] = []
         for item in leaderboard:
@@ -32,6 +52,8 @@ class WalletDiscoveryService:
                 or item.get("proxyWallet")
                 or ""
             )
+            if self._is_placeholder_address(wallet_address):
+                continue
             if not wallet_address:
                 continue
             activities = await self.client.fetch_wallet_activity(wallet_address, limit=80)
@@ -41,10 +63,96 @@ class WalletDiscoveryService:
             wallets.append(metrics)
 
         if not wallets:
-            wallets = self._fallback_wallets(categories)
+            if self.config.mode.value == "RESEARCH":
+                wallets = self._fallback_wallets(categories)
+            else:
+                wallets = []
 
         write_json(self.data_dir / "top_wallets.json", [wallet.model_dump(mode="json") for wallet in wallets])
         return wallets
+
+    async def _discover_from_market_holders(self, markets: list[object]) -> list[dict[str, object]]:
+        active_markets = [
+            market
+            for market in markets
+            if getattr(market, "active", False) and not getattr(market, "closed", False)
+        ]
+        active_markets.sort(key=lambda market: float(getattr(market, "liquidity", 0.0) or 0.0), reverse=True)
+        market_ids = [str(getattr(market, "market_id", "")) for market in active_markets[:10] if getattr(market, "market_id", "")]
+        holders = await self.client.fetch_top_holders(market_ids, per_market_limit=12)
+        candidates: dict[str, dict[str, object]] = {}
+        for row in holders:
+            wallet_address = str(
+                row.get("wallet_address")
+                or row.get("holder")
+                or row.get("address")
+                or row.get("proxyWallet")
+                or row.get("user")
+                or ""
+            )
+            if self._is_placeholder_address(wallet_address):
+                continue
+            if not wallet_address:
+                continue
+            if wallet_address not in candidates:
+                candidates[wallet_address] = {
+                    "wallet_address": wallet_address,
+                    "volume": float(row.get("shares") or row.get("amount") or row.get("balance") or 0.0),
+                }
+            else:
+                candidates[wallet_address]["volume"] = float(candidates[wallet_address]["volume"]) + float(
+                    row.get("shares") or row.get("amount") or row.get("balance") or 0.0
+                )
+        rows = list(candidates.values())
+        rows.sort(key=lambda item: float(item.get("volume") or 0.0), reverse=True)
+        return rows[:20]
+
+    async def _discover_from_recent_activity(self) -> list[dict[str, object]]:
+        activity = await self.client.fetch_recent_public_activity(limit=250)
+        candidates: dict[str, dict[str, object]] = {}
+        for row in activity:
+            wallet_address = str(
+                row.get("wallet_address")
+                or row.get("wallet")
+                or row.get("address")
+                or row.get("proxyWallet")
+                or row.get("user")
+                or row.get("makerAddress")
+                or row.get("takerAddress")
+                or ""
+            )
+            if self._is_placeholder_address(wallet_address) or not wallet_address:
+                continue
+            score = float(row.get("size") or row.get("amount") or row.get("shares") or row.get("volume") or 0.0)
+            existing = candidates.get(wallet_address)
+            if existing is None:
+                candidates[wallet_address] = {"wallet_address": wallet_address, "volume": score, "activity_count": 1}
+            else:
+                existing["volume"] = float(existing.get("volume") or 0.0) + score
+                existing["activity_count"] = int(existing.get("activity_count") or 0) + 1
+        rows = list(candidates.values())
+        rows.sort(
+            key=lambda item: (
+                int(item.get("activity_count") or 0),
+                float(item.get("volume") or 0.0),
+            ),
+            reverse=True,
+        )
+        return rows[:30]
+
+    def _is_placeholder_wallet(self, item: dict[str, object]) -> bool:
+        wallet_address = str(
+            item.get("wallet_address")
+            or item.get("wallet")
+            or item.get("address")
+            or item.get("proxyWallet")
+            or item.get("user")
+            or ""
+        )
+        return self._is_placeholder_address(wallet_address)
+
+    def _is_placeholder_address(self, wallet_address: str) -> bool:
+        return wallet_address.upper().startswith("0XWALLET")
 
     def _build_metrics(
         self,

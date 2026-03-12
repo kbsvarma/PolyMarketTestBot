@@ -1,21 +1,41 @@
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
+import sys
+from datetime import datetime, timezone
+import asyncio
 
 import pandas as pd
 import streamlit as st
 import yaml
-
+from pandas.errors import ParserError
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from src.state import AppStateStore
+from src.config import load_config
+from src.geoblock import GeoblockChecker
+from src.live_engine import LiveTradingEngine
+
+
 DATA = ROOT / "data"
 LOGS = ROOT / "logs"
+STATE_STORE = AppStateStore(DATA / "app_state.json")
 
 
 def load_csv(name: str) -> pd.DataFrame:
     path = DATA / name
-    return pd.read_csv(path) if path.exists() and path.stat().st_size > 0 else pd.DataFrame()
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except ParserError:
+        st.warning(f"{name} contains malformed rows. Showing the readable subset only.")
+        return pd.read_csv(path, engine="python", on_bad_lines="skip")
 
 
 def load_json(name: str) -> dict | list:
@@ -37,6 +57,12 @@ def load_jsonl_tail(name: str, lines: int = 10) -> list[dict]:
     return rows
 
 
+def render_jsonl_lines(rows: list[dict]) -> str:
+    if not rows:
+        return "No recent activity."
+    return "\n".join(json.dumps(row, default=str) for row in rows)
+
+
 def load_log_tail(name: str, lines: int = 25) -> str:
     path = LOGS / name
     if not path.exists():
@@ -44,10 +70,101 @@ def load_log_tail(name: str, lines: int = 25) -> str:
     return "\n".join(path.read_text(encoding="utf-8").splitlines()[-lines:])
 
 
+def health_component(health: dict, name: str) -> dict:
+    components = health.get("components", []) if isinstance(health, dict) else []
+    for component in components:
+        if component.get("name") == name:
+            return component
+    return {}
+
+
+def parse_detail_mapping(detail: object) -> dict:
+    if isinstance(detail, dict):
+        return detail
+    if not detail:
+        return {}
+    text = str(detail).strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        try:
+            parsed = ast.literal_eval(text)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, SyntaxError):
+            return {}
+
+
+def wallet_balance_text(state: dict) -> str:
+    payload = parse_detail_mapping(state.get("balance_detail", ""))
+    raw_balance = payload.get("cash_usd", payload.get("available", payload.get("balance", "")))
+    if raw_balance in ("", None):
+        return "N/A"
+    try:
+        return f"${float(raw_balance):,.2f}"
+    except (TypeError, ValueError):
+        return str(raw_balance)
+
+
+def currency_text(value: object) -> str:
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def parse_iso_datetime(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def bot_runtime_status(state: dict, refresh_seconds: int) -> tuple[str, str]:
+    last_started = parse_iso_datetime(state.get("last_cycle_started_at"))
+    last_cycle = parse_iso_datetime(state.get("last_cycle_completed_at"))
+    if state.get("bot_loop_running") and last_started is not None:
+        started_age = (datetime.now(timezone.utc) - last_started).total_seconds()
+        if started_age <= max(refresh_seconds * 4, 180):
+            return ("RUNNING", f"Cycle in progress, started {int(started_age)}s ago")
+    if last_cycle is None:
+        return ("STOPPED", "No completed bot cycle recorded yet.")
+    age = (datetime.now(timezone.utc) - last_cycle).total_seconds()
+    if age <= max(refresh_seconds * 2, 45):
+        return ("RUNNING", f"Last cycle {int(age)}s ago")
+    return ("IDLE", f"Last cycle {int(age)}s ago")
+
+
+def paper_positions_frame(positions_payload: dict | list) -> pd.DataFrame:
+    if isinstance(positions_payload, dict):
+        rows = positions_payload.get("paper", [])
+        return pd.DataFrame(rows) if isinstance(rows, list) else pd.DataFrame()
+    return pd.DataFrame()
+
+
+def placeholder_wallets(wallets: list[object]) -> bool:
+    return bool(wallets) and all(str(wallet).startswith("0xWALLET") for wallet in wallets)
+
+
 def main() -> None:
     st.set_page_config(page_title="Polymarket Live Operator Console", layout="wide")
     st.title("Polymarket Wallet-Following Operator Console")
     st.caption("Live-readiness, health, reconciliation, and risk console for a tightly gated wallet-following bot.")
+    flash_message = st.session_state.pop("paper_flash_message", "")
+    flash_level = st.session_state.pop("paper_flash_level", "info")
+    control_cols = st.columns([0.2, 0.25, 0.55])
+    if control_cols[0].button("Refresh Dashboard", use_container_width=True):
+        st.rerun()
+    if control_cols[1].button("Refresh Wallet Status", use_container_width=True):
+        config_obj = load_config(ROOT / "config.yaml", ROOT / ".env")
+        engine = LiveTradingEngine(config_obj, DATA, STATE_STORE, GeoblockChecker(config_obj))
+        asyncio.run(engine.refresh_live_status())
+        st.session_state["paper_flash_message"] = "Wallet status refreshed."
+        st.session_state["paper_flash_level"] = "success"
+        st.rerun()
+    control_cols[2].caption(f"Dashboard loaded at {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
 
     config = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8"))
     state = load_json("app_state.json")
@@ -60,6 +177,14 @@ def main() -> None:
     strategy = load_csv("strategy_comparison.csv")
     paper = load_csv("paper_trade_history.csv")
     live = load_csv("live_trade_history.csv")
+    positions_payload = load_json("positions.json")
+    paper_positions = paper_positions_frame(positions_payload)
+    paper_summary = state.get("paper_summary", {}) if isinstance(state, dict) else {}
+    paper_events = pd.DataFrame(load_jsonl_tail("paper_audit.jsonl", lines=30))
+    runtime_state, runtime_detail = bot_runtime_status(state, int(config.get("runtime", {}).get("polling_interval_seconds", 20)))
+    watched_wallets = state.get("last_cycle_watched_wallets", [])
+    using_placeholder_wallets = placeholder_wallets(watched_wallets)
+    no_real_wallets = not watched_wallets
 
     with st.sidebar:
         st.subheader("System")
@@ -67,7 +192,7 @@ def main() -> None:
         st.subheader("Live Readiness")
         st.json(state.get("live_readiness_last_result", {}))
         st.subheader("Config")
-        st.yaml(config)
+        st.code(yaml.safe_dump(config, sort_keys=False), language="yaml")
 
     top = st.columns(6)
     top[0].metric("Mode", state.get("mode", config.get("mode", "RESEARCH")))
@@ -77,6 +202,17 @@ def main() -> None:
     top[4].metric("Kill Switch", "ON" if state.get("kill_switch") else "OFF")
     top[5].metric("Heartbeat", "OK" if state.get("heartbeat_ok") else "BAD")
 
+    balance_component = health_component(health, "balance")
+    allowance_component = health_component(health, "allowance")
+    wallet_row = st.columns(7)
+    wallet_row[0].metric("Wallet Auth", "OK" if state.get("auth_detail") else "UNKNOWN")
+    wallet_row[1].metric("Wallet Stablecoins", currency_text(state.get("wallet_total_stablecoins")))
+    wallet_row[2].metric("Spendable USDC", wallet_balance_text(state))
+    wallet_row[3].metric("Position Value", currency_text(state.get("portfolio_position_value")))
+    wallet_row[4].metric("Balance Visible", "YES" if state.get("balance_visible") else "NO")
+    wallet_row[5].metric("Allowance", "OK" if state.get("allowance_sufficient") else "NOT READY")
+    wallet_row[6].metric("Exchange Positions", str(state.get("positions_detail", "0 positions visible")).split(" ")[0] if state.get("positions_detail") else "0")
+
     row1_left, row1_right = st.columns([1.1, 0.9])
     with row1_left:
         st.subheader("Live Readiness Checklist")
@@ -85,6 +221,207 @@ def main() -> None:
     with row1_right:
         st.subheader("Health Summary")
         st.json(health)
+
+    wallet_left, wallet_right = st.columns(2)
+    with wallet_left:
+        st.subheader("Wallet Connection")
+        st.json(
+            {
+                "auth_detail": state.get("auth_detail", ""),
+                "connected_funder_wallet": state.get("connected_funder_wallet", ""),
+                "connected_proxy_wallet": state.get("connected_proxy_wallet", ""),
+                "wallet_balance_visible": state.get("wallet_balance_visible", False),
+                "wallet_balance_detail": state.get("wallet_balance_detail", ""),
+                "wallet_usdc_balance": currency_text(state.get("wallet_usdc_balance")),
+                "wallet_usdce_balance": currency_text(state.get("wallet_usdce_balance")),
+                "wallet_total_stablecoins": currency_text(state.get("wallet_total_stablecoins")),
+                "balance_visible": state.get("balance_visible", False),
+                "spendable_usdc": wallet_balance_text(state),
+                "position_value": currency_text(state.get("portfolio_position_value")),
+                "position_cost_basis": currency_text(state.get("portfolio_cost_basis")),
+                "balance_detail": state.get("balance_detail", ""),
+                "allowance_sufficient": state.get("allowance_sufficient", False),
+                "allowance_detail": state.get("allowance_detail", ""),
+                "open_orders_visible": state.get("open_orders_visible", False),
+                "open_orders_detail": state.get("open_orders_detail", ""),
+                "positions_visible": state.get("positions_visible", False),
+                "positions_detail": state.get("positions_detail", ""),
+            }
+        )
+        st.caption("Wallet Stablecoins is read directly from the Polygon wallet. Spendable USDC comes from Polymarket's authenticated CLOB balance/allowance endpoint and represents collateral available for new orders.")
+    with wallet_right:
+        st.subheader("Wallet Health Metadata")
+        st.json(
+            {
+                "balance_component": balance_component,
+                "allowance_component": allowance_component,
+            }
+        )
+
+    st.subheader("Paper Trading Controls")
+    paper_left, paper_mid, paper_right = st.columns([1.1, 1.1, 1.8])
+    with paper_left:
+        paper_bankroll = st.number_input(
+            "Paper bankroll",
+            min_value=10.0,
+            value=float(state.get("paper_bankroll_override", 0.0) or config.get("bankroll", {}).get("paper_starting_bankroll", 200.0)),
+            step=10.0,
+            help="Total paper bankroll used by the strategy sizing and risk checks.",
+        )
+    with paper_mid:
+        paper_trade_notional = st.number_input(
+            "Max paper trade",
+            min_value=1.0,
+            value=float(state.get("paper_trade_notional_override", 0.0) or 5.0),
+            step=1.0,
+            help="Hard cap for each paper trade notional.",
+        )
+        if st.button("Save Paper Settings", use_container_width=True):
+            STATE_STORE.update_system_status(
+                paper_bankroll_override=float(paper_bankroll),
+                paper_trade_notional_override=float(paper_trade_notional),
+            )
+            st.session_state["paper_flash_message"] = "Paper settings saved. They will be used on the next bot cycle."
+            st.session_state["paper_flash_level"] = "success"
+            st.rerun()
+        run_cols = st.columns(2)
+        if run_cols[0].button("Run Paper Bot", use_container_width=True):
+            STATE_STORE.update_system_status(
+                paper_bankroll_override=float(paper_bankroll),
+                paper_trade_notional_override=float(paper_trade_notional),
+                paper_run_enabled=True,
+            )
+            st.session_state["paper_flash_message"] = "Paper trading started."
+            st.session_state["paper_flash_level"] = "success"
+            st.rerun()
+        if run_cols[1].button("Pause Paper Bot", use_container_width=True):
+            STATE_STORE.update_system_status(paper_run_enabled=False)
+            st.session_state["paper_flash_message"] = "Paper trading paused."
+            st.session_state["paper_flash_level"] = "warning"
+            st.rerun()
+    with paper_right:
+        if flash_message:
+            getattr(st, flash_level, st.info)(flash_message)
+        pnl_cols = st.columns(4)
+        pnl_cols[0].metric("Last Hour PnL", currency_text(paper_summary.get("last_hour_net_pnl")))
+        pnl_cols[1].metric("Last 24h PnL", currency_text(paper_summary.get("last_24h_net_pnl")))
+        pnl_cols[2].metric("Last 7d PnL", currency_text(paper_summary.get("last_7d_net_pnl")))
+        pnl_cols[3].metric("Net PnL", currency_text(paper_summary.get("net_pnl_total")))
+        st.caption("Paper PnL is updated from live Polymarket orderbook marks for open paper positions during bot cycles.")
+        if runtime_state == "RUNNING":
+            st.success(f"Worker running. {runtime_detail}")
+        elif runtime_state == "IDLE":
+            st.warning(f"Worker idle. {runtime_detail}")
+        else:
+            st.error(f"Worker stopped. {runtime_detail}")
+        if no_real_wallets:
+            st.warning("No real public wallets have been approved for paper following yet, so no paper trades can fire.")
+        if using_placeholder_wallets:
+            st.warning(
+                "The current paper cycle is watching placeholder fallback wallets (for example `0xWALLET00`). "
+                "That means you should not expect real public-wallet detections or meaningful paper trades yet."
+            )
+        st.json(
+            {
+                "bot_runtime": runtime_state,
+                "bot_runtime_detail": runtime_detail,
+                "paper_run_enabled": state.get("paper_run_enabled", False),
+                "paper_bankroll": currency_text(paper_summary.get("paper_bankroll")),
+                "paper_trade_notional_override": currency_text(paper_summary.get("paper_trade_notional_override")),
+                "open_positions": paper_summary.get("open_positions", 0),
+                "open_notional": currency_text(paper_summary.get("open_notional")),
+                "realized_pnl_total": currency_text(paper_summary.get("realized_pnl_total")),
+                "unrealized_pnl_total": currency_text(paper_summary.get("unrealized_pnl_total")),
+                "last_cycle_detection_count": state.get("last_cycle_detection_count", 0),
+                "last_cycle_decision_count": state.get("last_cycle_decision_count", 0),
+                "last_cycle_completed_at": state.get("last_cycle_completed_at", ""),
+                "last_cycle_watched_wallets": state.get("last_cycle_watched_wallets", []),
+                "placeholder_wallets": using_placeholder_wallets,
+                "updated_at": paper_summary.get("updated_at", ""),
+            }
+        )
+
+    st.subheader("Paper Activity Monitor")
+    monitor_left, monitor_right = st.columns(2)
+    with monitor_left:
+        st.caption("Paper audit events")
+        st.code(render_jsonl_lines(load_jsonl_tail("paper_audit.jsonl", lines=25)), language="json")
+    with monitor_right:
+        st.caption("Worker cycle log")
+        st.code(load_log_tail("system.log", lines=30) or "No recent system log entries.", language="text")
+
+    st.subheader("Paper Blotter")
+    blotter_left, blotter_mid, blotter_right = st.columns(3)
+    if not paper_positions.empty:
+        if "closed" in paper_positions.columns:
+            open_paper = paper_positions[paper_positions["closed"] != True].copy()
+            closed_paper = paper_positions[paper_positions["closed"] == True].copy()
+        else:
+            open_paper = paper_positions.copy()
+            closed_paper = pd.DataFrame()
+        if "opened_at" in open_paper.columns:
+            open_paper = open_paper.sort_values("opened_at", ascending=False)
+        if "closed_at" in closed_paper.columns:
+            closed_paper = closed_paper.sort_values("closed_at", ascending=False)
+    else:
+        open_paper = pd.DataFrame()
+        closed_paper = pd.DataFrame()
+    with blotter_left:
+        st.metric("Realized PnL", currency_text(paper_summary.get("realized_pnl_total")))
+        st.subheader("Open Paper Positions")
+        st.dataframe(
+            open_paper[
+                [
+                    column
+                    for column in [
+                        "market_id",
+                        "token_id",
+                        "category",
+                        "entry_style",
+                        "entry_price",
+                        "current_mark_price",
+                        "quantity",
+                        "notional",
+                        "unrealized_pnl",
+                        "opened_at",
+                    ]
+                    if column in open_paper.columns
+                ]
+            ],
+            use_container_width=True,
+            height=280,
+        )
+    with blotter_mid:
+        st.metric("Unrealized PnL", currency_text(paper_summary.get("unrealized_pnl_total")))
+        st.subheader("Closed Paper Trades")
+        st.dataframe(
+            closed_paper[
+                [
+                    column
+                    for column in [
+                        "market_id",
+                        "token_id",
+                        "category",
+                        "entry_style",
+                        "entry_price",
+                        "current_mark_price",
+                        "quantity",
+                        "realized_pnl",
+                        "exit_reason",
+                        "closed_at",
+                    ]
+                    if column in closed_paper.columns
+                ]
+            ],
+            use_container_width=True,
+            height=280,
+        )
+    with blotter_right:
+        st.metric("Open Notional", currency_text(paper_summary.get("open_notional")))
+        st.subheader("Recent Paper Events")
+        if paper_events.empty:
+            st.info("No paper events recorded yet.")
+        st.dataframe(paper_events, use_container_width=True, height=280)
 
     row2_left, row2_right = st.columns(2)
     with row2_left:
@@ -140,14 +477,20 @@ def main() -> None:
 
     row7_left, row7_right = st.columns(2)
     with row7_left:
-        st.subheader("Paper Portfolio")
+        st.subheader("Paper History (Raw)")
         st.dataframe(paper, use_container_width=True, height=220)
     with row7_right:
         st.subheader("Alert / Error Log Tail")
-        st.code(load_log_tail("errors.log"), language="text")
+        error_log = load_log_tail("errors.log")
+        if not error_log.strip():
+            error_log = "No recent errors logged."
+        st.code(error_log, language="text")
 
     st.subheader("System Log Tail")
-    st.code(load_log_tail("system.log"), language="text")
+    system_log = load_log_tail("system.log")
+    if not system_log.strip():
+        system_log = "No recent system log entries. Use the runtime status and paper audit feed above to verify activity."
+    st.code(system_log, language="text")
 
 
 if __name__ == "__main__":

@@ -25,6 +25,10 @@ DEFAULT_STATE: dict[str, Any] = {
     "heartbeat_ok": False,
     "balance_visible": False,
     "reconciliation_clean": False,
+    "paper_bankroll_override": 0.0,
+    "paper_trade_notional_override": 0.0,
+    "paper_run_enabled": False,
+    "paper_summary": {},
 }
 
 

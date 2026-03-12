@@ -28,6 +28,7 @@ class MarketWSClient:
             self.last_error = "websockets unavailable or no token ids"
             return
         websocket = None
+        received_any = False
         try:
             websocket = await asyncio.wait_for(websockets.connect(self.url), timeout=timeout_seconds)
             self.connected = True
@@ -36,13 +37,21 @@ class MarketWSClient:
             for _ in range(max_messages):
                 raw = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
                 payload = json.loads(raw)
-                asset_id = str(payload.get("asset_id") or payload.get("token_id") or token_ids[0])
-                payload["received_at"] = datetime.now(timezone.utc).isoformat()
-                self.latest_messages[asset_id] = payload
+                if isinstance(payload, list):
+                    rows = [item for item in payload if isinstance(item, dict)]
+                elif isinstance(payload, dict):
+                    rows = [payload]
+                else:
+                    rows = []
+                for row in rows:
+                    asset_id = str(row.get("asset_id") or row.get("token_id") or token_ids[0])
+                    row["received_at"] = datetime.now(timezone.utc).isoformat()
+                    self.latest_messages[asset_id] = row
                 self.last_event_at = datetime.now(timezone.utc)
+                received_any = True
         except Exception as exc:
-            self.connected = False
-            self.last_error = str(exc)
+            self.connected = received_any
+            self.last_error = str(exc) or exc.__class__.__name__
             self.reconnect_attempts += 1
         finally:
             if websocket is not None:

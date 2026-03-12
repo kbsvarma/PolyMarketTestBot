@@ -39,8 +39,12 @@ class RiskManager:
         balance_visible: bool = True,
         allowance_sufficient: bool = True,
         tradable: bool = True,
+        bankroll_override: float | None = None,
     ) -> RiskResult:
         bankroll = self.config.bankroll.paper_starting_bankroll if mode != "LIVE" else self.config.bankroll.live_bankroll_reference
+        if mode != "LIVE" and bankroll_override and bankroll_override > 0:
+            bankroll = bankroll_override
+        spread_limit = self.config.risk.max_spread_pct if mode == "LIVE" else max(self.config.risk.max_spread_pct, 0.05)
         now = datetime.now(timezone.utc)
         self.hourly_entries = [timestamp for timestamp in self.hourly_entries if now - timestamp <= timedelta(hours=1)]
 
@@ -80,8 +84,8 @@ class RiskManager:
             return RiskResult(allowed=False, reason_code="LOW_LIQUIDITY", human_readable_reason="Orderbook depth below threshold.", context={"depth": detection.depth_available})
         if data_age_seconds > self.config.risk.stale_market_data_seconds:
             return RiskResult(allowed=False, reason_code="STALE_MARKET_DATA", human_readable_reason="Market data is too stale.", context={"data_age_seconds": data_age_seconds})
-        if fill.spread_pct > self.config.risk.max_spread_pct:
-            return RiskResult(allowed=False, reason_code="WIDE_SPREAD", human_readable_reason="Spread is too wide.", context={"spread_pct": fill.spread_pct})
+        if fill.spread_pct > spread_limit:
+            return RiskResult(allowed=False, reason_code="WIDE_SPREAD", human_readable_reason="Spread is too wide.", context={"spread_pct": fill.spread_pct, "spread_limit": spread_limit})
         if not fill.fillable:
             return RiskResult(allowed=False, reason_code="FILLABILITY", human_readable_reason=fill.reason, context=fill.model_dump())
         if fill.slippage_pct > self.config.risk.max_slippage_pct:

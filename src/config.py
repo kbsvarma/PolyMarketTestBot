@@ -122,6 +122,9 @@ class EnvConfig(BaseModel):
     state_code: str = ""
     simulate_geoblock_status: str = "eligible"
     polymarket_chain_id: int = 137
+    polygon_rpc_url: str = "https://polygon-bor-rpc.publicnode.com"
+    polygon_usdc_address: str = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+    polygon_usdce_address: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
 
 class AppConfig(BaseModel):
@@ -156,6 +159,7 @@ RUNTIME_FILES: dict[str, str] = {
     "data/live_orders.json": "[]",
     "data/live_audit.jsonl": "",
     "data/live_decisions.jsonl": "",
+    "data/paper_audit.jsonl": "",
     "data/health_status.json": "{}",
     "logs/system.log": "",
     "logs/errors.log": "",
@@ -183,6 +187,9 @@ def _load_env() -> EnvConfig:
         state_code=os.getenv("STATE_CODE", ""),
         simulate_geoblock_status=os.getenv("SIMULATE_GEOBLOCK_STATUS", "eligible"),
         polymarket_chain_id=int(os.getenv("POLYMARKET_CHAIN_ID", "137")),
+        polygon_rpc_url=os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com"),
+        polygon_usdc_address=os.getenv("POLYGON_USDC_ADDRESS", "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
+        polygon_usdce_address=os.getenv("POLYGON_USDCE_ADDRESS", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
     )
 
 

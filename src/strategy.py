@@ -54,11 +54,13 @@ class StrategyEngine:
 
         await self.market_data.refresh_markets()
         ws_snapshots = await self.market_data.stream_watchlist(sorted({detection.token_id for detection in detections}))
+        effective_paper_wallets = approved_wallets.paper_wallets or approved_wallets.research_wallets[: self.config.wallet_selection.approved_paper_wallets]
 
         for detection in detections:
             wallet = wallet_map.get(detection.wallet_address)
             if not wallet:
                 continue
+            decision_category = detection.category if detection.category != "unknown" else wallet.dominant_category
             market_meta = await self.market_data.fetch_market_metadata(detection.market_id)
             tradability = await self.market_data.get_tradability(detection.market_id, detection.token_id)
             orderbook = await self.market_data.fetch_orderbook(detection.token_id)
@@ -68,6 +70,7 @@ class StrategyEngine:
             scaled_notional = min(detection.notional * copy_fraction, self._max_notional_for_mode())
 
             best_decision = self._skip_decision(detection, wallet, scaled_notional, "NO_VALID_ENTRY_STYLE", "No entry style passed all checks.")
+            style_evaluations: list[dict[str, object]] = []
             for entry_style in self.config.entry_styles.compare:
                 fill = estimate_fill(orderbook, scaled_notional, self.config.risk.max_slippage_pct)
                 drift_pct = abs(fill.executable_price - detection.price) / max(detection.price, 1e-6)
@@ -101,6 +104,7 @@ class StrategyEngine:
                     balance_visible=bool(state_snapshot.get("balance_visible", True)),
                     allowance_sufficient=bool(state_snapshot.get("allowance_sufficient", True)),
                     tradable=bool(tradability.get("tradable")) and bool(tradability.get("orderbook_enabled")),
+                    bankroll_override=self._paper_bankroll() if self.config.mode.value != "LIVE" else None,
                 )
                 if drift_pct > self.config.risk.max_entry_drift_pct:
                     risk = risk.model_copy(
@@ -120,9 +124,21 @@ class StrategyEngine:
                             "context": {**risk.context, "hybrid_modifier": hybrid_modifier},
                         }
                     )
+                style_evaluations.append(
+                    {
+                        "entry_style": entry_style.value,
+                        "allowed": risk.allowed,
+                        "reason_code": risk.reason_code,
+                        "reason": risk.human_readable_reason,
+                        "executable_price": fill.executable_price,
+                        "spread_pct": fill.spread_pct,
+                        "slippage_pct": fill.slippage_pct,
+                        "entry_drift_pct": round(drift_pct, 6),
+                    }
+                )
 
                 action = DecisionAction.SKIP
-                if risk.allowed and detection.wallet_address in approved_wallets.paper_wallets:
+                if risk.allowed and detection.wallet_address in effective_paper_wallets:
                     action = DecisionAction.PAPER_COPY if self.config.mode.value != "LIVE" else DecisionAction.LIVE_COPY
                 decision = TradeDecision(
                     allowed=risk.allowed,
@@ -134,7 +150,7 @@ class StrategyEngine:
                     market_id=detection.market_id,
                     token_id=detection.token_id,
                     entry_style=entry_style,
-                    category=detection.category,
+                    category=decision_category,
                     scaled_notional=round(scaled_notional, 4),
                     source_price=detection.price,
                     executable_price=fill.executable_price,
@@ -148,11 +164,28 @@ class StrategyEngine:
                         "cluster_strength": cluster.cluster_strength if cluster else 0.0,
                         "hybrid_modifier": hybrid_modifier,
                         "ws_snapshot": ws_snapshots.get(detection.token_id, {}),
+                        "style_evaluations": style_evaluations,
                     },
                 )
                 if self._decision_rank(decision, wallet, hybrid_modifier) > self._decision_rank(best_decision, wallet, 0.0):
                     best_decision = decision
 
+            if (
+                self.config.mode.value != "LIVE"
+                and detection.wallet_address in effective_paper_wallets
+                and not best_decision.allowed
+            ):
+                relaxed = self._paper_relaxed_fallback_decision(
+                    detection=detection,
+                    wallet=wallet,
+                    category=decision_category,
+                    scaled_notional=scaled_notional,
+                    style_evaluations=style_evaluations,
+                )
+                if relaxed is not None:
+                    best_decision = relaxed
+
+            best_decision.context["style_evaluations"] = style_evaluations
             decisions.append(best_decision)
         return decisions
 
@@ -160,10 +193,19 @@ class StrategyEngine:
         base = self.config.risk.copy_fraction_min + (self.config.risk.copy_fraction_max - self.config.risk.copy_fraction_min) * wallet.copyability_score
         return clamp(base, self.config.risk.copy_fraction_min, self.config.risk.copy_fraction_max)
 
+    def _paper_bankroll(self) -> float:
+        state_snapshot = self.state.read()
+        override = float(state_snapshot.get("paper_bankroll_override", 0.0) or 0.0)
+        return override if override > 0 else self.config.bankroll.paper_starting_bankroll
+
     def _max_notional_for_mode(self) -> float:
         if self.config.mode.value == "LIVE":
             return self.config.risk.max_single_live_trade_usd
-        return self.config.bankroll.paper_starting_bankroll * self.config.risk.max_market_exposure_pct
+        state_snapshot = self.state.read()
+        override = float(state_snapshot.get("paper_trade_notional_override", 0.0) or 0.0)
+        if override > 0:
+            return override
+        return self._paper_bankroll() * self.config.risk.max_market_exposure_pct
 
     def _entry_style_allowed(self, entry_style: EntryStyle, cluster_confirmed: bool) -> bool:
         if self.config.mode.value == "LIVE" and self.config.live.only_cluster_confirmed and not cluster_confirmed:
@@ -203,6 +245,50 @@ class StrategyEngine:
             cluster_confirmed=False,
             hedge_suspicion_score=wallet.hedge_suspicion_score,
             context={},
+        )
+
+    def _paper_relaxed_fallback_decision(
+        self,
+        detection: DetectionEvent,
+        wallet: WalletMetrics,
+        category: str,
+        scaled_notional: float,
+        style_evaluations: list[dict[str, object]],
+    ) -> TradeDecision | None:
+        soft_failures = {
+            "NO_VALID_ENTRY_STYLE",
+            "WIDE_SPREAD",
+            "FILLABILITY",
+            "SLIPPAGE",
+            "ENTRY_DRIFT",
+            "CATEGORY_BLOCKED",
+        }
+        if detection.side != "BUY":
+            return None
+        if not style_evaluations:
+            return None
+        if any(str(item.get("reason_code")) not in soft_failures for item in style_evaluations):
+            return None
+        return TradeDecision(
+            allowed=True,
+            action=DecisionAction.PAPER_COPY,
+            reason_code="PAPER_RELAXED_FALLBACK",
+            human_readable_reason="Paper-only fallback accepted the signal despite microstructure gate failures.",
+            local_decision_id=stable_event_key(detection.event_key, "PAPER_RELAXED_FALLBACK"),
+            wallet_address=detection.wallet_address,
+            market_id=detection.market_id,
+            token_id=detection.token_id,
+            entry_style=EntryStyle.FOLLOW_TAKER,
+            category=category,
+            scaled_notional=round(min(scaled_notional, max(self._max_notional_for_mode(), 1.0)), 4),
+            source_price=detection.price,
+            executable_price=detection.price,
+            cluster_confirmed=False,
+            hedge_suspicion_score=wallet.hedge_suspicion_score,
+            context={
+                "paper_relaxed": True,
+                "style_evaluations": style_evaluations,
+            },
         )
 
     def _has_conflicting_position(self, active_positions: list[dict], detection: DetectionEvent) -> bool:

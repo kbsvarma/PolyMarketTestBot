@@ -37,13 +37,21 @@ class TradeMonitor:
         timestamp = self._parse_timestamp(row.get("timestamp") or row.get("time"))
         tx_hash = str(row.get("tx_hash") or row.get("transactionHash") or row.get("hash") or f"local-{wallet[-4:]}-{int(timestamp.timestamp())}")
         market_id = str(row.get("market_id") or row.get("conditionId") or row.get("market") or row.get("slug") or "unknown-market")
-        token_id = str(row.get("token_id") or row.get("asset_id") or row.get("tokenId") or row.get("clobTokenId") or "unknown-token")
+        token_id = str(
+            row.get("token_id")
+            or row.get("asset_id")
+            or row.get("tokenId")
+            or row.get("clobTokenId")
+            or row.get("asset")
+            or "unknown-token"
+        )
         side = str(row.get("side") or row.get("type") or "BUY").upper()
         event_key = self.make_event_key(wallet, market_id, token_id, tx_hash, side)
         local_now = datetime.now(timezone.utc)
         latency = max((local_now - timestamp).total_seconds(), 0.0)
         price = float(row.get("price") or row.get("outcomePrice") or 0.5)
         size = float(row.get("size") or row.get("amount") or row.get("shares") or 10.0)
+        category = self._infer_category(row)
         return DetectionEvent(
             event_key=event_key,
             local_detection_timestamp=local_now,
@@ -62,15 +70,41 @@ class TradeMonitor:
             best_bid=float(row.get("best_bid")) if row.get("best_bid") is not None else None,
             best_ask=float(row.get("best_ask")) if row.get("best_ask") is not None else None,
             depth_available=float(row.get("depth_available")) if row.get("depth_available") is not None else None,
-            category=str(row.get("category") or "unknown"),
-            source_alias=str(row.get("alias") or ""),
+            category=category,
+            source_alias=str(row.get("alias") or row.get("pseudonym") or row.get("name") or ""),
             market_metadata={"raw": row},
         )
 
-    def _parse_timestamp(self, raw: str | None) -> datetime:
+    def _infer_category(self, row: dict) -> str:
+        explicit = str(row.get("category") or "").strip()
+        if explicit:
+            return explicit
+        text = " ".join(
+            str(row.get(key) or "")
+            for key in ("slug", "eventSlug", "title", "outcome", "icon")
+        ).lower()
+        if any(keyword in text for keyword in ("btc", "bitcoin", "eth", "ethereum", "sol", "solana", "xrp", "crypto")):
+            return "crypto price"
+        if any(keyword in text for keyword in ("election", "candidate", "president", "senate", "supreme court", "biden", "trump")):
+            return "politics"
+        if any(keyword in text for keyword in ("temperature", "weather", "rain", "snow")):
+            return "macro / economics"
+        if any(keyword in text for keyword in ("championship", "match", "game", "nba", "nfl", "mlb", "soccer")):
+            return "sports"
+        return "unknown"
+
+    def _parse_timestamp(self, raw: str | int | float | None) -> datetime:
         if not raw:
             return datetime.now(timezone.utc)
+        if isinstance(raw, (int, float)):
+            try:
+                value = float(raw)
+                if value > 1_000_000_000_000:
+                    value = value / 1000.0
+                return datetime.fromtimestamp(value, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return datetime.now(timezone.utc)
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
         except ValueError:
             return datetime.now(timezone.utc)
