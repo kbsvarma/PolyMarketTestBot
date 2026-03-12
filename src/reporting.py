@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from collections import Counter
+import json
 
 from src.config import AppConfig
-from src.models import TradeDecision, WalletMetrics
+from src.models import PaperReadiness, TradeDecision, WalletMetrics
+from src.paper_quality import classify_paper_readiness, summarize_source_quality
 from src.state import AppStateStore
 from src.utils import write_json
 
@@ -35,6 +38,7 @@ class ReportWriter:
                 "wallets_to_demote": [wallet.wallet_address for wallet in wallets if wallet.copied_performance_score < 0.35][:3],
             },
             "skip_reasons": self._reason_counts(skipped),
+            "paper_quality": self._paper_quality_summary(),
         }
         write_json(self.data_dir / "daily_summary.json", payload)
 
@@ -57,3 +61,73 @@ class ReportWriter:
         for decision in decisions:
             counts[decision.reason_code] = counts.get(decision.reason_code, 0) + 1
         return counts
+
+    def write_paper_quality_summary(self) -> dict[str, object]:
+        payload = self._paper_quality_summary()
+        write_json(self.data_dir / "paper_quality_summary.json", payload)
+        write_json(self.data_dir / "source_quality_summary.json", payload.get("source_quality_summary", {}))
+        return payload
+
+    def _paper_quality_summary(self) -> dict[str, object]:
+        discovery = self._read_json(self.data_dir / "wallet_discovery_diagnostics.json")
+        scoring = self._read_json(self.data_dir / "wallet_scoring_diagnostics.json")
+        traces = self._read_jsonl(self.data_dir / "paper_decision_trace.jsonl")
+        approved_wallets = self.state.read().get("approved_wallets", {})
+
+        signal_count = len(traces)
+        skip_count = len([trace for trace in traces if trace.get("final_action") == "SKIP"])
+        entered_count = len([trace for trace in traces if trace.get("final_action") == "PAPER_COPY"])
+        source_quality_values = [str(trace.get("source_quality") or "") for trace in traces]
+        source_quality_summary = summarize_source_quality(source_quality_values)
+        readiness = classify_paper_readiness(
+            discovery_state=str(discovery.get("state") or discovery.get("diagnostics", {}).get("discovery_state") or "NO_DATA"),
+            scoring_state=str(scoring.get("state") or "EMPTY"),
+            approved_wallet_count=len(approved_wallets.get("paper_wallets", [])),
+            candidate_signal_count=signal_count,
+            real_data_signal_pct=float(source_quality_summary.get("REAL_PUBLIC_DATA", 0.0)),
+            fallback_signal_pct=float(source_quality_summary.get("SYNTHETIC_FALLBACK", 0.0)),
+        )
+        skip_reason_distribution = Counter(str(trace.get("reason_code") or "UNKNOWN") for trace in traces if trace.get("final_action") == "SKIP")
+        funnel = {
+            "detected": signal_count,
+            "eligible": len([trace for trace in traces if trace.get("risk_allowed")]),
+            "skipped": skip_count,
+            "entered": entered_count,
+        }
+        return {
+            "paper_readiness": readiness.value if isinstance(readiness, PaperReadiness) else str(readiness),
+            "total_detected_source_trades": int(self.state.read().get("last_cycle_detection_count", 0)),
+            "total_candidate_signals": signal_count,
+            "total_skipped_signals": skip_count,
+            "skip_reason_distribution": dict(skip_reason_distribution),
+            "source_quality_summary": source_quality_summary,
+            "approved_wallet_count": len(approved_wallets.get("paper_wallets", [])),
+            "rejected_wallet_count": int(scoring.get("diagnostics", {}).get("rejected_count", 0)),
+            "current_discovery_state": str(discovery.get("diagnostics", {}).get("discovery_state") or discovery.get("state") or "UNKNOWN"),
+            "current_scoring_state": str(scoring.get("state") or "UNKNOWN"),
+            "funnel": funnel,
+            "discovery_reason": discovery.get("reason", ""),
+            "scoring_diagnostics": scoring.get("diagnostics", {}),
+            "fallback_in_use": float(source_quality_summary.get("SYNTHETIC_FALLBACK", 0.0)) > 0,
+        }
+
+    def _read_json(self, path: Path) -> dict[str, object]:
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8") or "{}")
+        except json.JSONDecodeError:
+            return {}
+
+    def _read_jsonl(self, path: Path) -> list[dict[str, object]]:
+        if not path.exists():
+            return []
+        rows: list[dict[str, object]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return rows

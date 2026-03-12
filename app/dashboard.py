@@ -170,6 +170,9 @@ def main() -> None:
     state = load_json("app_state.json")
     summary = load_json("daily_summary.json")
     health = load_json("health_status.json")
+    discovery = load_json("wallet_discovery_diagnostics.json")
+    scoring = load_json("wallet_scoring_diagnostics.json")
+    paper_quality = load_json("paper_quality_summary.json")
     live_orders = load_json("live_orders.json")
     wallet_scores = load_csv("wallet_scorecard.csv")
     category_scores = load_csv("category_wallet_scorecard.csv")
@@ -181,6 +184,7 @@ def main() -> None:
     paper_positions = paper_positions_frame(positions_payload)
     paper_summary = state.get("paper_summary", {}) if isinstance(state, dict) else {}
     paper_events = pd.DataFrame(load_jsonl_tail("paper_audit.jsonl", lines=30))
+    decision_traces = pd.DataFrame(load_jsonl_tail("paper_decision_trace.jsonl", lines=40))
     runtime_state, runtime_detail = bot_runtime_status(state, int(config.get("runtime", {}).get("polling_interval_seconds", 20)))
     watched_wallets = state.get("last_cycle_watched_wallets", [])
     using_placeholder_wallets = placeholder_wallets(watched_wallets)
@@ -221,6 +225,26 @@ def main() -> None:
     with row1_right:
         st.subheader("Health Summary")
         st.json(health)
+
+    diag_left, diag_mid, diag_right = st.columns(3)
+    diag_left.metric("Discovery State", str(discovery.get("diagnostics", {}).get("discovery_state") or discovery.get("state") or "UNKNOWN"))
+    diag_mid.metric("Scoring State", str(scoring.get("state") or "UNKNOWN"))
+    diag_right.metric("Paper Readiness", str(paper_quality.get("paper_readiness") or "UNKNOWN"))
+
+    st.subheader("Paper Trust Diagnostics")
+    trust_left, trust_mid, trust_right = st.columns(3)
+    with trust_left:
+        st.caption("Wallet discovery")
+        st.json(discovery)
+    with trust_mid:
+        st.caption("Wallet scoring")
+        st.json(scoring.get("diagnostics", {}))
+        rejected_wallets = pd.DataFrame(scoring.get("rejected_wallets", []))
+        if not rejected_wallets.empty:
+            st.dataframe(rejected_wallets, use_container_width=True, height=180)
+    with trust_right:
+        st.caption("Paper quality / source quality")
+        st.json(paper_quality)
 
     wallet_left, wallet_right = st.columns(2)
     with wallet_left:
@@ -338,8 +362,22 @@ def main() -> None:
                 "last_cycle_watched_wallets": state.get("last_cycle_watched_wallets", []),
                 "placeholder_wallets": using_placeholder_wallets,
                 "updated_at": paper_summary.get("updated_at", ""),
+                "discovery_state": discovery.get("diagnostics", {}).get("discovery_state", ""),
+                "scoring_state": scoring.get("state", ""),
+                "paper_readiness": paper_quality.get("paper_readiness", ""),
             }
         )
+
+    funnel_cols = st.columns(4)
+    funnel = paper_quality.get("funnel", {}) if isinstance(paper_quality, dict) else {}
+    funnel_cols[0].metric("Detected", funnel.get("detected", 0))
+    funnel_cols[1].metric("Eligible", funnel.get("eligible", 0))
+    funnel_cols[2].metric("Skipped", funnel.get("skipped", 0))
+    funnel_cols[3].metric("Entered", funnel.get("entered", 0))
+    skip_reason_distribution = paper_quality.get("skip_reason_distribution", {}) if isinstance(paper_quality, dict) else {}
+    if skip_reason_distribution:
+        st.caption("Skip reason distribution")
+        st.dataframe(pd.DataFrame([{"reason_code": key, "count": value} for key, value in skip_reason_distribution.items()]), use_container_width=True, height=160)
 
     st.subheader("Paper Activity Monitor")
     monitor_left, monitor_right = st.columns(2)
@@ -422,6 +460,34 @@ def main() -> None:
         if paper_events.empty:
             st.info("No paper events recorded yet.")
         st.dataframe(paper_events, use_container_width=True, height=280)
+
+    st.subheader("Paper Decision Trace Feed")
+    if decision_traces.empty:
+        st.info("No paper decision traces recorded yet.")
+    else:
+        st.dataframe(
+            decision_traces[
+                [
+                    column
+                    for column in [
+                        "detected_at",
+                        "wallet_address",
+                        "category",
+                        "source_quality",
+                        "cluster_state",
+                        "freshness_state",
+                        "fillability_state",
+                        "risk_reason_code",
+                        "final_action",
+                        "reason_code",
+                        "scaled_notional",
+                    ]
+                    if column in decision_traces.columns
+                ]
+            ],
+            use_container_width=True,
+            height=240,
+        )
 
     row2_left, row2_right = st.columns(2)
     with row2_left:

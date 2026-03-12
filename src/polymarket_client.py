@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover
         return None
 
 from src.config import AppConfig
-from src.models import HealthStatus, MarketInfo, OrderbookLevel, OrderbookSnapshot
+from src.models import HealthStatus, MarketInfo, OrderbookLevel, OrderbookSnapshot, SourceQuality
 
 
 class PolymarketClient:
@@ -210,6 +210,7 @@ class PolymarketClient:
                     liquidity=float(item.get("liquidity") or 0.0),
                     volume=float(item.get("volume") or item.get("volumeNum") or 0.0),
                     end_date_iso=item.get("endDate") or item.get("end_date_iso"),
+                    source_quality=SourceQuality.REAL_PUBLIC_DATA,
                 )
                 if row.market_id and row.token_id:
                     rows.append(row)
@@ -319,7 +320,7 @@ class PolymarketClient:
         if self._sdk_client is None:
             if self._live_mode():
                 raise RuntimeError("Live balance unavailable because py-clob-client is not initialized.")
-            return {"cash_usd": self.config.bankroll.live_bankroll_reference, "source": "reference"}
+            return {"cash_usd": self.config.bankroll.live_bankroll_reference, "source": "reference", "source_quality": SourceQuality.SYNTHETIC_FALLBACK.value}
         try:
             if hasattr(self._sdk_client, "get_balance_allowance"):
                 params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL) if BalanceAllowanceParams and AssetType else None
@@ -332,28 +333,28 @@ class PolymarketClient:
         except Exception as exc:
             if self._live_mode():
                 raise RuntimeError(f"Unable to fetch real balance in LIVE mode: {exc}") from exc
-            return {"cash_usd": self.config.bankroll.live_bankroll_reference, "source": "fallback"}
+            return {"cash_usd": self.config.bankroll.live_bankroll_reference, "source": "fallback", "source_quality": SourceQuality.SYNTHETIC_FALLBACK.value}
 
     async def get_allowance(self) -> dict[str, Any]:
         if self._sdk_client is None:
             if self._live_mode():
                 raise RuntimeError("Allowance/spendability unavailable because py-clob-client is not initialized.")
-            return {"available": self.config.bankroll.live_bankroll_reference, "sufficient": True, "source": "reference"}
+            return {"available": self.config.bankroll.live_bankroll_reference, "sufficient": True, "source": "reference", "source_quality": SourceQuality.SYNTHETIC_FALLBACK.value}
         try:
             if hasattr(self._sdk_client, "get_balance_allowance"):
                 params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL) if BalanceAllowanceParams and AssetType else None
                 payload = self._sdk_client.get_balance_allowance(params)
                 available = float(payload.get("available") or payload.get("balance") or payload.get("allowance") or 0.0)
-                return {"available": available, "sufficient": available > 0, "raw": payload}
+                return {"available": available, "sufficient": available > 0, "raw": payload, "source_quality": SourceQuality.REAL_PUBLIC_DATA.value}
             if hasattr(self._sdk_client, "get_balance"):
                 payload = self._sdk_client.get_balance()
                 available = float(payload.get("available") or payload.get("balance") or 0.0)
-                return {"available": available, "sufficient": available > 0, "raw": payload}
+                return {"available": available, "sufficient": available > 0, "raw": payload, "source_quality": SourceQuality.REAL_PUBLIC_DATA.value}
             raise RuntimeError("SDK allowance method unavailable")
         except Exception as exc:
             if self._live_mode():
                 raise RuntimeError(f"Unable to fetch allowance/spendability in LIVE mode: {exc}") from exc
-            return {"available": self.config.bankroll.live_bankroll_reference, "sufficient": True, "source": "fallback"}
+            return {"available": self.config.bankroll.live_bankroll_reference, "sufficient": True, "source": "fallback", "source_quality": SourceQuality.SYNTHETIC_FALLBACK.value}
 
     async def get_positions(self) -> list[dict[str, Any]]:
         if self._sdk_client and hasattr(self._sdk_client, "get_positions"):
@@ -541,6 +542,7 @@ class PolymarketClient:
                 closed=False,
                 liquidity=500 + idx * 120,
                 volume=2500 + idx * 400,
+                source_quality=SourceQuality.SYNTHETIC_FALLBACK,
             )
             for idx, (title, category) in enumerate(
                 [
@@ -565,5 +567,6 @@ class PolymarketClient:
                 "tx_hash": f"fallback-{wallet_address[-4:]}-0",
                 "title": "Will BTC settle above 100k this month",
                 "category": "crypto price",
+                "source_quality": SourceQuality.SYNTHETIC_FALLBACK.value,
             }
         ]

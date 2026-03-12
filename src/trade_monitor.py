@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from src.config import AppConfig
-from src.models import DetectionEvent
+from src.models import DetectionEvent, SourceQuality
 from src.polymarket_client import PolymarketClient
 from src.utils import append_csv_row, stable_event_key
 
@@ -73,6 +73,7 @@ class TradeMonitor:
             category=category,
             source_alias=str(row.get("alias") or row.get("pseudonym") or row.get("name") or ""),
             market_metadata={"raw": row},
+            source_quality=SourceQuality(str(row.get("source_quality") or SourceQuality.REAL_PUBLIC_DATA.value)),
         )
 
     def _infer_category(self, row: dict) -> str:

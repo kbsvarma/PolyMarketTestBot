@@ -34,6 +34,26 @@ class HealthState(str, Enum):
     UNHEALTHY = "UNHEALTHY"
 
 
+class DiscoveryState(str, Enum):
+    SUCCESS = "SUCCESS"
+    NO_DATA = "NO_DATA"
+    FETCH_FAILED = "FETCH_FAILED"
+    MALFORMED_RESPONSE = "MALFORMED_RESPONSE"
+    FILTERED_TO_ZERO = "FILTERED_TO_ZERO"
+
+
+class SourceQuality(str, Enum):
+    REAL_PUBLIC_DATA = "REAL_PUBLIC_DATA"
+    DEGRADED_PUBLIC_DATA = "DEGRADED_PUBLIC_DATA"
+    SYNTHETIC_FALLBACK = "SYNTHETIC_FALLBACK"
+
+
+class PaperReadiness(str, Enum):
+    STRONG = "STRONG"
+    DEGRADED = "DEGRADED"
+    NOT_TRUSTWORTHY = "NOT_TRUSTWORTHY"
+
+
 class EntryStyle(str, Enum):
     FOLLOW_TAKER = "FOLLOW_TAKER"
     PASSIVE_LIMIT = "PASSIVE_LIMIT"
@@ -94,6 +114,31 @@ class WalletMetrics(BaseModel):
     copied_performance_score: float = 0.0
     global_score: float = 0.0
     dominant_category: str = "unknown"
+    source_quality: SourceQuality = SourceQuality.REAL_PUBLIC_DATA
+
+
+class DiscoveryResult(BaseModel):
+    wallets: list[WalletMetrics] = Field(default_factory=list)
+    state: DiscoveryState = DiscoveryState.NO_DATA
+    source_quality: SourceQuality = SourceQuality.DEGRADED_PUBLIC_DATA
+    reason: str = ""
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+    candidate_wallets: list[dict[str, Any]] = Field(default_factory=list)
+    rejected_wallets: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class WalletScoringResult(BaseModel):
+    scored_wallets: list[WalletMetrics] = Field(default_factory=list)
+    skipped_wallets: list[dict[str, Any]] = Field(default_factory=list)
+    rejected_wallets: list[dict[str, Any]] = Field(default_factory=list)
+    state: str = "EMPTY"
+    source_quality: SourceQuality = SourceQuality.DEGRADED_PUBLIC_DATA
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+
+
+class CategoryScoringResult(BaseModel):
+    rows: list["CategoryScore"] = Field(default_factory=list)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
 
 class CategoryScore(BaseModel):
@@ -133,6 +178,7 @@ class DetectionEvent(BaseModel):
     category: str = "unknown"
     source_alias: str = ""
     market_metadata: dict[str, Any] = Field(default_factory=dict)
+    source_quality: SourceQuality = SourceQuality.REAL_PUBLIC_DATA
 
 
 class OrderbookLevel(BaseModel):
@@ -211,6 +257,7 @@ class MarketInfo(BaseModel):
     liquidity: float = 0.0
     volume: float = 0.0
     end_date_iso: str | None = None
+    source_quality: SourceQuality = SourceQuality.REAL_PUBLIC_DATA
 
 
 class Position(BaseModel):

@@ -29,6 +29,11 @@ DEFAULT_STATE: dict[str, Any] = {
     "paper_trade_notional_override": 0.0,
     "paper_run_enabled": False,
     "paper_summary": {},
+    "wallet_discovery_state": "UNKNOWN",
+    "wallet_discovery_reason": "",
+    "wallet_discovery_source_quality": "DEGRADED_PUBLIC_DATA",
+    "wallet_scoring_state": "UNKNOWN",
+    "wallet_scoring_source_quality": "DEGRADED_PUBLIC_DATA",
 }
 
 

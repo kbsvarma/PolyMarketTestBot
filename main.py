@@ -62,13 +62,25 @@ async def run() -> None:
     if config.mode.value == "LIVE" or has_wallet_credentials:
         await live_engine.refresh_live_status()
 
-    wallets = await discovery.run_discovery_cycle()
-    scored_wallets = scorer.score_wallets(wallets)
-    category_scorecards = category_scorer.build_scorecards(scored_wallets)
-    replay_rows = evaluator.evaluate_wallets(scored_wallets)
-    approved_wallets = scorer.select_wallets(scored_wallets, replay_rows)
+    discovery_result = await discovery.run_discovery_cycle()
+    scoring_result = scorer.score_wallets(discovery_result.wallets)
+    category_scorecards = category_scorer.build_scorecards(scoring_result.scored_wallets)
+    replay_rows = evaluator.evaluate_wallets(scoring_result.scored_wallets)
+    approved_wallets = scorer.select_wallets(scoring_result, replay_rows)
 
-    state.set_wallets(approved_wallets, scored_wallets)
+    state.set_wallets(approved_wallets, scoring_result.scored_wallets)
+    state.update_system_status(
+        wallet_discovery_state=discovery_result.state.value,
+        wallet_discovery_reason=discovery_result.reason,
+        wallet_discovery_source_quality=discovery_result.source_quality.value,
+        wallet_scoring_state=scoring_result.state,
+        wallet_scoring_source_quality=scoring_result.source_quality.value,
+    )
+    reporter.write_paper_quality_summary()
+    if config.mode.value != "LIVE" and discovery_result.state.value != "SUCCESS":
+        logger.warning("Paper/Research discovery degraded state={} reason={}", discovery_result.state.value, discovery_result.reason)
+    if config.mode.value != "LIVE" and scoring_result.state != "SUCCESS":
+        logger.warning("Paper/Research scoring degraded state={}", scoring_result.state)
 
     scheduler = AppScheduler(config)
 
@@ -94,11 +106,12 @@ async def run() -> None:
             watched_wallets,
         )
         detections = await monitor.poll_wallets(watched_wallets)
-        decisions = await strategy.process_detections(detections, approved_wallets, scored_wallets)
+        decisions = await strategy.process_detections(detections, approved_wallets, scoring_result.scored_wallets)
         if config.mode.value != "PAPER" or state_snapshot.get("paper_run_enabled", False):
             await paper_engine.handle_decisions(decisions)
         await live_engine.handle_decisions(decisions)
-        reporter.write_daily_summary(scored_wallets, decisions)
+        reporter.write_daily_summary(scoring_result.scored_wallets, decisions)
+        reporter.write_paper_quality_summary()
         analytics.write_strategy_comparison()
         alerts.emit_health_alerts(state.read())
         state.update_system_status(
@@ -119,7 +132,7 @@ async def run() -> None:
     await cycle()
 
     if config.mode.value == "RESEARCH":
-        reporter.write_research_snapshot(scored_wallets, category_scorecards, replay_rows)
+        reporter.write_research_snapshot(scoring_result.scored_wallets, category_scorecards.rows, replay_rows)
         return
 
     cycle_count = 1

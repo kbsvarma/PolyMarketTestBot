@@ -11,7 +11,7 @@ from src.orderbook import estimate_fill
 from src.positions import PositionStore
 from src.risk_manager import RiskManager
 from src.state import AppStateStore
-from src.utils import clamp, stable_event_key
+from src.utils import append_jsonl, clamp, stable_event_key
 
 
 class StrategyEngine:
@@ -22,6 +22,7 @@ class StrategyEngine:
         self.market_data = MarketDataService(config, data_dir)
         self.risk = RiskManager(config)
         self.positions = PositionStore(data_dir / "positions.json")
+        self.trace_path = data_dir / "paper_decision_trace.jsonl"
 
     def _wallet_map(self, wallets: list[WalletMetrics]) -> dict[str, WalletMetrics]:
         return {wallet.wallet_address: wallet for wallet in wallets}
@@ -186,6 +187,7 @@ class StrategyEngine:
                     best_decision = relaxed
 
             best_decision.context["style_evaluations"] = style_evaluations
+            self._write_decision_trace(detection, best_decision, cluster_confirmed, style_evaluations)
             decisions.append(best_decision)
         return decisions
 
@@ -307,3 +309,39 @@ class StrategyEngine:
             ws_liquidity_signal = 0.05 if ws_snapshot else 0.0
             return round(clamp((tightness - 0.95) * 2.0 + ws_liquidity_signal, -0.2, 0.15), 4)
         return 0.0
+
+    def _write_decision_trace(
+        self,
+        detection: DetectionEvent,
+        decision: TradeDecision,
+        cluster_confirmed: bool,
+        style_evaluations: list[dict[str, object]],
+    ) -> None:
+        risk_context = decision.context.get("risk_context", {})
+        fill = decision.context.get("fill", {})
+        append_jsonl(
+            self.trace_path,
+            {
+                "signal_id": decision.local_decision_id,
+                "detected_at": detection.local_detection_timestamp.isoformat(),
+                "source_trade_timestamp": detection.source_trade_timestamp.isoformat(),
+                "wallet_address": detection.wallet_address,
+                "source_alias": detection.source_alias,
+                "category": decision.category,
+                "market_id": detection.market_id,
+                "token_id": detection.token_id,
+                "source_quality": detection.source_quality.value,
+                "cluster_state": "CONFIRMED" if cluster_confirmed else "SINGLE_WALLET",
+                "freshness_state": "FRESH" if detection.detection_latency_seconds <= self.config.risk.stale_signal_seconds else "STALE",
+                "fillability_state": "FILLABLE" if fill.get("fillable") else "UNFILLABLE",
+                "risk_allowed": decision.allowed,
+                "risk_reason_code": decision.reason_code,
+                "risk_reason": decision.human_readable_reason,
+                "risk_context": risk_context,
+                "final_action": decision.action.value,
+                "reason_code": decision.reason_code,
+                "entry_style": decision.entry_style.value,
+                "style_evaluations": style_evaluations,
+                "scaled_notional": decision.scaled_notional,
+            },
+        )

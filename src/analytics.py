@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.config import AppConfig
+from src.utils import read_csv_safe
 
 
 class AnalyticsEngine:
@@ -35,7 +36,7 @@ class AnalyticsEngine:
             ).to_csv(self.data_dir / "strategy_comparison.csv", index=False)
             return
 
-        paper = pd.read_csv(paper_path)
+        paper = read_csv_safe(paper_path)
         if paper.empty:
             return
         for column, default in {
