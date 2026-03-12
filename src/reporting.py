@@ -5,7 +5,7 @@ from collections import Counter
 import json
 
 from src.config import AppConfig
-from src.models import PaperReadiness, TradeDecision, WalletMetrics
+from src.models import PaperReadiness, SourceQuality, TradeDecision, WalletMetrics
 from src.paper_quality import classify_paper_readiness, summarize_source_quality
 from src.state import AppStateStore
 from src.utils import write_json
@@ -20,6 +20,7 @@ class ReportWriter:
     def write_daily_summary(self, wallets: list[WalletMetrics], decisions: list[TradeDecision]) -> None:
         allowed = [decision for decision in decisions if decision.allowed]
         skipped = [decision for decision in decisions if not decision.allowed]
+        paper_quality = self._paper_quality_summary()
         payload = {
             "mode": self.config.mode.value,
             "wallet_count": len(wallets),
@@ -28,6 +29,14 @@ class ReportWriter:
             "skipped_decisions": len(skipped),
             "top_wallets": [wallet.wallet_address for wallet in wallets[:3]],
             "state": self.state.read(),
+            "discovery_state": paper_quality.get("current_discovery_state", "UNKNOWN"),
+            "scoring_state": paper_quality.get("current_scoring_state", "UNKNOWN"),
+            "source_quality_summary": paper_quality.get("source_quality_summary", {}),
+            "fallback_in_use": paper_quality.get("fallback_in_use", False),
+            "paper_readiness": paper_quality.get("paper_readiness", PaperReadiness.NOT_TRUSTWORTHY.value),
+            "approved_wallet_count": paper_quality.get("approved_wallet_count", 0),
+            "rejected_wallet_count": paper_quality.get("rejected_wallet_count", 0),
+            "synthetic_wallet_count": paper_quality.get("synthetic_wallet_count", 0),
             "recent_live_decisions": [decision.model_dump(mode="json") for decision in decisions[-5:]],
             "questions_answered": {
                 "copyable_wallets_after_delay": [wallet.wallet_address for wallet in wallets if wallet.delayed_viability_score > 0.55][:5],
@@ -38,7 +47,7 @@ class ReportWriter:
                 "wallets_to_demote": [wallet.wallet_address for wallet in wallets if wallet.copied_performance_score < 0.35][:3],
             },
             "skip_reasons": self._reason_counts(skipped),
-            "paper_quality": self._paper_quality_summary(),
+            "paper_quality": paper_quality,
         }
         write_json(self.data_dir / "daily_summary.json", payload)
 
@@ -48,10 +57,23 @@ class ReportWriter:
         category_scorecards: list[object],
         replay_rows: list[dict[str, object]],
     ) -> None:
+        existing = self._read_json(self.data_dir / "daily_summary.json")
+        paper_quality = self._paper_quality_summary()
         payload = {
+            **existing,
+            "mode": self.config.mode.value,
             "research_wallets": [wallet.wallet_address for wallet in wallets[:5]],
             "category_rows": len(category_scorecards),
             "replay_rows": len(replay_rows),
+            "discovery_state": paper_quality.get("current_discovery_state", "UNKNOWN"),
+            "scoring_state": paper_quality.get("current_scoring_state", "UNKNOWN"),
+            "source_quality_summary": paper_quality.get("source_quality_summary", {}),
+            "fallback_in_use": paper_quality.get("fallback_in_use", False),
+            "paper_readiness": paper_quality.get("paper_readiness", PaperReadiness.NOT_TRUSTWORTHY.value),
+            "approved_wallet_count": paper_quality.get("approved_wallet_count", 0),
+            "rejected_wallet_count": paper_quality.get("rejected_wallet_count", 0),
+            "synthetic_wallet_count": paper_quality.get("synthetic_wallet_count", 0),
+            "paper_quality": paper_quality,
             "message": "Research snapshot generated.",
         }
         write_json(self.data_dir / "daily_summary.json", payload)
@@ -79,18 +101,28 @@ class ReportWriter:
         entered_count = len([trace for trace in traces if trace.get("final_action") == "PAPER_COPY"])
         source_quality_values = [str(trace.get("source_quality") or "") for trace in traces]
         source_quality_summary = summarize_source_quality(source_quality_values)
+        dominant_source_quality = str(source_quality_summary.get("dominant_source_quality") or "DEGRADED_PUBLIC_DATA")
+        scoring_diagnostics = scoring.get("diagnostics", {})
+        approved_wallets_list = approved_wallets.get("paper_wallets", [])
+        synthetic_wallet_count = int(scoring_diagnostics.get("synthetic_wallet_count", 0))
+        fallback_in_use = bool(discovery.get("diagnostics", {}).get("fallback_used")) or dominant_source_quality == SourceQuality.SYNTHETIC_FALLBACK.value
         readiness = classify_paper_readiness(
             discovery_state=str(discovery.get("state") or discovery.get("diagnostics", {}).get("discovery_state") or "NO_DATA"),
             scoring_state=str(scoring.get("state") or "EMPTY"),
-            approved_wallet_count=len(approved_wallets.get("paper_wallets", [])),
+            approved_wallet_count=len(approved_wallets_list),
             candidate_signal_count=signal_count,
             real_data_signal_pct=float(source_quality_summary.get("REAL_PUBLIC_DATA", 0.0)),
             fallback_signal_pct=float(source_quality_summary.get("SYNTHETIC_FALLBACK", 0.0)),
+            degraded_signal_pct=float(source_quality_summary.get("DEGRADED_PUBLIC_DATA", 0.0)),
+            fallback_in_use=fallback_in_use,
+            approved_wallet_source_quality=str(scoring.get("source_quality") or SourceQuality.DEGRADED_PUBLIC_DATA.value),
         )
         skip_reason_distribution = Counter(str(trace.get("reason_code") or "UNKNOWN") for trace in traces if trace.get("final_action") == "SKIP")
         funnel = {
             "detected": signal_count,
+            "candidates": signal_count,
             "eligible": len([trace for trace in traces if trace.get("risk_allowed")]),
+            "approved": entered_count,
             "skipped": skip_count,
             "entered": entered_count,
         }
@@ -98,17 +130,23 @@ class ReportWriter:
             "paper_readiness": readiness.value if isinstance(readiness, PaperReadiness) else str(readiness),
             "total_detected_source_trades": int(self.state.read().get("last_cycle_detection_count", 0)),
             "total_candidate_signals": signal_count,
+            "total_approved_decisions": entered_count,
             "total_skipped_signals": skip_count,
             "skip_reason_distribution": dict(skip_reason_distribution),
             "source_quality_summary": source_quality_summary,
-            "approved_wallet_count": len(approved_wallets.get("paper_wallets", [])),
-            "rejected_wallet_count": int(scoring.get("diagnostics", {}).get("rejected_count", 0)),
+            "approved_wallet_count": len(approved_wallets_list),
+            "rejected_wallet_count": int(scoring_diagnostics.get("rejected_count", 0)),
+            "synthetic_wallet_count": synthetic_wallet_count,
             "current_discovery_state": str(discovery.get("diagnostics", {}).get("discovery_state") or discovery.get("state") or "UNKNOWN"),
             "current_scoring_state": str(scoring.get("state") or "UNKNOWN"),
             "funnel": funnel,
             "discovery_reason": discovery.get("reason", ""),
-            "scoring_diagnostics": scoring.get("diagnostics", {}),
-            "fallback_in_use": float(source_quality_summary.get("SYNTHETIC_FALLBACK", 0.0)) > 0,
+            "scoring_diagnostics": scoring_diagnostics,
+            "fallback_in_use": fallback_in_use,
+            "dominant_source_quality": dominant_source_quality,
+            "decision_count": signal_count,
+            "approved_decisions": entered_count,
+            "skipped_decisions": skip_count,
         }
 
     def _read_json(self, path: Path) -> dict[str, object]:

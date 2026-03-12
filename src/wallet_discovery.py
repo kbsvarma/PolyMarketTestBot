@@ -96,6 +96,7 @@ class WalletDiscoveryService:
             "candidate_wallets": len(candidate_rows),
         }
 
+        filtered_wallets: list[dict[str, object]] = []
         rejected_wallets: list[dict[str, object]] = []
         wallets: list[WalletMetrics] = []
         for candidate in candidate_rows:
@@ -111,7 +112,7 @@ class WalletDiscoveryService:
                 rejected_wallets.append({"wallet_address": wallet_address, "reason_code": "MALFORMED_RESPONSE", "reason": "Wallet activity is not a list."})
                 continue
             if len(activities) < self.config.wallet_selection.min_trade_count:
-                rejected_wallets.append(
+                filtered_wallets.append(
                     {
                         "wallet_address": wallet_address,
                         "reason_code": "INSUFFICIENT_HISTORY",
@@ -150,6 +151,7 @@ class WalletDiscoveryService:
         if not wallets and self.config.mode.value == "RESEARCH":
             wallets = self._fallback_wallets(categories)
             fallback_used = True
+            state = DiscoveryState.SYNTHETIC_FALLBACK_USED
             reason = "Research mode is using synthetic fallback wallets because public discovery was insufficient."
 
         source_quality = quality_from_discovery_state(state, fallback_used=fallback_used)
@@ -157,8 +159,11 @@ class WalletDiscoveryService:
         diagnostics["finished_at"] = datetime.now(timezone.utc).isoformat()
         diagnostics["discovery_state"] = state.value
         diagnostics["source_quality"] = source_quality.value
+        diagnostics["raw_candidate_count"] = len(candidate_rows)
+        diagnostics["filtered_wallet_count"] = len(filtered_wallets)
         diagnostics["wallet_count"] = len(wallets)
         diagnostics["rejected_wallet_count"] = len(rejected_wallets)
+        diagnostics["approved_candidate_count"] = len(wallets)
 
         result = DiscoveryResult(
             wallets=wallets,
@@ -167,6 +172,7 @@ class WalletDiscoveryService:
             reason=reason,
             diagnostics=diagnostics,
             candidate_wallets=candidate_rows,
+            filtered_wallets=filtered_wallets,
             rejected_wallets=rejected_wallets,
         )
         write_json(self.data_dir / "wallet_discovery_diagnostics.json", result.model_dump(mode="json"))

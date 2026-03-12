@@ -40,6 +40,7 @@ class DiscoveryState(str, Enum):
     FETCH_FAILED = "FETCH_FAILED"
     MALFORMED_RESPONSE = "MALFORMED_RESPONSE"
     FILTERED_TO_ZERO = "FILTERED_TO_ZERO"
+    SYNTHETIC_FALLBACK_USED = "SYNTHETIC_FALLBACK_USED"
 
 
 class SourceQuality(str, Enum):
@@ -124,6 +125,7 @@ class DiscoveryResult(BaseModel):
     reason: str = ""
     diagnostics: dict[str, Any] = Field(default_factory=dict)
     candidate_wallets: list[dict[str, Any]] = Field(default_factory=list)
+    filtered_wallets: list[dict[str, Any]] = Field(default_factory=list)
     rejected_wallets: list[dict[str, Any]] = Field(default_factory=list)
 
 

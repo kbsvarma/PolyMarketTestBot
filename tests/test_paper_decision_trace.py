@@ -50,9 +50,19 @@ def test_paper_decision_trace_written(tmp_path: Path) -> None:
         context={"fill": {"fillable": True}, "risk_context": {"foo": "bar"}},
     )
 
-    engine._write_decision_trace(detection, decision, False, [{"entry_style": "FOLLOW_TAKER", "allowed": True}])  # noqa: SLF001
+    engine._write_decision_trace(  # noqa: SLF001
+        detection,
+        decision,
+        False,
+        [{"entry_style": "FOLLOW_TAKER", "allowed": True}],
+        "SUCCESS",
+        "SUCCESS",
+        detection.source_quality,
+    )
     rows = (data_dir / "paper_decision_trace.jsonl").read_text(encoding="utf-8").splitlines()
     payload = json.loads(rows[-1])
     assert payload["wallet_address"] == "0xabc"
     assert payload["final_action"] == "PAPER_COPY"
     assert payload["freshness_state"] == "FRESH"
+    assert payload["discovery_state"] == "SUCCESS"
+    assert payload["source_quality"] == "REAL_PUBLIC_DATA"

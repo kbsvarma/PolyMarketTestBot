@@ -45,6 +45,9 @@ class PaperTradingEngine:
                         "reason_code": decision.reason_code,
                         "reason": decision.human_readable_reason,
                         "notional": decision.scaled_notional,
+                        "source_quality": decision.context.get("source_quality", ""),
+                        "discovery_state": decision.context.get("discovery_state", ""),
+                        "scoring_state": decision.context.get("scoring_state", ""),
                         "style_evaluations": decision.context.get("style_evaluations", []),
                     },
                 )
@@ -120,6 +123,7 @@ class PaperTradingEngine:
                     "notional": position.notional,
                     "entry_style": position.entry_style.value,
                     "reason_code": decision.reason_code,
+                    "source_quality": decision.context.get("source_quality", ""),
                     "style_evaluations": decision.context.get("style_evaluations", []),
                 },
             )

@@ -102,3 +102,4 @@ def test_wallet_discovery_research_fallback_is_labeled(monkeypatch) -> None:
     result = asyncio.run(service.run_discovery_cycle())
     assert result.wallets
     assert result.source_quality == SourceQuality.SYNTHETIC_FALLBACK
+    assert result.state == DiscoveryState.SYNTHETIC_FALLBACK_USED

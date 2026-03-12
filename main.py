@@ -76,11 +76,23 @@ async def run() -> None:
         wallet_scoring_state=scoring_result.state,
         wallet_scoring_source_quality=scoring_result.source_quality.value,
     )
-    reporter.write_paper_quality_summary()
-    if config.mode.value != "LIVE" and discovery_result.state.value != "SUCCESS":
-        logger.warning("Paper/Research discovery degraded state={} reason={}", discovery_result.state.value, discovery_result.reason)
-    if config.mode.value != "LIVE" and scoring_result.state != "SUCCESS":
-        logger.warning("Paper/Research scoring degraded state={}", scoring_result.state)
+    paper_quality = reporter.write_paper_quality_summary()
+    if config.mode.value != "LIVE":
+        logger.info(
+            "Paper/Research startup discovery_state={} scoring_state={} source_quality={} paper_readiness={}",
+            discovery_result.state.value,
+            scoring_result.state,
+            discovery_result.source_quality.value,
+            paper_quality.get("paper_readiness", "UNKNOWN"),
+        )
+        if discovery_result.state.value != "SUCCESS":
+            logger.warning("Paper/Research discovery degraded state={} reason={}", discovery_result.state.value, discovery_result.reason)
+        if scoring_result.state != "SUCCESS":
+            logger.warning("Paper/Research scoring degraded state={}", scoring_result.state)
+        if paper_quality.get("fallback_in_use"):
+            logger.warning("Paper mode is using fallback or synthetic data and is not trustworthy for live-readiness decisions.")
+        elif paper_quality.get("paper_readiness") != "STRONG":
+            logger.warning("Paper mode is running in a degraded state and should not be treated as strong pre-live evidence.")
 
     scheduler = AppScheduler(config)
 
@@ -111,7 +123,7 @@ async def run() -> None:
             await paper_engine.handle_decisions(decisions)
         await live_engine.handle_decisions(decisions)
         reporter.write_daily_summary(scoring_result.scored_wallets, decisions)
-        reporter.write_paper_quality_summary()
+        paper_quality = reporter.write_paper_quality_summary()
         analytics.write_strategy_comparison()
         alerts.emit_health_alerts(state.read())
         state.update_system_status(
@@ -122,11 +134,13 @@ async def run() -> None:
             last_cycle_watched_wallets=watched_wallets,
         )
         logger.info(
-            "Cycle complete mode={} detections={} decisions={} paper_run_enabled={}",
+            "Cycle complete mode={} detections={} decisions={} paper_run_enabled={} paper_readiness={} source_quality={}",
             config.mode.value,
             len(detections),
             len(decisions),
             state_snapshot.get("paper_run_enabled", False),
+            paper_quality.get("paper_readiness", "UNKNOWN"),
+            paper_quality.get("dominant_source_quality", "UNKNOWN"),
         )
 
     await cycle()

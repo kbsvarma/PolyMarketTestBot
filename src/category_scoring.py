@@ -38,6 +38,7 @@ class CategoryScorer:
             diagnostics={
                 "row_count": len(rows),
                 "categories": sorted({row.category for row in rows}),
+                "wallet_count": len(wallets),
             },
         )
         if rows:

@@ -27,10 +27,11 @@ class WalletScoringService:
             return result
 
         scored_wallets: list[WalletMetrics] = []
+        skipped_wallets: list[dict[str, object]] = []
         rejected_wallets: list[dict[str, object]] = []
         for wallet in wallets:
             if wallet.trade_count < self.config.wallet_selection.min_trade_count:
-                rejected_wallets.append(
+                skipped_wallets.append(
                     {
                         "wallet_address": wallet.wallet_address,
                         "reason_code": "INSUFFICIENT_TRADES",
@@ -74,15 +75,17 @@ class WalletScoringService:
         source_quality = max((wallet.source_quality for wallet in scored_wallets), key=quality_rank, default=SourceQuality.DEGRADED_PUBLIC_DATA)
         result = WalletScoringResult(
             scored_wallets=scored_wallets,
-            skipped_wallets=[],
+            skipped_wallets=skipped_wallets,
             rejected_wallets=rejected_wallets,
-            state="PARTIAL_SUCCESS" if scored_wallets and rejected_wallets else ("SUCCESS" if scored_wallets else "EMPTY"),
+            state="PARTIAL_SUCCESS" if scored_wallets and (rejected_wallets or skipped_wallets) else ("SUCCESS" if scored_wallets else "EMPTY"),
             source_quality=source_quality,
             diagnostics={
                 "wallet_count": len(wallets),
                 "scored_count": len(scored_wallets),
+                "skipped_count": len(skipped_wallets),
                 "rejected_count": len(rejected_wallets),
                 "top_wallets": [wallet.wallet_address for wallet in scored_wallets[:3]],
+                "synthetic_wallet_count": len([wallet for wallet in wallets if wallet.source_quality == SourceQuality.SYNTHETIC_FALLBACK]),
             },
         )
         self._persist(result)
@@ -100,6 +103,7 @@ class WalletScoringService:
             if wallet.copyability_score >= self.config.wallet_selection.min_copyability_score
             and wallet.delayed_viability_score >= self.config.wallet_selection.min_delay_viability_score
             and replay_expectancy.get(wallet.wallet_address, 0.0) >= self.config.backtest.min_wallet_replay_expectancy
+            and wallet.source_quality == SourceQuality.REAL_PUBLIC_DATA
         ]
         research = [wallet.wallet_address for wallet in scoring.scored_wallets[: self.config.wallet_selection.top_research_wallets]]
         paper = [wallet.wallet_address for wallet in eligible[: self.config.wallet_selection.approved_paper_wallets]]
@@ -118,6 +122,7 @@ class WalletScoringService:
             {
                 **result.model_dump(mode="json"),
                 "scored_wallets": [wallet.model_dump(mode="json") for wallet in result.scored_wallets],
+                "approved_wallets": [wallet.wallet_address for wallet in result.scored_wallets if wallet.source_quality == SourceQuality.REAL_PUBLIC_DATA],
             },
         )
         write_json(self.data_dir / "top_wallets.json", [wallet.model_dump(mode="json") for wallet in result.scored_wallets[: self.config.wallet_selection.top_research_wallets]])

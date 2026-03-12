@@ -10,6 +10,9 @@ def test_paper_readiness_classification() -> None:
         candidate_signal_count=10,
         real_data_signal_pct=0.8,
         fallback_signal_pct=0.0,
+        degraded_signal_pct=0.0,
+        fallback_in_use=False,
+        approved_wallet_source_quality="REAL_PUBLIC_DATA",
     )
     assert readiness == PaperReadiness.STRONG
 
@@ -20,6 +23,9 @@ def test_paper_readiness_classification() -> None:
         candidate_signal_count=0,
         real_data_signal_pct=0.0,
         fallback_signal_pct=1.0,
+        degraded_signal_pct=0.0,
+        fallback_in_use=True,
+        approved_wallet_source_quality="SYNTHETIC_FALLBACK",
     )
     assert degraded == PaperReadiness.NOT_TRUSTWORTHY
 
@@ -28,3 +34,4 @@ def test_source_quality_summary() -> None:
     summary = summarize_source_quality(["REAL_PUBLIC_DATA", "REAL_PUBLIC_DATA", "DEGRADED_PUBLIC_DATA"])
     assert summary["REAL_PUBLIC_DATA"] == 0.6667
     assert summary["SYNTHETIC_FALLBACK"] == 0.0
+    assert summary["dominant_source_quality"] == "REAL_PUBLIC_DATA"

@@ -6,11 +6,12 @@ from pathlib import Path
 from src.clustering import cluster_detections
 from src.config import AppConfig
 from src.market_data import MarketDataService
-from src.models import ApprovedWallets, DecisionAction, DetectionEvent, EntryStyle, TradeDecision, WalletMetrics
+from src.models import ApprovedWallets, DecisionAction, DetectionEvent, EntryStyle, SourceQuality, TradeDecision, WalletMetrics
 from src.orderbook import estimate_fill
 from src.positions import PositionStore
 from src.risk_manager import RiskManager
 from src.state import AppStateStore
+from src.source_quality import quality_rank
 from src.utils import append_jsonl, clamp, stable_event_key
 
 
@@ -61,6 +62,7 @@ class StrategyEngine:
             wallet = wallet_map.get(detection.wallet_address)
             if not wallet:
                 continue
+            state_snapshot = self.state.read()
             decision_category = detection.category if detection.category != "unknown" else wallet.dominant_category
             market_meta = await self.market_data.fetch_market_metadata(detection.market_id)
             tradability = await self.market_data.get_tradability(detection.market_id, detection.token_id)
@@ -69,6 +71,9 @@ class StrategyEngine:
             cluster_confirmed = cluster is not None
             copy_fraction = self._select_copy_fraction(wallet)
             scaled_notional = min(detection.notional * copy_fraction, self._max_notional_for_mode())
+            decision_source_quality = max([wallet.source_quality, detection.source_quality], key=quality_rank)
+            discovery_state = str(state_snapshot.get("wallet_discovery_state", "UNKNOWN"))
+            scoring_state = str(state_snapshot.get("wallet_scoring_state", "UNKNOWN"))
 
             best_decision = self._skip_decision(detection, wallet, scaled_notional, "NO_VALID_ENTRY_STYLE", "No entry style passed all checks.")
             style_evaluations: list[dict[str, object]] = []
@@ -77,7 +82,6 @@ class StrategyEngine:
                 drift_pct = abs(fill.executable_price - detection.price) / max(detection.price, 1e-6)
                 hybrid_modifier = self._hybrid_confirmation_modifier(detection, ws_snapshots.get(detection.token_id, {}))
                 entry_style_allowed = self._entry_style_allowed(entry_style, cluster_confirmed)
-                state_snapshot = self.state.read()
                 risk = self.risk.evaluate(
                     detection=detection,
                     wallet=wallet,
@@ -107,6 +111,24 @@ class StrategyEngine:
                     tradable=bool(tradability.get("tradable")) and bool(tradability.get("orderbook_enabled")),
                     bankroll_override=self._paper_bankroll() if self.config.mode.value != "LIVE" else None,
                 )
+                if self.config.mode.value != "LIVE" and decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK:
+                    risk = risk.model_copy(
+                        update={
+                            "allowed": False,
+                            "reason_code": "SYNTHETIC_SOURCE_BLOCKED",
+                            "human_readable_reason": "Synthetic fallback data is blocked from trustable paper approvals.",
+                            "context": {**risk.context, "source_quality": decision_source_quality.value},
+                        }
+                    )
+                elif self.config.mode.value != "LIVE" and decision_source_quality == SourceQuality.DEGRADED_PUBLIC_DATA and risk.allowed:
+                    risk = risk.model_copy(
+                        update={
+                            "allowed": False,
+                            "reason_code": "DEGRADED_SOURCE_SHADOW",
+                            "human_readable_reason": "Degraded public data keeps paper in shadow mode for this signal.",
+                            "context": {**risk.context, "source_quality": decision_source_quality.value},
+                        }
+                    )
                 if drift_pct > self.config.risk.max_entry_drift_pct:
                     risk = risk.model_copy(
                         update={
@@ -131,6 +153,7 @@ class StrategyEngine:
                         "allowed": risk.allowed,
                         "reason_code": risk.reason_code,
                         "reason": risk.human_readable_reason,
+                        "source_quality": decision_source_quality.value,
                         "executable_price": fill.executable_price,
                         "spread_pct": fill.spread_pct,
                         "slippage_pct": fill.slippage_pct,
@@ -166,6 +189,9 @@ class StrategyEngine:
                         "hybrid_modifier": hybrid_modifier,
                         "ws_snapshot": ws_snapshots.get(detection.token_id, {}),
                         "style_evaluations": style_evaluations,
+                        "discovery_state": discovery_state,
+                        "scoring_state": scoring_state,
+                        "source_quality": decision_source_quality.value,
                     },
                 )
                 if self._decision_rank(decision, wallet, hybrid_modifier) > self._decision_rank(best_decision, wallet, 0.0):
@@ -182,12 +208,15 @@ class StrategyEngine:
                     category=decision_category,
                     scaled_notional=scaled_notional,
                     style_evaluations=style_evaluations,
+                    source_quality=decision_source_quality,
+                    discovery_state=discovery_state,
+                    scoring_state=scoring_state,
                 )
                 if relaxed is not None:
                     best_decision = relaxed
 
             best_decision.context["style_evaluations"] = style_evaluations
-            self._write_decision_trace(detection, best_decision, cluster_confirmed, style_evaluations)
+            self._write_decision_trace(detection, best_decision, cluster_confirmed, style_evaluations, discovery_state, scoring_state, decision_source_quality)
             decisions.append(best_decision)
         return decisions
 
@@ -256,6 +285,9 @@ class StrategyEngine:
         category: str,
         scaled_notional: float,
         style_evaluations: list[dict[str, object]],
+        source_quality: SourceQuality,
+        discovery_state: str,
+        scoring_state: str,
     ) -> TradeDecision | None:
         soft_failures = {
             "NO_VALID_ENTRY_STYLE",
@@ -268,6 +300,10 @@ class StrategyEngine:
         if detection.side != "BUY":
             return None
         if not style_evaluations:
+            return None
+        if source_quality != SourceQuality.REAL_PUBLIC_DATA:
+            return None
+        if discovery_state != "SUCCESS" or scoring_state not in {"SUCCESS", "PARTIAL_SUCCESS"}:
             return None
         if any(str(item.get("reason_code")) not in soft_failures for item in style_evaluations):
             return None
@@ -290,6 +326,9 @@ class StrategyEngine:
             context={
                 "paper_relaxed": True,
                 "style_evaluations": style_evaluations,
+                "source_quality": source_quality.value,
+                "discovery_state": discovery_state,
+                "scoring_state": scoring_state,
             },
         )
 
@@ -316,6 +355,9 @@ class StrategyEngine:
         decision: TradeDecision,
         cluster_confirmed: bool,
         style_evaluations: list[dict[str, object]],
+        discovery_state: str,
+        scoring_state: str,
+        source_quality: SourceQuality,
     ) -> None:
         risk_context = decision.context.get("risk_context", {})
         fill = decision.context.get("fill", {})
@@ -330,13 +372,17 @@ class StrategyEngine:
                 "category": decision.category,
                 "market_id": detection.market_id,
                 "token_id": detection.token_id,
-                "source_quality": detection.source_quality.value,
+                "source_wallet": detection.wallet_address,
+                "source_quality": source_quality.value,
+                "discovery_state": discovery_state,
+                "scoring_state": scoring_state,
                 "cluster_state": "CONFIRMED" if cluster_confirmed else "SINGLE_WALLET",
                 "freshness_state": "FRESH" if detection.detection_latency_seconds <= self.config.risk.stale_signal_seconds else "STALE",
                 "fillability_state": "FILLABLE" if fill.get("fillable") else "UNFILLABLE",
                 "risk_allowed": decision.allowed,
                 "risk_reason_code": decision.reason_code,
                 "risk_reason": decision.human_readable_reason,
+                "human_readable_reason": decision.human_readable_reason,
                 "risk_context": risk_context,
                 "final_action": decision.action.value,
                 "reason_code": decision.reason_code,

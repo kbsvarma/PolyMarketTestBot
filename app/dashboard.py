@@ -43,7 +43,10 @@ def load_json(name: str) -> dict | list:
     if not path.exists():
         return {}
     text = path.read_text(encoding="utf-8").strip()
-    return json.loads(text) if text else {}
+    try:
+        return json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        return {}
 
 
 def load_jsonl_tail(name: str, lines: int = 10) -> list[dict]:
@@ -53,7 +56,10 @@ def load_jsonl_tail(name: str, lines: int = 10) -> list[dict]:
     rows = []
     for line in path.read_text(encoding="utf-8").splitlines()[-lines:]:
         if line.strip():
-            rows.append(json.loads(line))
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return rows
 
 
@@ -231,6 +237,13 @@ def main() -> None:
     diag_mid.metric("Scoring State", str(scoring.get("state") or "UNKNOWN"))
     diag_right.metric("Paper Readiness", str(paper_quality.get("paper_readiness") or "UNKNOWN"))
 
+    dominant_source_quality = str(paper_quality.get("dominant_source_quality") or "UNKNOWN")
+    fallback_in_use = bool(paper_quality.get("fallback_in_use", False))
+    if fallback_in_use or dominant_source_quality == "SYNTHETIC_FALLBACK":
+        st.error("Paper run is using synthetic fallback data. This run is not trustworthy for live-readiness decisions.")
+    elif dominant_source_quality == "DEGRADED_PUBLIC_DATA":
+        st.warning("Paper run is using degraded public data. Treat results as development-only unless source quality improves.")
+
     st.subheader("Paper Trust Diagnostics")
     trust_left, trust_mid, trust_right = st.columns(3)
     with trust_left:
@@ -365,15 +378,18 @@ def main() -> None:
                 "discovery_state": discovery.get("diagnostics", {}).get("discovery_state", ""),
                 "scoring_state": scoring.get("state", ""),
                 "paper_readiness": paper_quality.get("paper_readiness", ""),
+                "dominant_source_quality": dominant_source_quality,
+                "fallback_in_use": fallback_in_use,
             }
         )
 
-    funnel_cols = st.columns(4)
+    funnel_cols = st.columns(5)
     funnel = paper_quality.get("funnel", {}) if isinstance(paper_quality, dict) else {}
     funnel_cols[0].metric("Detected", funnel.get("detected", 0))
-    funnel_cols[1].metric("Eligible", funnel.get("eligible", 0))
-    funnel_cols[2].metric("Skipped", funnel.get("skipped", 0))
-    funnel_cols[3].metric("Entered", funnel.get("entered", 0))
+    funnel_cols[1].metric("Candidates", funnel.get("candidates", funnel.get("detected", 0)))
+    funnel_cols[2].metric("Approved", funnel.get("approved", funnel.get("entered", 0)))
+    funnel_cols[3].metric("Skipped", funnel.get("skipped", 0))
+    funnel_cols[4].metric("Entered", funnel.get("entered", 0))
     skip_reason_distribution = paper_quality.get("skip_reason_distribution", {}) if isinstance(paper_quality, dict) else {}
     if skip_reason_distribution:
         st.caption("Skip reason distribution")
@@ -473,6 +489,8 @@ def main() -> None:
                         "detected_at",
                         "wallet_address",
                         "category",
+                        "discovery_state",
+                        "scoring_state",
                         "source_quality",
                         "cluster_state",
                         "freshness_state",
