@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from src.config import load_config
-from src.models import DecisionAction, DetectionEvent, EntryStyle, TradeDecision
+from src.models import DecisionAction, DetectionEvent, EntryStyle, TradeDecision, TrustLevel
 from src.state import AppStateStore
 from src.strategy import StrategyEngine
 
@@ -66,5 +66,7 @@ def test_paper_decision_trace_written(tmp_path: Path) -> None:
     assert payload["freshness_state"] == "FRESH"
     assert payload["discovery_state"] == "SUCCESS"
     assert payload["source_quality"] == "REAL_PUBLIC_DATA"
-    assert payload["trust_level"] == "STRONG"
+    assert payload["trust_level"] == TrustLevel.TRUSTWORTHY.value
     assert payload["fallback_used"] is False
+    assert payload["counts_as_trustworthy_approval"] is False
+    assert payload["source_wallet"] == "0xabc"

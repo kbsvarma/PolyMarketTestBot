@@ -45,6 +45,12 @@ class AppStateStore:
         current = read_json(self.path, DEFAULT_STATE.copy())  # type: ignore[return-value]
         merged = DEFAULT_STATE.copy()
         merged.update(current)
+        readiness = merged.get("live_readiness_last_result", {}) or {}
+        system_status = str(merged.get("system_status", SystemStatus.INIT.value))
+        if system_status == SystemStatus.LIVE_READY.value and not readiness.get("ready", False):
+            merged["system_status"] = SystemStatus.DEGRADED.value
+            merged["status"] = SystemStatus.DEGRADED.value
+            merged["last_transition_reason"] = "Invalid LIVE_READY state downgraded because readiness is unresolved."
         return merged
 
     def write(self, payload: dict[str, Any]) -> None:
@@ -53,6 +59,13 @@ class AppStateStore:
     def update_system_status(self, **kwargs: Any) -> None:
         payload = self.read()
         payload.update(kwargs)
+        readiness = payload.get("live_readiness_last_result", {}) or {}
+        if payload.get("system_status") == SystemStatus.LIVE_READY.value and (
+            not isinstance(readiness, dict) or not readiness or not readiness.get("ready", False)
+        ):
+            payload["system_status"] = SystemStatus.DEGRADED.value
+            payload["status"] = SystemStatus.DEGRADED.value
+            payload["last_transition_reason"] = "LIVE_READY rejected because readiness result is empty or false."
         self.write(payload)
 
     def set_wallets(self, approved_wallets: object, scorecards: object) -> None:

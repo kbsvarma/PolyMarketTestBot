@@ -120,6 +120,15 @@ def main() -> None:
     diag_left.metric("Discovery State", str(discovery.get("diagnostics", {}).get("discovery_state") or discovery.get("state") or "UNKNOWN"))
     diag_mid.metric("Scoring State", str(scoring.get("state") or "UNKNOWN"))
     diag_right.metric("Paper Readiness", str(paper_quality.get("paper_readiness") or "UNKNOWN"))
+    trust_cols = st.columns(4)
+    trust_cols[0].metric("Trust Level", str(paper_quality.get("trust_level") or "UNKNOWN"))
+    trust_cols[1].metric("Trustworthy Approvals", int(paper_quality.get("total_approved_decisions_trustworthy", 0)))
+    trust_cols[2].metric("Degraded Approvals", int(paper_quality.get("total_approved_decisions_degraded", 0)))
+    trust_cols[3].metric("Synthetic Wallets", int(paper_quality.get("synthetic_wallet_count", 0)))
+    approval_cols = st.columns(3)
+    approval_cols[0].metric("Approvals Total", int(paper_quality.get("total_approved_decisions", 0)))
+    approval_cols[1].metric("Non-Validation Approvals", int(paper_quality.get("total_approved_decisions_non_validation", 0)))
+    approval_cols[2].metric("Dominant Source Quality", str(paper_quality.get("dominant_source_quality") or "UNKNOWN"))
 
     dominant_source_quality = str(paper_quality.get("dominant_source_quality") or "UNKNOWN")
     fallback_in_use = bool(paper_quality.get("fallback_in_use", False))
@@ -262,8 +271,11 @@ def main() -> None:
                 "discovery_state": discovery.get("diagnostics", {}).get("discovery_state", ""),
                 "scoring_state": scoring.get("state", ""),
                 "paper_readiness": paper_quality.get("paper_readiness", ""),
+                "trust_level": paper_quality.get("trust_level", ""),
                 "dominant_source_quality": dominant_source_quality,
                 "fallback_in_use": fallback_in_use,
+                "approved_decisions_trustworthy": paper_quality.get("total_approved_decisions_trustworthy", 0),
+                "approved_decisions_degraded": paper_quality.get("total_approved_decisions_degraded", 0),
             }
         )
 
@@ -274,10 +286,19 @@ def main() -> None:
     funnel_cols[2].metric("Approved", funnel.get("approved", funnel.get("entered", 0)))
     funnel_cols[3].metric("Skipped", funnel.get("skipped", 0))
     funnel_cols[4].metric("Entered", funnel.get("entered", 0))
+    trust_funnel_cols = st.columns(3)
+    trust_funnel_cols[0].metric("Decision Count (Trustworthy)", int(paper_quality.get("decision_count_trustworthy", 0)))
+    trust_funnel_cols[1].metric("Decision Count (Degraded)", int(paper_quality.get("decision_count_degraded", 0)))
+    trust_funnel_cols[2].metric("Warnings", len(paper_quality.get("warnings", [])) if isinstance(paper_quality, dict) else 0)
     skip_reason_distribution = paper_quality.get("skip_reason_distribution", {}) if isinstance(paper_quality, dict) else {}
     if skip_reason_distribution:
         st.caption("Skip reason distribution")
         st.dataframe(pd.DataFrame([{"reason_code": key, "count": value} for key, value in skip_reason_distribution.items()]), use_container_width=True, height=160)
+    warnings = paper_quality.get("warnings", []) if isinstance(paper_quality, dict) else []
+    if warnings:
+        st.caption("Paper trust warnings")
+        for warning in warnings:
+            st.warning(str(warning))
 
     st.subheader("Paper Activity Monitor")
     monitor_left, monitor_right = st.columns(2)

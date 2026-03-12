@@ -21,8 +21,14 @@ class SystemStateMachine:
         self.store = store
 
     def transition(self, new_status: SystemStatus, reason: str) -> None:
-        current_raw = self.store.read().get("system_status", SystemStatus.INIT.value)
+        state = self.store.read()
+        current_raw = state.get("system_status", SystemStatus.INIT.value)
         current = SystemStatus(current_raw)
         if new_status not in ALLOWED_TRANSITIONS.get(current, set()):
             raise ValueError(f"Invalid state transition: {current.value} -> {new_status.value}")
+        readiness = state.get("live_readiness_last_result", {}) or {}
+        if new_status == SystemStatus.LIVE_READY and (
+            not isinstance(readiness, dict) or not readiness or not readiness.get("ready", False)
+        ):
+            raise ValueError("Cannot transition to LIVE_READY without a positive readiness result.")
         self.store.update_system_status(system_status=new_status.value, status=new_status.value, last_transition_reason=reason)

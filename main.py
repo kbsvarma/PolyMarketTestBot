@@ -96,7 +96,7 @@ async def run() -> None:
 
     scheduler = AppScheduler(config)
 
-    async def cycle() -> None:
+    async def cycle() -> list:
         cycle_started_at = datetime.now(timezone.utc).isoformat()
         state_snapshot = state.read()
         state.update_system_status(bot_loop_running=True, last_cycle_started_at=cycle_started_at)
@@ -142,11 +142,17 @@ async def run() -> None:
             paper_quality.get("paper_readiness", "UNKNOWN"),
             paper_quality.get("dominant_source_quality", "UNKNOWN"),
         )
+        return decisions
 
-    await cycle()
+    first_cycle_decisions = await cycle()
 
     if config.mode.value == "RESEARCH":
-        reporter.write_research_snapshot(scoring_result.scored_wallets, category_scorecards.rows, replay_rows)
+        reporter.write_research_snapshot(
+            scoring_result.scored_wallets,
+            category_scorecards.rows,
+            replay_rows,
+            decisions=first_cycle_decisions,
+        )
         return
 
     cycle_count = 1

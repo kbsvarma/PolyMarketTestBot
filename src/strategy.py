@@ -8,7 +8,7 @@ from src.config import AppConfig
 from src.market_data import MarketDataService
 from src.models import ApprovedWallets, DecisionAction, DetectionEvent, EntryStyle, SourceQuality, TradeDecision, WalletMetrics
 from src.orderbook import estimate_fill
-from src.paper_quality import classify_trust_level
+from src.paper_quality import classify_trust_level, counts_as_trustworthy_approval
 from src.positions import PositionStore
 from src.risk_manager import RiskManager
 from src.state import AppStateStore
@@ -130,6 +130,15 @@ class StrategyEngine:
                             "context": {**risk.context, "source_quality": decision_source_quality.value},
                         }
                     )
+                if self.config.mode.value != "LIVE" and scoring_state == "EMPTY":
+                    risk = risk.model_copy(
+                        update={
+                            "allowed": False,
+                            "reason_code": "NO_APPROVED_SCORED_WALLETS",
+                            "human_readable_reason": "Scoring is empty, so paper entries are blocked from trusted approval.",
+                            "context": {**risk.context, "scoring_state": scoring_state},
+                        }
+                    )
                 if drift_pct > self.config.risk.max_entry_drift_pct:
                     risk = risk.model_copy(
                         update={
@@ -217,13 +226,32 @@ class StrategyEngine:
                     best_decision = relaxed
 
             best_decision.context["style_evaluations"] = style_evaluations
-            best_decision.context["trust_level"] = classify_trust_level(
+            trust_level = classify_trust_level(
                 source_quality=decision_source_quality.value,
                 discovery_state=discovery_state,
                 scoring_state=scoring_state,
                 fallback_in_use=decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
             )
-            best_decision.context["fallback_used"] = decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK
+            fallback_used = decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK
+            if best_decision.action == DecisionAction.PAPER_COPY and (
+                fallback_used or scoring_state == "EMPTY"
+            ):
+                best_decision = best_decision.model_copy(
+                    update={
+                        "allowed": False,
+                        "action": DecisionAction.SKIP,
+                        "reason_code": "NON_VALIDATION_SOURCE",
+                        "human_readable_reason": "Paper decision blocked because the current source/scoring state is not validation-grade.",
+                    }
+                )
+            best_decision.context["trust_level"] = trust_level
+            best_decision.context["fallback_used"] = fallback_used
+            best_decision.context["counts_as_trustworthy_approval"] = counts_as_trustworthy_approval(
+                final_action=best_decision.action.value,
+                trust_level=trust_level,
+                fallback_in_use=fallback_used,
+                scoring_state=scoring_state,
+            )
             self._write_decision_trace(detection, best_decision, cluster_confirmed, style_evaluations, discovery_state, scoring_state, decision_source_quality)
             decisions.append(best_decision)
         return decisions
@@ -344,6 +372,7 @@ class StrategyEngine:
                     fallback_in_use=False,
                 ),
                 "fallback_used": False,
+                "counts_as_trustworthy_approval": False,
             },
         )
 
@@ -399,6 +428,7 @@ class StrategyEngine:
                     ),
                 ),
                 "fallback_used": decision.context.get("fallback_used", source_quality == SourceQuality.SYNTHETIC_FALLBACK),
+                "counts_as_trustworthy_approval": decision.context.get("counts_as_trustworthy_approval", False),
                 "discovery_state": discovery_state,
                 "scoring_state": scoring_state,
                 "cluster_state": "CONFIRMED" if cluster_confirmed else "SINGLE_WALLET",
