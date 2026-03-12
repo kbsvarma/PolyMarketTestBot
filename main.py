@@ -123,7 +123,7 @@ async def run() -> None:
             await paper_engine.handle_decisions(decisions)
         await live_engine.handle_decisions(decisions)
         reporter.write_daily_summary(scoring_result.scored_wallets, decisions)
-        paper_quality = reporter.write_paper_quality_summary()
+        paper_quality = reporter.write_paper_quality_summary(decisions)
         analytics.write_strategy_comparison()
         alerts.emit_health_alerts(state.read())
         state.update_system_status(

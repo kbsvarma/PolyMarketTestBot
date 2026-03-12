@@ -4,6 +4,28 @@ from src.models import DiscoveryState, PaperReadiness, SourceQuality
 from src.source_quality import dominant_source_quality
 
 
+def classify_trust_level(
+    *,
+    source_quality: str,
+    discovery_state: str,
+    scoring_state: str,
+    fallback_in_use: bool,
+) -> str:
+    if fallback_in_use or source_quality == SourceQuality.SYNTHETIC_FALLBACK.value:
+        return PaperReadiness.NOT_TRUSTWORTHY.value
+    if discovery_state in {
+        DiscoveryState.NO_DATA.value,
+        DiscoveryState.FETCH_FAILED.value,
+        DiscoveryState.MALFORMED_RESPONSE.value,
+        DiscoveryState.FILTERED_TO_ZERO.value,
+        DiscoveryState.SYNTHETIC_FALLBACK_USED.value,
+    }:
+        return PaperReadiness.NOT_TRUSTWORTHY.value
+    if source_quality == SourceQuality.DEGRADED_PUBLIC_DATA.value or scoring_state not in {"SUCCESS", "PARTIAL_SUCCESS"}:
+        return PaperReadiness.DEGRADED.value
+    return PaperReadiness.STRONG.value
+
+
 def classify_paper_readiness(
     *,
     discovery_state: str,
@@ -16,13 +38,15 @@ def classify_paper_readiness(
     fallback_in_use: bool = False,
     approved_wallet_source_quality: str = SourceQuality.DEGRADED_PUBLIC_DATA.value,
 ) -> PaperReadiness:
-    if fallback_in_use or approved_wallet_source_quality == SourceQuality.SYNTHETIC_FALLBACK.value:
+    trust_level = classify_trust_level(
+        source_quality=approved_wallet_source_quality,
+        discovery_state=discovery_state,
+        scoring_state=scoring_state,
+        fallback_in_use=fallback_in_use,
+    )
+    if trust_level == PaperReadiness.NOT_TRUSTWORTHY.value:
         return PaperReadiness.NOT_TRUSTWORTHY
     if approved_wallet_count == 0 or candidate_signal_count == 0:
-        return PaperReadiness.NOT_TRUSTWORTHY
-    if discovery_state in {DiscoveryState.NO_DATA.value, DiscoveryState.FETCH_FAILED.value, DiscoveryState.MALFORMED_RESPONSE.value}:
-        return PaperReadiness.NOT_TRUSTWORTHY
-    if discovery_state in {DiscoveryState.FILTERED_TO_ZERO.value, DiscoveryState.SYNTHETIC_FALLBACK_USED.value}:
         return PaperReadiness.NOT_TRUSTWORTHY
     if scoring_state not in {"SUCCESS", "PARTIAL_SUCCESS"}:
         return PaperReadiness.DEGRADED

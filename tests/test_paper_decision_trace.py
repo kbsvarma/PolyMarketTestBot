@@ -66,3 +66,5 @@ def test_paper_decision_trace_written(tmp_path: Path) -> None:
     assert payload["freshness_state"] == "FRESH"
     assert payload["discovery_state"] == "SUCCESS"
     assert payload["source_quality"] == "REAL_PUBLIC_DATA"
+    assert payload["trust_level"] == "STRONG"
+    assert payload["fallback_used"] is False

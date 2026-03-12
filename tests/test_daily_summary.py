@@ -62,6 +62,17 @@ def test_daily_summary_contains_paper_quality_fields(tmp_path: Path) -> None:
     assert "approved_wallet_count" in payload
     assert "rejected_wallet_count" in payload
     assert "synthetic_wallet_count" in payload
+    assert "skip_reason_distribution" in payload
+
+    paper_quality = json.loads((tmp_path / "paper_quality_summary.json").read_text(encoding="utf-8"))
+    assert paper_quality["mode"] == "RESEARCH"
+    assert "generated_at" in paper_quality
+    assert paper_quality["total_detected_source_trades"] == 4
+    assert paper_quality["total_candidate_signals"] == 0
+    assert paper_quality["total_scored_wallets"] == 1
+    assert paper_quality["total_approved_wallets"] == 1
+    assert paper_quality["total_rejected_wallets"] == 1
+    assert "trust_level_summary" in paper_quality
 
 
 def test_research_snapshot_preserves_existing_daily_summary_fields(tmp_path: Path) -> None:
@@ -91,3 +102,34 @@ def test_research_snapshot_preserves_existing_daily_summary_fields(tmp_path: Pat
     assert payload["approved_decisions"] == 2
     assert payload["skipped_decisions"] == 5
     assert payload["skip_reason_distribution"] == {"A": 1}
+
+
+def test_paper_quality_summary_reflects_current_decisions_consistently(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.yaml", root / ".env.example")
+    state = AppStateStore(tmp_path / "app_state.json")
+    state.write(
+        {
+            "mode": "PAPER",
+            "approved_wallets": {"paper_wallets": ["0xabc"], "research_wallets": ["0xabc"], "live_wallets": []},
+            "last_cycle_detection_count": 2,
+        }
+    )
+    (tmp_path / "wallet_discovery_diagnostics.json").write_text(
+        json.dumps({"state": "SUCCESS", "diagnostics": {"discovery_state": "SUCCESS", "fallback_used": False, "wallet_count": 1}, "reason": "ok"}),
+        encoding="utf-8",
+    )
+    (tmp_path / "wallet_scoring_diagnostics.json").write_text(
+        json.dumps({"state": "SUCCESS", "source_quality": "REAL_PUBLIC_DATA", "diagnostics": {"scored_count": 1, "rejected_count": 0, "synthetic_wallet_count": 0}}),
+        encoding="utf-8",
+    )
+
+    writer = ReportWriter(config, tmp_path, state)
+    payload = writer.write_paper_quality_summary([])
+    assert payload["mode"] == "RESEARCH"
+    assert payload["fallback_in_use"] is False
+    assert payload["total_discovered_wallets"] == 1
+    assert payload["total_scored_wallets"] == 1
+    assert payload["total_approved_wallets"] == 1
+    assert payload["total_rejected_wallets"] == 0
+    assert payload["total_detected_source_trades"] == 2

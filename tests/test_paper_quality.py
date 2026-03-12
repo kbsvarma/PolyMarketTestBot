@@ -1,5 +1,5 @@
 from src.models import PaperReadiness
-from src.paper_quality import classify_paper_readiness, summarize_source_quality
+from src.paper_quality import classify_paper_readiness, classify_trust_level, summarize_source_quality
 
 
 def test_paper_readiness_classification() -> None:
@@ -35,3 +35,15 @@ def test_source_quality_summary() -> None:
     assert summary["REAL_PUBLIC_DATA"] == 0.6667
     assert summary["SYNTHETIC_FALLBACK"] == 0.0
     assert summary["dominant_source_quality"] == "REAL_PUBLIC_DATA"
+
+
+def test_trust_level_is_conservative_under_fallback() -> None:
+    assert (
+        classify_trust_level(
+            source_quality="SYNTHETIC_FALLBACK",
+            discovery_state="SYNTHETIC_FALLBACK_USED",
+            scoring_state="SUCCESS",
+            fallback_in_use=True,
+        )
+        == "NOT_TRUSTWORTHY"
+    )

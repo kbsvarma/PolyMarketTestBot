@@ -8,6 +8,7 @@ from src.config import AppConfig
 from src.market_data import MarketDataService
 from src.models import ApprovedWallets, DecisionAction, DetectionEvent, EntryStyle, SourceQuality, TradeDecision, WalletMetrics
 from src.orderbook import estimate_fill
+from src.paper_quality import classify_trust_level
 from src.positions import PositionStore
 from src.risk_manager import RiskManager
 from src.state import AppStateStore
@@ -71,7 +72,7 @@ class StrategyEngine:
             cluster_confirmed = cluster is not None
             copy_fraction = self._select_copy_fraction(wallet)
             scaled_notional = min(detection.notional * copy_fraction, self._max_notional_for_mode())
-            decision_source_quality = max([wallet.source_quality, detection.source_quality], key=quality_rank)
+            decision_source_quality = min([wallet.source_quality, detection.source_quality], key=quality_rank)
             discovery_state = str(state_snapshot.get("wallet_discovery_state", "UNKNOWN"))
             scoring_state = str(state_snapshot.get("wallet_scoring_state", "UNKNOWN"))
 
@@ -216,6 +217,13 @@ class StrategyEngine:
                     best_decision = relaxed
 
             best_decision.context["style_evaluations"] = style_evaluations
+            best_decision.context["trust_level"] = classify_trust_level(
+                source_quality=decision_source_quality.value,
+                discovery_state=discovery_state,
+                scoring_state=scoring_state,
+                fallback_in_use=decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+            )
+            best_decision.context["fallback_used"] = decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK
             self._write_decision_trace(detection, best_decision, cluster_confirmed, style_evaluations, discovery_state, scoring_state, decision_source_quality)
             decisions.append(best_decision)
         return decisions
@@ -329,6 +337,13 @@ class StrategyEngine:
                 "source_quality": source_quality.value,
                 "discovery_state": discovery_state,
                 "scoring_state": scoring_state,
+                "trust_level": classify_trust_level(
+                    source_quality=source_quality.value,
+                    discovery_state=discovery_state,
+                    scoring_state=scoring_state,
+                    fallback_in_use=False,
+                ),
+                "fallback_used": False,
             },
         )
 
@@ -374,6 +389,16 @@ class StrategyEngine:
                 "token_id": detection.token_id,
                 "source_wallet": detection.wallet_address,
                 "source_quality": source_quality.value,
+                "trust_level": decision.context.get(
+                    "trust_level",
+                    classify_trust_level(
+                        source_quality=source_quality.value,
+                        discovery_state=discovery_state,
+                        scoring_state=scoring_state,
+                        fallback_in_use=source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                    ),
+                ),
+                "fallback_used": decision.context.get("fallback_used", source_quality == SourceQuality.SYNTHETIC_FALLBACK),
                 "discovery_state": discovery_state,
                 "scoring_state": scoring_state,
                 "cluster_state": "CONFIRMED" if cluster_confirmed else "SINGLE_WALLET",
