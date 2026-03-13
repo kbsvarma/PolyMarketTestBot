@@ -40,3 +40,16 @@ def test_state_machine_blocks_live_ready_with_empty_readiness_dict(tmp_path: Pat
     machine = SystemStateMachine(store)
     with pytest.raises(ValueError, match="Cannot transition to LIVE_READY"):
         machine.transition(SystemStatus.LIVE_READY, "test")
+
+
+def test_state_machine_allows_live_ready_with_positive_readiness(tmp_path: Path) -> None:
+    store = AppStateStore(tmp_path / "app_state.json")
+    store.write(
+        {
+            "system_status": SystemStatus.PAUSED.value,
+            "live_readiness_last_result": {"ready": True},
+        }
+    )
+    machine = SystemStateMachine(store)
+    machine.transition(SystemStatus.LIVE_READY, "test")
+    assert store.read()["system_status"] == SystemStatus.LIVE_READY.value

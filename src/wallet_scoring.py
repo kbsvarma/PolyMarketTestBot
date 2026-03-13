@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.hedge_filter import hedge_suspicion_score
-from src.models import ApprovedWallets, SourceQuality, WalletMetrics, WalletScoringResult
+from src.models import ApprovedWallets, SourceQuality, ValidationMode, WalletMetrics, WalletScoringResult
 from src.source_quality import quality_rank
 from src.utils import clamp, write_csv, write_json
 
@@ -86,6 +86,11 @@ class WalletScoringService:
                 "rejected_count": len(rejected_wallets),
                 "top_wallets": [wallet.wallet_address for wallet in scored_wallets[:3]],
                 "synthetic_wallet_count": len([wallet for wallet in wallets if wallet.source_quality == SourceQuality.SYNTHETIC_FALLBACK]),
+                "validation_mode": (
+                    ValidationMode.DEV_ONLY.value
+                    if source_quality == SourceQuality.SYNTHETIC_FALLBACK
+                    else ValidationMode.VALIDATION_GRADE.value
+                ),
             },
         )
         self._persist(result)

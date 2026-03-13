@@ -61,6 +61,12 @@ class PaperReadiness(str, Enum):
     NOT_TRUSTWORTHY = "NOT_TRUSTWORTHY"
 
 
+class ValidationMode(str, Enum):
+    VALIDATION_GRADE = "VALIDATION_GRADE"
+    DEGRADED_VALIDATION = "DEGRADED_VALIDATION"
+    DEV_ONLY = "DEV_ONLY"
+
+
 class EntryStyle(str, Enum):
     FOLLOW_TAKER = "FOLLOW_TAKER"
     PASSIVE_LIMIT = "PASSIVE_LIMIT"

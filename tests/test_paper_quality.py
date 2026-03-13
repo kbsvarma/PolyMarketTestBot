@@ -68,6 +68,20 @@ def test_trust_level_is_conservative_under_fallback() -> None:
     )
 
 
+def test_source_quality_summary_marks_synthetic_as_dominant_without_decisions() -> None:
+    summary = summarize_source_quality_from_truth(
+        values=[],
+        discovery_state="SYNTHETIC_FALLBACK_USED",
+        scoring_state="SUCCESS",
+        fallback_in_use=True,
+        synthetic_wallet_count=3,
+        total_scored_wallets=3,
+        dominant_hint="SYNTHETIC_FALLBACK",
+    )
+    assert summary["dominant_source_quality"] == "SYNTHETIC_FALLBACK"
+    assert summary["SYNTHETIC_FALLBACK"] == 1.0
+
+
 def test_counts_as_trustworthy_approval_is_conservative() -> None:
     assert (
         counts_as_trustworthy_approval(

@@ -61,6 +61,12 @@ async def run() -> None:
 
     if config.mode.value == "LIVE" or has_wallet_credentials:
         await live_engine.refresh_live_status()
+        if config.mode.value != "LIVE":
+            state.update_system_status(
+                mode=config.mode.value,
+                system_status=config.mode.value,
+                status=config.mode.value,
+            )
 
     discovery_result = await discovery.run_discovery_cycle()
     scoring_result = scorer.score_wallets(discovery_result.wallets)
@@ -99,7 +105,11 @@ async def run() -> None:
     async def cycle() -> list:
         cycle_started_at = datetime.now(timezone.utc).isoformat()
         state_snapshot = state.read()
-        state.update_system_status(bot_loop_running=True, last_cycle_started_at=cycle_started_at)
+        state.update_system_status(
+            mode=config.mode.value,
+            bot_loop_running=True,
+            last_cycle_started_at=cycle_started_at,
+        )
         if config.mode.value == "LIVE":
             watched_wallets = approved_wallets.live_wallets
         else:
@@ -127,6 +137,7 @@ async def run() -> None:
         analytics.write_strategy_comparison()
         alerts.emit_health_alerts(state.read())
         state.update_system_status(
+            mode=config.mode.value,
             bot_loop_running=True,
             last_cycle_completed_at=datetime.now(timezone.utc).isoformat(),
             last_cycle_detection_count=len(detections),

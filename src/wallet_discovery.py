@@ -6,7 +6,7 @@ from pathlib import Path
 from statistics import mean
 
 from src.config import AppConfig
-from src.models import DiscoveryResult, DiscoveryState, SourceQuality, WalletMetrics
+from src.models import DiscoveryResult, DiscoveryState, SourceQuality, ValidationMode, WalletMetrics
 from src.polymarket_client import PolymarketClient
 from src.source_quality import quality_from_discovery_state, quality_rank
 from src.utils import clamp, write_json
@@ -159,6 +159,9 @@ class WalletDiscoveryService:
         diagnostics["finished_at"] = datetime.now(timezone.utc).isoformat()
         diagnostics["discovery_state"] = state.value
         diagnostics["source_quality"] = source_quality.value
+        diagnostics["validation_mode"] = (
+            ValidationMode.DEV_ONLY.value if fallback_used else ValidationMode.VALIDATION_GRADE.value
+        )
         diagnostics["raw_candidate_count"] = len(candidate_rows)
         diagnostics["filtered_wallet_count"] = len(filtered_wallets)
         diagnostics["wallet_count"] = len(wallets)

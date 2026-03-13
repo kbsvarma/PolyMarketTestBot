@@ -125,10 +125,11 @@ def main() -> None:
     trust_cols[1].metric("Trustworthy Approvals", int(paper_quality.get("total_approved_decisions_trustworthy", 0)))
     trust_cols[2].metric("Degraded Approvals", int(paper_quality.get("total_approved_decisions_degraded", 0)))
     trust_cols[3].metric("Synthetic Wallets", int(paper_quality.get("synthetic_wallet_count", 0)))
-    approval_cols = st.columns(3)
+    approval_cols = st.columns(4)
     approval_cols[0].metric("Approvals Total", int(paper_quality.get("total_approved_decisions", 0)))
     approval_cols[1].metric("Non-Validation Approvals", int(paper_quality.get("total_approved_decisions_non_validation", 0)))
     approval_cols[2].metric("Dominant Source Quality", str(paper_quality.get("dominant_source_quality") or "UNKNOWN"))
+    approval_cols[3].metric("Validation Mode", str(paper_quality.get("validation_mode") or "UNKNOWN"))
 
     dominant_source_quality = str(paper_quality.get("dominant_source_quality") or "UNKNOWN")
     fallback_in_use = bool(paper_quality.get("fallback_in_use", False))
@@ -272,6 +273,7 @@ def main() -> None:
                 "scoring_state": scoring.get("state", ""),
                 "paper_readiness": paper_quality.get("paper_readiness", ""),
                 "trust_level": paper_quality.get("trust_level", ""),
+                "validation_mode": paper_quality.get("validation_mode", ""),
                 "dominant_source_quality": dominant_source_quality,
                 "fallback_in_use": fallback_in_use,
                 "approved_decisions_trustworthy": paper_quality.get("total_approved_decisions_trustworthy", 0),
