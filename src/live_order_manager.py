@@ -27,22 +27,29 @@ class LiveOrderManager:
         order.lifecycle_status = OrderLifecycleStatus.SUBMITTING
         order.submitted_at = datetime.now(timezone.utc)
         order.last_update_at = datetime.now(timezone.utc)
-        if side == "BUY":
-            response = await self.client.place_buy_order(
-                token_id=order.token_id,
-                price=order.intended_price,
-                size=order.intended_size,
-                entry_style=order.entry_style.value,
-                client_order_id=order.client_order_id,
-            )
-        else:
-            response = await self.client.place_sell_order(
-                token_id=order.token_id,
-                price=order.intended_price,
-                size=order.intended_size,
-                entry_style=order.entry_style.value,
-                client_order_id=order.client_order_id,
-            )
+        try:
+            if side == "BUY":
+                response = await self.client.place_buy_order(
+                    token_id=order.token_id,
+                    price=order.intended_price,
+                    size=order.intended_size,
+                    entry_style=order.entry_style.value,
+                    client_order_id=order.client_order_id,
+                )
+            else:
+                response = await self.client.place_sell_order(
+                    token_id=order.token_id,
+                    price=order.intended_price,
+                    size=order.intended_size,
+                    entry_style=order.entry_style.value,
+                    client_order_id=order.client_order_id,
+                )
+        except Exception:
+            order.last_exchange_status = "REJECTED"
+            order.lifecycle_status = OrderLifecycleStatus.REJECTED
+            order.terminal_state = True
+            order.last_update_at = datetime.now(timezone.utc)
+            raise
         order.exchange_order_id = str(response.get("exchange_order_id") or "")
         order.last_exchange_status = str(response.get("status") or "SUBMITTED")
         order.lifecycle_status = self._map_status(order.last_exchange_status)
@@ -58,7 +65,7 @@ class LiveOrderManager:
         order.lifecycle_status = self._map_status(order.last_exchange_status)
         order.filled_size = float(status.get("filled_size") or order.filled_size)
         order.average_fill_price = float(status.get("average_fill_price") or order.average_fill_price)
-        order.remaining_size = float(status.get("remaining_size") or max(order.intended_size - order.filled_size, 0.0))
+        order.remaining_size = self._resolve_remaining_size(order, status)
         order.last_update_at = datetime.now(timezone.utc)
         order.raw_exchange_response_refs.append(self.audit.record("status_response", {"ts": datetime.now(timezone.utc).isoformat(), "exchange_order_id": order.exchange_order_id, "status": status}))
         if order.lifecycle_status in {OrderLifecycleStatus.CANCELLED, OrderLifecycleStatus.REJECTED, OrderLifecycleStatus.EXPIRED, OrderLifecycleStatus.FILLED}:
@@ -146,6 +153,7 @@ class LiveOrderManager:
             "CREATED": OrderLifecycleStatus.CREATED,
             "SUBMITTED": OrderLifecycleStatus.SUBMITTED,
             "ACKNOWLEDGED": OrderLifecycleStatus.ACKNOWLEDGED,
+            "LIVE": OrderLifecycleStatus.RESTING,
             "RESTING": OrderLifecycleStatus.RESTING,
             "OPEN": OrderLifecycleStatus.RESTING,
             "PARTIALLY_FILLED": OrderLifecycleStatus.PARTIALLY_FILLED,
@@ -155,3 +163,25 @@ class LiveOrderManager:
             "EXPIRED": OrderLifecycleStatus.EXPIRED,
         }
         return mapping.get(normalized, OrderLifecycleStatus.UNKNOWN)
+
+    def _resolve_remaining_size(self, order: LiveOrder, status: dict) -> float:
+        raw_remaining = status.get("remaining_size")
+        if raw_remaining not in (None, ""):
+            try:
+                remaining = float(raw_remaining)
+                if remaining > 0 or order.lifecycle_status in {OrderLifecycleStatus.FILLED, OrderLifecycleStatus.CANCELLED, OrderLifecycleStatus.REJECTED, OrderLifecycleStatus.EXPIRED}:
+                    return remaining
+            except (TypeError, ValueError):
+                pass
+
+        raw = status.get("raw")
+        if isinstance(raw, dict):
+            try:
+                original_size = float(raw.get("original_size") or 0.0)
+                size_matched = float(raw.get("size_matched") or 0.0)
+                if original_size > 0:
+                    return max(original_size - size_matched, 0.0)
+            except (TypeError, ValueError):
+                pass
+
+        return max(order.intended_size - order.filled_size, 0.0)

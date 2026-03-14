@@ -116,6 +116,7 @@ class EnvConfig(BaseModel):
     polymarket_api_passphrase: str = ""
     polymarket_private_key: str = ""
     polymarket_funder: str = ""
+    polymarket_signature_type: int | None = None
     live_trading_enabled: bool = False
     allowed_country_codes: list[str] = Field(default_factory=list)
     country_code: str = "US"
@@ -186,6 +187,11 @@ def _load_env() -> EnvConfig:
         polymarket_api_passphrase=os.getenv("POLYMARKET_API_PASSPHRASE", ""),
         polymarket_private_key=os.getenv("POLYMARKET_PRIVATE_KEY", ""),
         polymarket_funder=os.getenv("POLYMARKET_FUNDER", ""),
+        polymarket_signature_type=(
+            int(os.getenv("POLYMARKET_SIGNATURE_TYPE", ""))
+            if os.getenv("POLYMARKET_SIGNATURE_TYPE", "").strip()
+            else None
+        ),
         live_trading_enabled=os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true",
         allowed_country_codes=[code.strip() for code in allowed if code.strip()],
         country_code=os.getenv("COUNTRY_CODE", "US"),

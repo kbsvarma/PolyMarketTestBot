@@ -3,6 +3,53 @@ from __future__ import annotations
 from src.models import ReconciliationIssue, ReconciliationSummary
 
 
+def _normalize_order_status(value: object) -> str:
+    status = str(value or "").upper()
+    mapping = {
+        "LIVE": "RESTING",
+        "OPEN": "RESTING",
+    }
+    return mapping.get(status, status)
+
+
+def _normalize_local_order_status(item: dict) -> str:
+    lifecycle = str(item.get("lifecycle_status") or "")
+    if lifecycle.upper() == "UNKNOWN" and item.get("last_exchange_status"):
+        return _normalize_order_status(item.get("last_exchange_status"))
+    return _normalize_order_status(lifecycle or item.get("last_exchange_status"))
+
+
+def _normalize_exchange_remaining(item: dict) -> float:
+    remaining = item.get("remaining_size")
+    if remaining in (None, ""):
+        remaining = item.get("remaining")
+    try:
+        numeric = float(remaining or 0.0)
+    except (TypeError, ValueError):
+        numeric = 0.0
+    if numeric > 0:
+        return round(numeric, 6)
+
+    try:
+        original_size = float(item.get("original_size") or 0.0)
+        size_matched = float(item.get("size_matched") or 0.0)
+    except (TypeError, ValueError):
+        original_size = 0.0
+        size_matched = 0.0
+    if original_size > 0:
+        return round(max(original_size - size_matched, 0.0), 6)
+    return 0.0
+
+
+def _normalize_order_quantity(value: object) -> float:
+    try:
+        numeric = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    scaled = int(numeric * 100)
+    return scaled / 100.0
+
+
 def reconcile_live_state(local_positions: list[dict], exchange_positions: list[dict], local_orders: list[dict], exchange_orders: list[dict]) -> ReconciliationSummary:
     issues: list[ReconciliationIssue] = []
 
@@ -37,10 +84,10 @@ def reconcile_live_state(local_positions: list[dict], exchange_positions: list[d
     local_order_keys = {
         (
             str(item.get("exchange_order_id") or item.get("client_order_id") or item.get("local_order_id")),
-            str(item.get("client_order_id") or ""),
-            str(item.get("lifecycle_status") or item.get("last_exchange_status")),
-            round(float(item.get("filled_size") or 0.0), 6),
-            round(float(item.get("remaining_size") or 0.0), 6),
+            "",
+            _normalize_local_order_status(item),
+            _normalize_order_quantity(item.get("filled_size")),
+            _normalize_order_quantity(item.get("remaining_size")),
             str(item.get("linked_position_id") or ""),
         )
         for item in local_orders
@@ -49,10 +96,10 @@ def reconcile_live_state(local_positions: list[dict], exchange_positions: list[d
     exchange_order_keys = {
         (
             str(item.get("id") or item.get("orderID") or item.get("exchange_order_id") or item.get("client_order_id")),
-            str(item.get("client_order_id") or item.get("clientOrderId") or ""),
-            str(item.get("status") or item.get("state") or ""),
-            round(float(item.get("filled_size") or item.get("filled") or 0.0), 6),
-            round(float(item.get("remaining_size") or item.get("remaining") or 0.0), 6),
+            "",
+            _normalize_order_status(item.get("status") or item.get("state") or ""),
+            _normalize_order_quantity(item.get("filled_size") or item.get("filled")),
+            _normalize_order_quantity(_normalize_exchange_remaining(item)),
             "",
         )
         for item in exchange_orders
@@ -68,7 +115,12 @@ def reconcile_live_state(local_positions: list[dict], exchange_positions: list[d
             )
         )
 
-    unresolved_unknowns = [item for item in local_orders if str(item.get("lifecycle_status")) == "UNKNOWN" and not item.get("terminal_state")]
+    unresolved_unknowns = [
+        item
+        for item in local_orders
+        if _normalize_local_order_status(item) == "UNKNOWN"
+        and not item.get("terminal_state")
+    ]
     if unresolved_unknowns:
         issues.append(
             ReconciliationIssue(

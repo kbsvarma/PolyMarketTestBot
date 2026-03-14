@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from src.models import Mode
 from src.models import SystemStatus
 from src.state import AppStateStore
 
@@ -20,10 +21,18 @@ class SystemStateMachine:
     def __init__(self, store: AppStateStore) -> None:
         self.store = store
 
+    def _coerce_status(self, raw: str) -> SystemStatus:
+        try:
+            return SystemStatus(raw)
+        except ValueError:
+            if raw == Mode.LIVE.value:
+                return SystemStatus.PAUSED
+            return SystemStatus.INIT
+
     def transition(self, new_status: SystemStatus, reason: str) -> None:
         state = self.store.read()
         current_raw = state.get("system_status", SystemStatus.INIT.value)
-        current = SystemStatus(current_raw)
+        current = self._coerce_status(str(current_raw))
         if new_status not in ALLOWED_TRANSITIONS.get(current, set()):
             raise ValueError(f"Invalid state transition: {current.value} -> {new_status.value}")
         readiness = state.get("live_readiness_last_result", {}) or {}

@@ -1,0 +1,90 @@
+mode: LIVE
+runtime:
+  ui_refresh_seconds: 15
+  discovery_interval_minutes: 45
+  polling_interval_seconds: 20
+  summary_interval_minutes: 60
+  wallet_evaluation_window_days: 30
+  max_runtime_cycles: 0
+bankroll:
+  paper_starting_bankroll: 200.0
+  live_bankroll_reference: 200.0
+risk:
+  max_total_exposure_pct: 0.15
+  max_market_exposure_pct: 0.04
+  max_wallet_exposure_pct: 0.06
+  copy_fraction_min: 0.03
+  copy_fraction_max: 0.05
+  max_single_live_trade_usd: 1.0
+  daily_stop_loss_pct: 0.05
+  max_new_entries_per_hour: 1
+  stale_signal_seconds: 90
+  stale_market_data_seconds: 15
+  max_spread_pct: 0.025
+  max_entry_drift_pct: 0.03
+  max_slippage_pct: 0.03
+  min_orderbook_depth_usd: 50.0
+  max_hedge_suspicion_score: 0.72
+  require_cluster_confirmation_live: false
+  heartbeat_timeout_seconds: 30
+  order_timeout_seconds: 20
+  max_reprice_attempts: 1
+  allow_categories:
+    - politics
+cluster:
+  enabled: true
+  confirmation_window_seconds: 180
+  min_wallets: 2
+  strong_cluster_wallets: 3
+  mode: HYBRID
+entry_styles:
+  compare:
+    - FOLLOW_TAKER
+    - PASSIVE_LIMIT
+    - POST_ONLY_MAKER
+  preferred_live_entry_style: PASSIVE_LIMIT
+backtest:
+  delay_buckets_seconds:
+    - 5
+    - 15
+    - 30
+    - 60
+  min_wallet_replay_expectancy: 0.01
+  min_wallet_copyability_score: 0.55
+wallet_selection:
+  top_research_wallets: 5
+  approved_paper_wallets: 3
+  min_trade_count: 12
+  min_copyability_score: 0.55
+  min_delay_viability_score: 0.50
+categories:
+  tracked:
+    - politics
+    - regulatory / legal
+    - crypto price
+    - sports
+    - entertainment / pop culture
+    - macro / economics
+    - geopolitics
+alerts:
+  enable_console_alerts: true
+  health_pause_on_live_mismatch: true
+live:
+  enabled: true
+  require_paper_validation: true
+  only_cluster_confirmed: false
+  only_low_hedge_suspicion: true
+  manual_live_enable: true
+  manual_resume_required: true
+  global_kill_switch: false
+  emergency_flatten_flag: false
+  heartbeat_required: true
+  bounded_execution_seconds: 20
+  enable_multi_entry_style_live: false
+  selected_categories:
+    - politics
+endpoints:
+  gamma_base_url: https://gamma-api.polymarket.com
+  clob_base_url: https://clob.polymarket.com
+  data_base_url: https://data-api.polymarket.com
+  user_agent: polymarket-wallet-follow-bot/0.2

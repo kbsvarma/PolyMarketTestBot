@@ -56,8 +56,16 @@ class StrategyEngine:
             total_exposure += notional
 
         await self.market_data.refresh_markets()
-        ws_snapshots = await self.market_data.stream_watchlist(sorted({detection.token_id for detection in detections}))
+        valid_watchlist_token_ids = sorted(
+            {
+                token_id
+                for token_id in (str(detection.token_id or "").strip() for detection in detections)
+                if token_id
+            }
+        )
+        ws_snapshots = await self.market_data.stream_watchlist(valid_watchlist_token_ids) if valid_watchlist_token_ids else {}
         effective_paper_wallets = approved_wallets.paper_wallets or approved_wallets.research_wallets[: self.config.wallet_selection.approved_paper_wallets]
+        effective_live_wallets = approved_wallets.live_wallets or effective_paper_wallets[:1]
 
         for detection in detections:
             wallet = wallet_map.get(detection.wallet_address)
@@ -65,16 +73,182 @@ class StrategyEngine:
                 continue
             state_snapshot = self.state.read()
             decision_category = detection.category if detection.category != "unknown" else wallet.dominant_category
-            market_meta = await self.market_data.fetch_market_metadata(detection.market_id)
-            tradability = await self.market_data.get_tradability(detection.market_id, detection.token_id)
-            orderbook = await self.market_data.fetch_orderbook(detection.token_id)
+            discovery_state = str(state_snapshot.get("wallet_discovery_state", "UNKNOWN"))
+            scoring_state = str(state_snapshot.get("wallet_scoring_state", "UNKNOWN"))
+            decision_source_quality = min([wallet.source_quality, detection.source_quality], key=quality_rank)
+            if not str(detection.token_id or "").strip():
+                skip = self._skip_decision(
+                    detection,
+                    wallet,
+                    min(detection.notional * self._select_copy_fraction(wallet), self._max_notional_for_mode()),
+                    "MISSING_TOKEN_ID",
+                    "Signal skipped because the source trade did not include a usable token_id.",
+                )
+                skip.context.update(
+                    {
+                        "discovery_state": discovery_state,
+                        "scoring_state": scoring_state,
+                        "source_quality": decision_source_quality.value,
+                        "trust_level": classify_trust_level(
+                            source_quality=decision_source_quality.value,
+                            discovery_state=discovery_state,
+                            scoring_state=scoring_state,
+                            fallback_in_use=decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                        ),
+                        "fallback_used": decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                        "counts_as_trustworthy_approval": False,
+                    }
+                )
+                self._write_decision_trace(
+                    detection,
+                    skip,
+                    False,
+                    [],
+                    discovery_state,
+                    scoring_state,
+                    decision_source_quality,
+                )
+                decisions.append(skip)
+                continue
+            try:
+                market_meta = await self.market_data.fetch_market_metadata(detection.market_id, detection.token_id)
+            except RuntimeError as exc:
+                if str(detection.token_id or "").strip() and detection.token_id != "unknown-token":
+                    market_meta = {
+                        "market_id": detection.market_id,
+                        "token_id": detection.token_id,
+                        "title": detection.market_title,
+                        "slug": detection.market_slug,
+                        "category": decision_category,
+                        "active": True,
+                        "closed": False,
+                        "metadata_fallback": True,
+                        "market_meta_error": str(exc),
+                    }
+                else:
+                    skip = self._skip_decision(
+                        detection,
+                        wallet,
+                        min(detection.notional * self._select_copy_fraction(wallet), self._max_notional_for_mode()),
+                        "MISSING_MARKET_METADATA",
+                        f"Live market metadata unavailable for {detection.market_id}; signal skipped conservatively.",
+                    )
+                    skip.context.update(
+                        {
+                            "market_meta_error": str(exc),
+                            "market_meta": {"market_id": detection.market_id, "title": detection.market_title, "slug": detection.market_slug},
+                            "tradability": {"market_id": detection.market_id, "token_id": detection.token_id, "tradable": False, "orderbook_enabled": False},
+                            "discovery_state": discovery_state,
+                            "scoring_state": scoring_state,
+                            "source_quality": decision_source_quality.value,
+                            "trust_level": classify_trust_level(
+                                source_quality=decision_source_quality.value,
+                                discovery_state=discovery_state,
+                                scoring_state=scoring_state,
+                                fallback_in_use=decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                            ),
+                            "fallback_used": decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                            "counts_as_trustworthy_approval": False,
+                        }
+                    )
+                    self._write_decision_trace(
+                        detection,
+                        skip,
+                        False,
+                        [],
+                        discovery_state,
+                        scoring_state,
+                        decision_source_quality,
+                    )
+                    decisions.append(skip)
+                    continue
+            try:
+                tradability = await self.market_data.get_tradability(detection.market_id, detection.token_id)
+            except RuntimeError as exc:
+                skip = self._skip_decision(
+                    detection,
+                    wallet,
+                    min(detection.notional * self._select_copy_fraction(wallet), self._max_notional_for_mode()),
+                    "MISSING_TRADABILITY",
+                    f"Live tradability unavailable for {detection.market_id}/{detection.token_id}; signal skipped conservatively.",
+                )
+                skip.context.update(
+                    {
+                        "market_meta": market_meta,
+                        "tradability_error": str(exc),
+                        "tradability": {
+                            "market_id": detection.market_id,
+                            "token_id": detection.token_id,
+                            "tradable": False,
+                            "orderbook_enabled": False,
+                        },
+                        "discovery_state": discovery_state,
+                        "scoring_state": scoring_state,
+                        "source_quality": decision_source_quality.value,
+                        "trust_level": classify_trust_level(
+                            source_quality=decision_source_quality.value,
+                            discovery_state=discovery_state,
+                            scoring_state=scoring_state,
+                            fallback_in_use=decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                        ),
+                        "fallback_used": decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                        "counts_as_trustworthy_approval": False,
+                    }
+                )
+                self._write_decision_trace(
+                    detection,
+                    skip,
+                    False,
+                    [],
+                    discovery_state,
+                    scoring_state,
+                    decision_source_quality,
+                )
+                decisions.append(skip)
+                continue
+            try:
+                orderbook = await self.market_data.fetch_orderbook(detection.token_id)
+            except RuntimeError as exc:
+                skip = self._skip_decision(
+                    detection,
+                    wallet,
+                    min(detection.notional * self._select_copy_fraction(wallet), self._max_notional_for_mode()),
+                    "ORDERBOOK_UNAVAILABLE",
+                    f"Live orderbook unavailable for token {detection.token_id}; signal skipped conservatively.",
+                )
+                skip.context.update(
+                    {
+                        "market_meta": market_meta,
+                        "tradability": tradability,
+                        "orderbook_error": str(exc),
+                        "discovery_state": discovery_state,
+                        "scoring_state": scoring_state,
+                        "source_quality": decision_source_quality.value,
+                        "trust_level": classify_trust_level(
+                            source_quality=decision_source_quality.value,
+                            discovery_state=discovery_state,
+                            scoring_state=scoring_state,
+                            fallback_in_use=decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                        ),
+                        "fallback_used": decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                        "counts_as_trustworthy_approval": False,
+                    }
+                )
+                self._write_decision_trace(
+                    detection,
+                    skip,
+                    False,
+                    [],
+                    discovery_state,
+                    scoring_state,
+                    decision_source_quality,
+                )
+                decisions.append(skip)
+                continue
             cluster = cluster_lookup.get((detection.market_id, detection.token_id))
             cluster_confirmed = cluster is not None
             copy_fraction = self._select_copy_fraction(wallet)
             scaled_notional = min(detection.notional * copy_fraction, self._max_notional_for_mode())
-            decision_source_quality = min([wallet.source_quality, detection.source_quality], key=quality_rank)
-            discovery_state = str(state_snapshot.get("wallet_discovery_state", "UNKNOWN"))
-            scoring_state = str(state_snapshot.get("wallet_scoring_state", "UNKNOWN"))
 
             best_decision = self._skip_decision(detection, wallet, scaled_notional, "NO_VALID_ENTRY_STYLE", "No entry style passed all checks.")
             style_evaluations: list[dict[str, object]] = []
@@ -172,8 +346,11 @@ class StrategyEngine:
                 )
 
                 action = DecisionAction.SKIP
-                if risk.allowed and detection.wallet_address in effective_paper_wallets:
-                    action = DecisionAction.PAPER_COPY if self.config.mode.value != "LIVE" else DecisionAction.LIVE_COPY
+                if risk.allowed:
+                    if self.config.mode.value == "LIVE" and detection.wallet_address in effective_live_wallets:
+                        action = DecisionAction.LIVE_COPY
+                    elif self.config.mode.value != "LIVE" and detection.wallet_address in effective_paper_wallets:
+                        action = DecisionAction.PAPER_COPY
                 decision = TradeDecision(
                     allowed=risk.allowed,
                     action=action,

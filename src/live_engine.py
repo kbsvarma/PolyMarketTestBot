@@ -53,6 +53,9 @@ class LiveTradingEngine:
         client_health = await self.client.health_check()
         checks["auth_valid"] = client_health.ok
         checks["auth_detail"] = client_health.detail
+        live_order_capable, live_order_capable_detail = self.client.live_order_capable()
+        checks["live_order_capable"] = live_order_capable
+        checks["live_order_capable_detail"] = live_order_capable_detail
 
         try:
             balance = await self.client.get_balance()
@@ -64,19 +67,31 @@ class LiveTradingEngine:
 
         try:
             allowance = await self.client.get_allowance()
+            checks["allowance_visible"] = bool(allowance.get("query_visible", True))
             checks["allowance_sufficient"] = bool(allowance.get("sufficient", False))
+            checks["allowance_available"] = float(allowance.get("available", 0.0) or 0.0)
+            checks["allowance_raw_summary"] = allowance.get("raw_summary", {})
+            checks["allowance_sdk_signature_type"] = allowance.get("sdk_signature_type")
+            checks["allowance_configured_signature_type"] = allowance.get("configured_signature_type")
             checks["allowance_detail"] = str(allowance)
         except Exception as exc:
+            checks["allowance_visible"] = False
             checks["allowance_sufficient"] = False
+            checks["allowance_available"] = 0.0
+            checks["allowance_raw_summary"] = {"error": str(exc)}
+            checks["allowance_sdk_signature_type"] = None
+            checks["allowance_configured_signature_type"] = self.config.env.polymarket_signature_type
             checks["allowance_detail"] = str(exc)
 
         try:
             wallet_balances = await self.client.get_wallet_stablecoin_balances()
             checks["wallet_balance_visible"] = True
             checks["wallet_balance_detail"] = str(wallet_balances)
+            checks["wallet_total_stablecoins"] = float(wallet_balances.get("total_stablecoins", 0.0) or 0.0)
         except Exception as exc:
             checks["wallet_balance_visible"] = False
             checks["wallet_balance_detail"] = str(exc)
+            checks["wallet_total_stablecoins"] = 0.0
 
         try:
             open_orders = await self.client.get_open_orders()
@@ -89,9 +104,13 @@ class LiveTradingEngine:
         try:
             positions = await self.client.get_positions()
             checks["positions_visible"] = True
+            checks["positions_count"] = len(positions)
+            checks["positions_query_error"] = ""
             checks["positions_detail"] = f"{len(positions)} positions visible"
         except Exception as exc:
             checks["positions_visible"] = False
+            checks["positions_count"] = 0
+            checks["positions_query_error"] = str(exc)
             checks["positions_detail"] = str(exc)
 
         try:
@@ -117,11 +136,22 @@ class LiveTradingEngine:
         reconciliation = await self.reconcile()
         checks["reconciliation_clean"] = reconciliation.clean
         checks["reconciliation_detail"] = reconciliation.severity
+        checks["reconciliation_summary"] = reconciliation.model_dump(mode="json")
         return checks
 
     async def refresh_live_status(self) -> None:
-        health = await self.collect_health()
         checks = await self.startup_validation()
+        reconciliation_summary = checks.get("reconciliation_summary", {})
+        unresolved = [
+            order.local_order_id
+            for order in self.orders.load()
+            if order.lifecycle_status == OrderLifecycleStatus.UNKNOWN and not order.terminal_state
+        ]
+        if bool(checks.get("reconciliation_clean", False)):
+            current = self.state.read()
+            if current.get("pause_reason") == "Live readiness gate failed." and not unresolved:
+                self.state.clear_pause()
+        health = await self.collect_health()
         readiness = build_readiness_result(self.config, self.state, health, checks)
         positions_payload: list[dict] = []
         try:
@@ -144,13 +174,20 @@ class LiveTradingEngine:
             heartbeat_ok=not any(component.name == "heartbeat" and component.state != HealthState.HEALTHY for component in health.components),
             balance_visible=bool(checks.get("balance_visible", False)),
             balance_detail=str(checks.get("balance_detail", "")),
-            allowance_visible=bool(checks.get("allowance_sufficient", False)),
+            allowance_visible=bool(checks.get("allowance_visible", False)),
+            manual_live_enable=bool(self.config.live.manual_live_enable),
             allowance_sufficient=bool(checks.get("allowance_sufficient", False)),
+            allowance_available=float(checks.get("allowance_available", 0.0) or 0.0),
+            allowance_raw_summary=checks.get("allowance_raw_summary", {}),
             allowance_detail=str(checks.get("allowance_detail", "")),
+            allowance_sdk_signature_type=checks.get("allowance_sdk_signature_type"),
+            allowance_configured_signature_type=checks.get("allowance_configured_signature_type"),
             auth_detail=str(checks.get("auth_detail", "")),
             open_orders_visible=bool(checks.get("open_orders_visible", False)),
             open_orders_detail=str(checks.get("open_orders_detail", "")),
             positions_visible=bool(checks.get("positions_visible", False)),
+            positions_count=int(checks.get("positions_count", 0) or 0),
+            positions_query_error=str(checks.get("positions_query_error", "")),
             positions_detail=str(checks.get("positions_detail", "")),
             connected_funder_wallet=self.config.env.polymarket_funder,
             connected_proxy_wallet=connected_proxy_wallet,
@@ -164,7 +201,8 @@ class LiveTradingEngine:
             tradability_ok=bool(checks.get("tradability_ok", False)),
             tradability_detail=str(checks.get("tradability_detail", "")),
             reconciliation_clean=bool(checks.get("reconciliation_clean", False)),
-            reconciliation_summary=(await self.reconcile()).model_dump(mode="json"),
+            reconciliation_summary=reconciliation_summary,
+            unresolved_live_order_ids=unresolved,
             live_last_reconciled_at=datetime.now(timezone.utc).isoformat(),
         )
         if self.config.mode.value == "LIVE":

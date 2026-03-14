@@ -13,7 +13,10 @@ class LiveOrderStore:
 
     def load(self) -> list[LiveOrder]:
         payload = read_json(self.path, [])
-        return [LiveOrder.model_validate(item) for item in payload]  # type: ignore[arg-type]
+        orders = [LiveOrder.model_validate(item) for item in payload]  # type: ignore[arg-type]
+        for order in orders:
+            self._normalize_loaded_order(order)
+        return orders
 
     def save(self, orders: list[LiveOrder]) -> None:
         write_json(self.path, [order.model_dump(mode="json") for order in orders])
@@ -46,3 +49,31 @@ class LiveOrderStore:
             lifecycle_status=OrderLifecycleStatus.CREATED,
             timeout_at=datetime.now(timezone.utc),
         )
+
+    def _normalize_loaded_order(self, order: LiveOrder) -> None:
+        if order.lifecycle_status != OrderLifecycleStatus.UNKNOWN:
+            return
+        normalized = str(order.last_exchange_status or "").upper()
+        mapping = {
+            "LIVE": OrderLifecycleStatus.RESTING,
+            "RESTING": OrderLifecycleStatus.RESTING,
+            "OPEN": OrderLifecycleStatus.RESTING,
+            "SUBMITTED": OrderLifecycleStatus.SUBMITTED,
+            "ACKNOWLEDGED": OrderLifecycleStatus.ACKNOWLEDGED,
+            "PARTIALLY_FILLED": OrderLifecycleStatus.PARTIALLY_FILLED,
+            "FILLED": OrderLifecycleStatus.FILLED,
+            "CANCELLED": OrderLifecycleStatus.CANCELLED,
+            "REJECTED": OrderLifecycleStatus.REJECTED,
+            "EXPIRED": OrderLifecycleStatus.EXPIRED,
+        }
+        mapped = mapping.get(normalized)
+        if mapped is None:
+            return
+        order.lifecycle_status = mapped
+        if mapped in {
+            OrderLifecycleStatus.CANCELLED,
+            OrderLifecycleStatus.REJECTED,
+            OrderLifecycleStatus.EXPIRED,
+            OrderLifecycleStatus.FILLED,
+        }:
+            order.terminal_state = True

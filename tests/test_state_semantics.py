@@ -53,3 +53,16 @@ def test_state_machine_allows_live_ready_with_positive_readiness(tmp_path: Path)
     machine = SystemStateMachine(store)
     machine.transition(SystemStatus.LIVE_READY, "test")
     assert store.read()["system_status"] == SystemStatus.LIVE_READY.value
+
+
+def test_state_machine_coerces_legacy_live_status_for_live_ready_transition(tmp_path: Path) -> None:
+    store = AppStateStore(tmp_path / "app_state.json")
+    store.write(
+        {
+            "system_status": "LIVE",
+            "live_readiness_last_result": {"ready": True},
+        }
+    )
+    machine = SystemStateMachine(store)
+    machine.transition(SystemStatus.LIVE_READY, "test")
+    assert store.read()["system_status"] == SystemStatus.LIVE_READY.value

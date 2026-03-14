@@ -71,3 +71,56 @@ def test_timeout_cancels_unfilled_order() -> None:
     )
     result = __import__("asyncio").run(manager.handle_timeout(order))
     assert result in {"CANCELLED", "TIMED_OUT"}
+
+
+def test_failed_submit_marks_order_rejected(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.yaml", root / ".env.example")
+    client = PolymarketClient(config)
+    manager = LiveOrderManager(config, tmp_path, client, AuditLogger(tmp_path / "live_audit.jsonl"))
+    order = manager.create_entry_order(build_decision())
+
+    async def _fail(**kwargs):
+        raise RuntimeError("invalid signature")
+
+    client.place_buy_order = _fail  # type: ignore[method-assign]
+
+    try:
+        __import__("asyncio").run(manager.submit_order(order, side="BUY"))
+        assert False, "expected RuntimeError"
+    except RuntimeError as exc:
+        assert "invalid signature" in str(exc)
+
+    assert order.lifecycle_status == OrderLifecycleStatus.REJECTED
+    assert order.terminal_state is True
+    assert order.last_exchange_status == "REJECTED"
+
+
+def test_refresh_order_maps_live_status_to_resting_and_uses_raw_size(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.yaml", root / ".env.example")
+    client = PolymarketClient(config)
+    manager = LiveOrderManager(config, tmp_path, client, AuditLogger(tmp_path / "live_audit.jsonl"))
+    order = manager.create_entry_order(build_decision())
+    order.exchange_order_id = "ex1"
+    order.intended_size = 5.769231
+
+    async def _status(order_id: str):
+        assert order_id == "ex1"
+        return {
+            "exchange_order_id": "ex1",
+            "status": "LIVE",
+            "filled_size": 0.0,
+            "average_fill_price": 0.0,
+            "remaining_size": 0.0,
+            "raw": {"original_size": "5.76", "size_matched": "0"},
+        }
+
+    client.get_order_status = _status  # type: ignore[method-assign]
+
+    __import__("asyncio").run(manager.refresh_order(order))
+
+    assert order.lifecycle_status == OrderLifecycleStatus.RESTING
+    assert order.last_exchange_status == "LIVE"
+    assert order.remaining_size == 5.76
+    assert order.terminal_state is False

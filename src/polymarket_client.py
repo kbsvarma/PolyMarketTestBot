@@ -52,6 +52,7 @@ class PolymarketClient:
         self.headers = {"User-Agent": config.endpoints.user_agent}
         self.client = httpx.AsyncClient(timeout=12.0, headers=self.headers) if httpx else None
         self._sdk_init_error = ""
+        self._preferred_signature_type: int | None = config.env.polymarket_signature_type
         self._sdk_client = self._build_sdk_client()
 
     def _build_sdk_client(self) -> Any:
@@ -79,6 +80,7 @@ class PolymarketClient:
                 chain_id=self.config.env.polymarket_chain_id,
                 key=self.config.env.polymarket_private_key,
                 creds=creds,
+                signature_type=self.config.env.polymarket_signature_type,
                 funder=self.config.env.polymarket_funder or None,
             )
             if creds is not None and hasattr(client, "set_api_creds"):
@@ -92,9 +94,187 @@ class PolymarketClient:
             self._sdk_init_error = str(exc)
             return None
 
+    def live_order_capable(self) -> tuple[bool, str]:
+        if not self.config.env.live_trading_enabled:
+            return False, "LIVE_TRADING_ENABLED is false."
+        if self._sdk_client is None:
+            return False, self._sdk_init_error or "py-clob-client is not initialized."
+        required_methods = ("create_order", "post_order", "get_order", "cancel", "get_orders")
+        missing = [name for name in required_methods if not hasattr(self._sdk_client, name)]
+        if missing:
+            return False, f"SDK client missing required live order methods: {', '.join(missing)}"
+        return True, "SDK live order methods are available."
+
     async def close(self) -> None:
         if self.client:
             await self.client.aclose()
+
+    def _to_float(self, value: Any) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _to_collateral_amount(self, value: Any) -> float:
+        if value in (None, ""):
+            return 0.0
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped.startswith("0x"):
+                return 0.0
+            if "." in stripped:
+                return self._to_float(stripped)
+            if stripped.lstrip("-").isdigit():
+                return self._to_float(stripped) / 1_000_000.0
+        if isinstance(value, int):
+            return float(value) / 1_000_000.0
+        return self._to_float(value)
+
+    def _normalize_positions_payload(self, payload: Any) -> list[dict[str, Any]]:
+        if payload is None:
+            raise RuntimeError("Empty positions response")
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            for key in ("data", "positions", "items"):
+                rows = payload.get(key)
+                if isinstance(rows, list):
+                    return [item for item in rows if isinstance(item, dict)]
+            if payload:
+                return [payload]
+        raise RuntimeError(f"Malformed positions response type: {type(payload).__name__}")
+
+    def _summarize_payload(self, payload: Any) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            keys = sorted(payload.keys())
+            return {"type": "dict", "keys": keys[:10]}
+        if isinstance(payload, list):
+            return {"type": "list", "length": len(payload)}
+        return {"type": type(payload).__name__}
+
+    def _market_info_from_item(self, item: dict[str, Any]) -> MarketInfo | None:
+        token_id = ""
+        clob_token_ids = item.get("clobTokenIds")
+        if isinstance(clob_token_ids, list) and clob_token_ids:
+            token_id = str(clob_token_ids[0])
+        elif isinstance(clob_token_ids, str):
+            token_id = clob_token_ids.split(",")[0].strip("[]\" ")
+        row = MarketInfo(
+            market_id=str(item.get("conditionId") or item.get("id") or item.get("slug") or ""),
+            token_id=token_id or str(item.get("tokenId") or item.get("clobTokenId") or item.get("asset_id") or ""),
+            title=str(item.get("question") or item.get("title") or item.get("description") or "Unknown market"),
+            slug=str(item.get("slug") or item.get("marketSlug") or ""),
+            category=str(item.get("category") or "unknown"),
+            active=bool(item.get("active", True)),
+            closed=bool(item.get("closed", False)),
+            liquidity=float(item.get("liquidity") or 0.0),
+            volume=float(item.get("volume") or item.get("volumeNum") or 0.0),
+            end_date_iso=item.get("endDate") or item.get("end_date_iso"),
+            source_quality=SourceQuality.REAL_PUBLIC_DATA,
+        )
+        if row.market_id and row.token_id:
+            return row
+        return None
+
+    def _extract_market_rows(self, payload: Any) -> list[dict[str, Any]]:
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict):
+            for key in ("markets", "data", "items"):
+                rows = payload.get(key)
+                if isinstance(rows, list):
+                    return [item for item in rows if isinstance(item, dict)]
+            return [payload]
+        return []
+
+    def _normalize_allowance_payload(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Malformed allowance response type: {type(payload).__name__}")
+        allowances = payload.get("allowances", {})
+        allowance_values: list[float] = []
+        if isinstance(allowances, dict):
+            for value in allowances.values():
+                allowance_values.append(self._to_collateral_amount(value))
+        top_level_available = self._to_collateral_amount(payload.get("available"))
+        top_level_balance = self._to_collateral_amount(payload.get("balance"))
+        top_level_allowance = self._to_collateral_amount(payload.get("allowance"))
+        approval_capacity = max([top_level_allowance, *allowance_values], default=0.0)
+        spendable_balance = max(top_level_available, top_level_balance, 0.0)
+        available = spendable_balance if spendable_balance > 0 else approval_capacity
+        sufficient = available > 0 and (approval_capacity > 0 or not isinstance(allowances, dict) or len(allowances) == 0)
+        return {
+            "available": available,
+            "sufficient": sufficient,
+            "approval_capacity": approval_capacity,
+            "raw": payload,
+            "raw_summary": {
+                "top_level_balance": top_level_balance,
+                "top_level_available": top_level_available,
+                "top_level_allowance": top_level_allowance,
+                "allowance_entry_count": len(allowances) if isinstance(allowances, dict) else 0,
+                "max_allowance_entry": max(allowance_values, default=0.0),
+                "approval_capacity": approval_capacity,
+            },
+            "query_visible": True,
+            "source_quality": SourceQuality.REAL_PUBLIC_DATA.value,
+        }
+
+    def _allowance_params_variants(self) -> list[Any]:
+        if BalanceAllowanceParams is None or AssetType is None:
+            return []
+        signature_type = getattr(getattr(self, "_sdk_client", None), "builder", None)
+        signature_type = getattr(signature_type, "sig_type", None)
+        configured_signature_type = self.config.env.polymarket_signature_type
+        signature_types = [configured_signature_type, signature_type, 0, 1, 2, None]
+        variants = []
+        for value in signature_types:
+            if value is None:
+                variants.append(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            else:
+                variants.append(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=value))
+        seen: set[tuple[str, str, object]] = set()
+        deduped: list[Any] = []
+        for params in variants:
+            key = (str(getattr(params, "asset_type", "")), str(getattr(params, "token_id", "")), getattr(params, "signature_type", None))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(params)
+        return deduped
+
+    def _extract_sdk_signature_type(self) -> int | None:
+        builder = getattr(self._sdk_client, "builder", None)
+        signature_type = getattr(builder, "sig_type", None)
+        if signature_type is None:
+            return self.config.env.polymarket_signature_type
+        return int(signature_type)
+
+    def _set_order_signature_type(self, signature_type: int | None) -> None:
+        builder = getattr(self._sdk_client, "builder", None)
+        if builder is not None and signature_type is not None:
+            builder.sig_type = int(signature_type)
+            self._preferred_signature_type = int(signature_type)
+
+    def _order_signature_type_candidates(self) -> list[int | None]:
+        current = self._extract_sdk_signature_type()
+        configured = self.config.env.polymarket_signature_type
+        candidates = [self._preferred_signature_type, configured, current, 1, 0]
+        deduped: list[int | None] = []
+        for item in candidates:
+            if item in deduped:
+                continue
+            deduped.append(item)
+        return deduped
+
+    def _best_allowance_attempt(self, attempts: list[dict[str, Any]]) -> dict[str, Any]:
+        return max(
+            attempts,
+            key=lambda item: (
+                float(item.get("available", 0.0)),
+                int(bool(item.get("query_visible", False))),
+                1 if item.get("query_method") == "get_balance_allowance" else 0,
+            ),
+        )
 
     async def _rpc_call(self, method: str, params: list[Any]) -> Any:
         if not self.client:
@@ -190,29 +370,10 @@ class PolymarketClient:
     async def fetch_markets(self, limit: int = 100) -> list[MarketInfo]:
         try:
             payload = await self._get_json(f"{self.gamma_url}/markets", params={"limit": limit})
-            markets = payload if isinstance(payload, list) else payload.get("markets", [])
             rows: list[MarketInfo] = []
-            for item in markets:
-                token_id = ""
-                clob_token_ids = item.get("clobTokenIds")
-                if isinstance(clob_token_ids, list) and clob_token_ids:
-                    token_id = str(clob_token_ids[0])
-                elif isinstance(clob_token_ids, str):
-                    token_id = clob_token_ids.split(",")[0].strip("[]\" ")
-                row = MarketInfo(
-                    market_id=str(item.get("conditionId") or item.get("id") or item.get("slug", "")),
-                    token_id=token_id or str(item.get("tokenId") or item.get("clobTokenId") or ""),
-                    title=str(item.get("question") or item.get("title") or item.get("description") or "Unknown market"),
-                    slug=str(item.get("slug") or item.get("marketSlug") or ""),
-                    category=str(item.get("category") or "unknown"),
-                    active=bool(item.get("active", True)),
-                    closed=bool(item.get("closed", False)),
-                    liquidity=float(item.get("liquidity") or 0.0),
-                    volume=float(item.get("volume") or item.get("volumeNum") or 0.0),
-                    end_date_iso=item.get("endDate") or item.get("end_date_iso"),
-                    source_quality=SourceQuality.REAL_PUBLIC_DATA,
-                )
-                if row.market_id and row.token_id:
+            for item in self._extract_market_rows(payload):
+                row = self._market_info_from_item(item)
+                if row is not None:
                     rows.append(row)
             rows = self._ensure_live_data(rows, "markets")
             return rows
@@ -220,6 +381,51 @@ class PolymarketClient:
             if self._live_mode():
                 raise RuntimeError("Unable to fetch real markets in LIVE mode.")
             return self._fallback_markets()
+
+    async def fetch_market_lookup(self, market_id: str, token_id: str = "") -> MarketInfo | None:
+        candidates: list[tuple[str, dict[str, Any] | None]] = []
+        if market_id:
+            candidates.extend(
+                [
+                    (f"{self.gamma_url}/markets/{market_id}", None),
+                    (f"{self.gamma_url}/markets", {"conditionId": market_id}),
+                    (f"{self.gamma_url}/markets", {"id": market_id}),
+                    (f"{self.gamma_url}/markets", {"market": market_id}),
+                ]
+            )
+        if token_id and token_id not in {"unknown-token", "unknown", "None"}:
+            candidates.extend(
+                [
+                    (f"{self.gamma_url}/markets", {"clobTokenIds": token_id}),
+                    (f"{self.gamma_url}/markets", {"clobTokenId": token_id}),
+                    (f"{self.gamma_url}/markets", {"tokenId": token_id}),
+                    (f"{self.gamma_url}/events", {"tokenId": token_id}),
+                ]
+            )
+        for url, params in candidates:
+            try:
+                payload = await self._get_json(url, params=params)
+            except Exception:
+                continue
+            rows = self._extract_market_rows(payload)
+            exact_match: MarketInfo | None = None
+            fallback_match: MarketInfo | None = None
+            for item in rows:
+                market = self._market_info_from_item(item)
+                if market is None:
+                    continue
+                if market.market_id == market_id and (not token_id or market.token_id == token_id):
+                    exact_match = market
+                    break
+                if token_id and market.token_id == token_id:
+                    fallback_match = market
+                elif market.market_id == market_id and fallback_match is None:
+                    fallback_match = market
+            if exact_match is not None:
+                return exact_match
+            if fallback_match is not None:
+                return fallback_match
+        return None
 
     @retry(
         stop=stop_after_attempt(2),
@@ -323,8 +529,25 @@ class PolymarketClient:
             return {"cash_usd": self.config.bankroll.live_bankroll_reference, "source": "reference", "source_quality": SourceQuality.SYNTHETIC_FALLBACK.value}
         try:
             if hasattr(self._sdk_client, "get_balance_allowance"):
-                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL) if BalanceAllowanceParams and AssetType else None
-                payload = self._sdk_client.get_balance_allowance(params)
+                attempts = []
+                errors: list[str] = []
+                for params in self._allowance_params_variants():
+                    try:
+                        payload = self._sdk_client.get_balance_allowance(params)
+                        normalized = self._normalize_allowance_payload(payload)
+                        normalized["query_method"] = "get_balance_allowance"
+                        normalized["query_params"] = {
+                            "asset_type": str(getattr(params, "asset_type", "")),
+                            "token_id": str(getattr(params, "token_id", "")),
+                            "signature_type": getattr(params, "signature_type", None),
+                        }
+                        attempts.append(normalized)
+                    except Exception as exc:
+                        errors.append(str(exc))
+                if not attempts:
+                    raise RuntimeError("; ".join(errors) if errors else "SDK balance method unavailable")
+                best = self._best_allowance_attempt(attempts)
+                payload = best.get("raw", {})
             elif hasattr(self._sdk_client, "get_balance"):
                 payload = self._sdk_client.get_balance()
             else:
@@ -341,29 +564,82 @@ class PolymarketClient:
                 raise RuntimeError("Allowance/spendability unavailable because py-clob-client is not initialized.")
             return {"available": self.config.bankroll.live_bankroll_reference, "sufficient": True, "source": "reference", "source_quality": SourceQuality.SYNTHETIC_FALLBACK.value}
         try:
+            attempts: list[dict[str, Any]] = []
+            errors: list[str] = []
             if hasattr(self._sdk_client, "get_balance_allowance"):
-                params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL) if BalanceAllowanceParams and AssetType else None
-                payload = self._sdk_client.get_balance_allowance(params)
-                available = float(payload.get("available") or payload.get("balance") or payload.get("allowance") or 0.0)
-                return {"available": available, "sufficient": available > 0, "raw": payload, "source_quality": SourceQuality.REAL_PUBLIC_DATA.value}
+                variants = self._allowance_params_variants() or [None]
+                for params in variants:
+                    try:
+                        payload = self._sdk_client.get_balance_allowance(params) if params is not None else self._sdk_client.get_balance_allowance()
+                        normalized = self._normalize_allowance_payload(payload)
+                        normalized["query_method"] = "get_balance_allowance"
+                        normalized["query_params"] = {
+                            "asset_type": str(getattr(params, "asset_type", "")),
+                            "token_id": str(getattr(params, "token_id", "")),
+                            "signature_type": getattr(params, "signature_type", None),
+                        } if params is not None else {"params": None}
+                        attempts.append(normalized)
+                    except Exception as exc:
+                        errors.append(f"get_balance_allowance:{exc}")
+                if hasattr(self._sdk_client, "update_balance_allowance"):
+                    for params in self._allowance_params_variants():
+                        try:
+                            payload = self._sdk_client.update_balance_allowance(params)
+                            normalized = self._normalize_allowance_payload(payload)
+                            normalized["query_method"] = "update_balance_allowance"
+                            normalized["query_params"] = {
+                                "asset_type": str(getattr(params, "asset_type", "")),
+                                "token_id": str(getattr(params, "token_id", "")),
+                                "signature_type": getattr(params, "signature_type", None),
+                            }
+                            attempts.append(normalized)
+                        except Exception as exc:
+                            errors.append(f"update_balance_allowance:{exc}")
             if hasattr(self._sdk_client, "get_balance"):
-                payload = self._sdk_client.get_balance()
-                available = float(payload.get("available") or payload.get("balance") or 0.0)
-                return {"available": available, "sufficient": available > 0, "raw": payload, "source_quality": SourceQuality.REAL_PUBLIC_DATA.value}
-            raise RuntimeError("SDK allowance method unavailable")
+                try:
+                    normalized = self._normalize_allowance_payload(self._sdk_client.get_balance())
+                    normalized["query_method"] = "get_balance"
+                    normalized["query_params"] = {}
+                    attempts.append(normalized)
+                except Exception as exc:
+                    errors.append(f"get_balance:{exc}")
+            if not attempts:
+                raise RuntimeError("; ".join(errors) if errors else "SDK allowance method unavailable")
+            best = self._best_allowance_attempt(attempts)
+            best["query_attempts"] = [
+                {
+                    "method": item.get("query_method", ""),
+                    "params": item.get("query_params", {}),
+                    "summary": item.get("raw_summary", {}),
+                }
+                for item in attempts
+            ]
+            best["query_errors"] = errors
+            best["sdk_signature_type"] = self._extract_sdk_signature_type()
+            best["configured_signature_type"] = self.config.env.polymarket_signature_type
+            preferred_signature_type = best.get("query_params", {}).get("signature_type")
+            if preferred_signature_type is not None:
+                self._set_order_signature_type(int(preferred_signature_type))
+            return best
         except Exception as exc:
             if self._live_mode():
                 raise RuntimeError(f"Unable to fetch allowance/spendability in LIVE mode: {exc}") from exc
-            return {"available": self.config.bankroll.live_bankroll_reference, "sufficient": True, "source": "fallback", "source_quality": SourceQuality.SYNTHETIC_FALLBACK.value}
+            return {
+                "available": self.config.bankroll.live_bankroll_reference,
+                "sufficient": True,
+                "source": "fallback",
+                "query_visible": True,
+                "source_quality": SourceQuality.SYNTHETIC_FALLBACK.value,
+            }
 
     async def get_positions(self) -> list[dict[str, Any]]:
+        errors: list[str] = []
         if self._sdk_client and hasattr(self._sdk_client, "get_positions"):
             try:
                 payload = self._sdk_client.get_positions()
-                return self._ensure_live_data(payload, "positions")
+                return self._normalize_positions_payload(payload)
             except Exception as exc:
-                if self._live_mode():
-                    raise RuntimeError(f"Unable to fetch positions in LIVE mode: {exc}") from exc
+                errors.append(f"sdk:{exc}")
         if not self.config.env.polymarket_funder:
             if self._live_mode():
                 raise RuntimeError("POLYMARKET_FUNDER is required for live position visibility.")
@@ -375,13 +651,13 @@ class PolymarketClient:
         for url, params in candidates:
             try:
                 payload = await self._get_json(url, params=params)
-                rows = payload if isinstance(payload, list) else payload.get("data", payload.get("positions", []))
-                if rows is not None and rows != []:
-                    return rows
-            except Exception:
+                return self._normalize_positions_payload(payload)
+            except Exception as exc:
+                errors.append(f"{url}:{exc}")
                 continue
         if self._live_mode():
-            raise RuntimeError("Unable to fetch live positions.")
+            detail = "; ".join(errors) if errors else "positions query unavailable"
+            raise RuntimeError(f"Unable to fetch live positions. {detail}")
         return []
 
     async def get_open_orders(self) -> list[dict[str, Any]]:
@@ -395,6 +671,7 @@ class PolymarketClient:
                 raise RuntimeError("Empty open orders response")
             normalized: list[dict[str, Any]] = []
             for item in payload:
+                remaining_size = self._extract_order_remaining_size(item)
                 normalized.append(
                     {
                         "exchange_order_id": str(item.get("id") or item.get("orderID") or item.get("order_id") or ""),
@@ -405,7 +682,7 @@ class PolymarketClient:
                         "side": str(item.get("side") or "BUY"),
                         "size": float(item.get("size") or item.get("original_size") or item.get("shares") or 0.0),
                         "filled_size": float(item.get("filled_size") or item.get("filled") or 0.0),
-                        "remaining_size": float(item.get("remaining_size") or item.get("remaining") or 0.0),
+                        "remaining_size": remaining_size,
                         "price": float(item.get("price") or 0.0),
                         "raw": item,
                     }
@@ -422,29 +699,43 @@ class PolymarketClient:
         if self._sdk_client is None or OrderArgs is None or OrderType is None:
             raise RuntimeError("py-clob-client is required for real live order placement.")
         order_type = OrderType.GTC
-        try:
-            if hasattr(OrderType, "FOK") and entry_style == "FOLLOW_TAKER":
-                order_type = OrderType.FOK
-            order_args = OrderArgs(
-                price=price,
-                size=size,
-                side=side,
-                token_id=token_id,
-            )
-            signed_order = self._sdk_client.create_order(order_args)
-            if client_order_id and isinstance(signed_order, dict):
-                signed_order["client_order_id"] = client_order_id
-            result = self._sdk_client.post_order(signed_order, order_type)
-            if not result:
-                raise RuntimeError("Empty order placement response")
-            return {
-                "exchange_order_id": str(result.get("orderID") or result.get("id") or result.get("order_id") or ""),
-                "status": str(result.get("status") or result.get("state") or "SUBMITTED"),
-                "client_order_id": client_order_id or str(result.get("client_order_id") or ""),
-                "raw": result,
-            }
-        except Exception as exc:
-            raise RuntimeError(f"Real live order placement failed: {exc}") from exc
+        if hasattr(OrderType, "FOK") and entry_style == "FOLLOW_TAKER":
+            order_type = OrderType.FOK
+        order_args = OrderArgs(
+            price=price,
+            size=size,
+            side=side,
+            token_id=token_id,
+        )
+        errors: list[str] = []
+        for signature_type in self._order_signature_type_candidates():
+            try:
+                self._set_order_signature_type(signature_type)
+                signed_order = self._sdk_client.create_order(order_args)
+                if client_order_id and isinstance(signed_order, dict):
+                    signed_order["client_order_id"] = client_order_id
+                result = self._sdk_client.post_order(signed_order, order_type)
+                if not result:
+                    raise RuntimeError("Empty order placement response")
+                exchange_order_id = str(result.get("orderID") or result.get("id") or result.get("order_id") or "")
+                status = str(result.get("status") or result.get("state") or "SUBMITTED")
+                echoed_client_order_id = client_order_id or str(result.get("client_order_id") or result.get("clientOrderId") or "")
+                if not exchange_order_id:
+                    raise RuntimeError("Order placement response did not include an exchange_order_id.")
+                if not status:
+                    raise RuntimeError("Order placement response did not include an order status.")
+                return {
+                    "exchange_order_id": exchange_order_id,
+                    "status": status,
+                    "client_order_id": echoed_client_order_id,
+                    "raw": result,
+                    "signature_type_used": self._extract_sdk_signature_type(),
+                }
+            except Exception as exc:
+                errors.append(f"signature_type={signature_type}:{exc}")
+                if "invalid signature" not in str(exc).lower():
+                    break
+        raise RuntimeError(f"Real live order placement failed: {'; '.join(errors)}")
 
     async def place_buy_order(self, token_id: str, price: float, size: float, entry_style: str, client_order_id: str | None = None) -> dict[str, Any]:
         return await self.place_order(token_id=token_id, price=price, size=size, side="BUY", entry_style=entry_style, client_order_id=client_order_id)
@@ -464,12 +755,28 @@ class PolymarketClient:
                 "status": str(result.get("status") or result.get("state") or ""),
                 "filled_size": float(result.get("filled_size") or result.get("filled") or 0.0),
                 "average_fill_price": float(result.get("avg_price") or result.get("average_fill_price") or 0.0),
-                "remaining_size": float(result.get("remaining_size") or result.get("remaining") or 0.0),
+                "remaining_size": self._extract_order_remaining_size(result),
                 "client_order_id": str(result.get("client_order_id") or result.get("clientOrderId") or ""),
                 "raw": result,
             }
         except Exception as exc:
             raise RuntimeError(f"Order status query failed: {exc}") from exc
+
+    def _extract_order_remaining_size(self, payload: dict[str, Any]) -> float:
+        try:
+            direct = float(payload.get("remaining_size") or payload.get("remaining") or 0.0)
+        except (TypeError, ValueError):
+            direct = 0.0
+        if direct > 0:
+            return direct
+        try:
+            original_size = float(payload.get("original_size") or payload.get("size") or payload.get("shares") or 0.0)
+            size_matched = float(payload.get("size_matched") or payload.get("filled_size") or payload.get("filled") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if original_size > 0:
+            return max(original_size - size_matched, 0.0)
+        return 0.0
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         if self._sdk_client is None or not hasattr(self._sdk_client, "cancel"):
@@ -526,6 +833,34 @@ class PolymarketClient:
                     "title": market.title,
                     "liquidity": market.liquidity,
                 }
+        direct_market = await self.fetch_market_lookup(market_id, token_id)
+        if direct_market is not None:
+            tradable = bool(direct_market.active and not direct_market.closed)
+            return {
+                "market_id": direct_market.market_id,
+                "token_id": direct_market.token_id,
+                "tradable": tradable,
+                "orderbook_enabled": tradable,
+                "category": direct_market.category,
+                "title": direct_market.title,
+                "liquidity": direct_market.liquidity,
+            }
+        if token_id and token_id not in {"unknown-token", "unknown", "None"}:
+            try:
+                orderbook = await self.get_orderbook(token_id)
+                has_depth = bool(orderbook.bids or orderbook.asks)
+                return {
+                    "market_id": market_id,
+                    "token_id": token_id,
+                    "tradable": has_depth,
+                    "orderbook_enabled": has_depth,
+                    "category": "unknown",
+                    "title": market_id,
+                    "liquidity": 0.0,
+                    "derived_from_orderbook": True,
+                }
+            except Exception:
+                pass
         if self._live_mode():
             raise RuntimeError(f"Market tradability metadata missing for {market_id}/{token_id}")
         return {"market_id": market_id, "token_id": token_id, "tradable": False, "orderbook_enabled": False}

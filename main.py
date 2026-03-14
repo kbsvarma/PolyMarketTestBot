@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,15 +22,92 @@ from src.trade_monitor import TradeMonitor
 from src.wallet_discovery import WalletDiscoveryService
 from src.wallet_scoring import WalletScoringService
 from backtest.evaluator import BacktestEvaluator
+from src.live_orders import LiveOrderStore
+from src.models import DecisionAction, OrderLifecycleStatus, TradeDecision
+
+
+def _build_operator_smoke_decision(config: AppConfig) -> TradeDecision | None:
+    enabled = os.getenv("POLYBOT_SMOKE_ORDER_ENABLED", "false").lower() == "true"
+    if not enabled:
+        return None
+
+    market_id = os.getenv("POLYBOT_SMOKE_ORDER_MARKET_ID", "").strip()
+    token_id = os.getenv("POLYBOT_SMOKE_ORDER_TOKEN_ID", "").strip()
+    price_raw = os.getenv("POLYBOT_SMOKE_ORDER_PRICE", "").strip()
+    if not market_id or not token_id or not price_raw:
+        raise RuntimeError(
+            "Explicit smoke order requires POLYBOT_SMOKE_ORDER_MARKET_ID, POLYBOT_SMOKE_ORDER_TOKEN_ID, and POLYBOT_SMOKE_ORDER_PRICE."
+        )
+
+    price = float(price_raw)
+    if price <= 0:
+        raise RuntimeError("POLYBOT_SMOKE_ORDER_PRICE must be greater than 0.")
+
+    notional = float(os.getenv("POLYBOT_SMOKE_ORDER_NOTIONAL_USD", str(config.risk.max_single_live_trade_usd)))
+    if notional <= 0:
+        raise RuntimeError("POLYBOT_SMOKE_ORDER_NOTIONAL_USD must be greater than 0.")
+
+    scaled_notional = round(notional, 4)
+    category = os.getenv("POLYBOT_SMOKE_ORDER_CATEGORY", "").strip() or (
+        config.live.selected_categories[0] if config.live.selected_categories else "politics"
+    )
+    wallet_label = os.getenv("POLYBOT_SMOKE_ORDER_WALLET_LABEL", "OPERATOR_SMOKE")
+    decision_id = os.getenv("POLYBOT_SMOKE_ORDER_ID", "").strip() or f"operator-smoke-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+
+    return TradeDecision(
+        allowed=True,
+        action=DecisionAction.LIVE_COPY,
+        reason_code="OPERATOR_SMOKE_ORDER",
+        human_readable_reason="Operator-approved supervised smoke order.",
+        local_decision_id=decision_id,
+        wallet_address=wallet_label,
+        market_id=market_id,
+        token_id=token_id,
+        entry_style=config.entry_styles.preferred_live_entry_style,
+        category=category,
+        scaled_notional=round(scaled_notional, 4),
+        source_price=price,
+        executable_price=price,
+        cluster_confirmed=True,
+        hedge_suspicion_score=0.0,
+        context={"operator_smoke_order": True, "requested_notional": scaled_notional},
+    )
+
+
+def _clear_stale_operator_smoke_orders(root: Path) -> None:
+    store = LiveOrderStore(root / "data" / "live_orders.json")
+    orders = store.load()
+    updated = False
+    for order in orders:
+        if order.terminal_state:
+            continue
+        if not str(order.local_decision_id).startswith("operator-smoke-"):
+            continue
+        if order.exchange_order_id:
+            continue
+        order.last_exchange_status = "REJECTED"
+        order.lifecycle_status = OrderLifecycleStatus.REJECTED
+        order.terminal_state = True
+        order.last_update_at = datetime.now(timezone.utc)
+        updated = True
+    if updated:
+        store.save(orders)
 
 
 async def run() -> None:
     root = Path(__file__).resolve().parent
-    config: AppConfig = load_config(root / "config.yaml", root / ".env")
+    config_path_value = os.getenv("POLYBOT_CONFIG_PATH", "config.yaml")
+    config_path = Path(config_path_value)
+    if not config_path.is_absolute():
+        config_path = root / config_path
+    config: AppConfig = load_config(config_path, root / ".env")
     ensure_runtime_files(root, config)
     setup_logging(root / "logs")
+    preflight_only = os.getenv("POLYBOT_PREFLIGHT_ONLY", "false").lower() == "true"
 
     state = AppStateStore(root / "data" / "app_state.json")
+    if preflight_only:
+        state.clear_pause()
     alerts = AlertManager(config, root / "logs")
     geoblock = GeoblockChecker(config)
     eligibility = geoblock.preflight_status()
@@ -37,6 +115,8 @@ async def run() -> None:
         mode=config.mode.value,
         system_status=config.mode.value,
         status=config.mode.value,
+        manual_live_enable=config.live.manual_live_enable,
+        manual_resume_required=config.live.manual_resume_required,
         eligibility=eligibility.model_dump(),
     )
 
@@ -67,6 +147,29 @@ async def run() -> None:
                 system_status=config.mode.value,
                 status=config.mode.value,
             )
+    if config.mode.value == "LIVE" and preflight_only:
+        logger.info("LIVE preflight-only mode enabled; exiting before discovery and decision loops.")
+        return
+
+    operator_smoke_decision = _build_operator_smoke_decision(config)
+    if config.mode.value == "LIVE" and operator_smoke_decision is not None:
+        _clear_stale_operator_smoke_orders(root)
+        state.clear_pause()
+        state.update_system_status(
+            manual_live_enable=True,
+            manual_resume_required=False,
+            paused=False,
+            pause_reason="",
+        )
+        logger.info(
+            "Running explicit supervised smoke order market_id={} token_id={} notional={} price={}",
+            operator_smoke_decision.market_id,
+            operator_smoke_decision.token_id,
+            operator_smoke_decision.scaled_notional,
+            operator_smoke_decision.executable_price,
+        )
+        await live_engine.handle_decisions([operator_smoke_decision])
+        return
 
     discovery_result = await discovery.run_discovery_cycle()
     scoring_result = scorer.score_wallets(discovery_result.wallets)
