@@ -124,3 +124,77 @@ def test_refresh_order_maps_live_status_to_resting_and_uses_raw_size(tmp_path: P
     assert order.last_exchange_status == "LIVE"
     assert order.remaining_size == 5.76
     assert order.terminal_state is False
+
+
+def test_refresh_order_maps_canceled_status_to_terminal_cancelled(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.yaml", root / ".env.example")
+    client = PolymarketClient(config)
+    manager = LiveOrderManager(config, tmp_path, client, AuditLogger(tmp_path / "live_audit.jsonl"))
+    order = manager.create_entry_order(build_decision())
+    order.exchange_order_id = "ex1"
+    order.intended_size = 5.769231
+
+    async def _status(order_id: str):
+        assert order_id == "ex1"
+        return {
+            "exchange_order_id": "ex1",
+            "status": "CANCELED",
+            "filled_size": 0.0,
+            "average_fill_price": 0.0,
+            "remaining_size": 5.76,
+            "raw": {"original_size": "5.76", "size_matched": "0"},
+        }
+
+    client.get_order_status = _status  # type: ignore[method-assign]
+
+    __import__("asyncio").run(manager.refresh_order(order))
+
+    assert order.lifecycle_status == OrderLifecycleStatus.CANCELLED
+    assert order.last_exchange_status == "CANCELED"
+    assert order.remaining_size == 0.0
+    assert order.terminal_state is True
+
+
+def test_cancel_open_order_marks_terminal_and_records_cancel(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.yaml", root / ".env.example")
+    client = PolymarketClient(config)
+    manager = LiveOrderManager(config, tmp_path, client, AuditLogger(tmp_path / "live_audit.jsonl"))
+    order = manager.create_entry_order(build_decision())
+    order.exchange_order_id = "ex1"
+    order.lifecycle_status = OrderLifecycleStatus.RESTING
+    order.remaining_size = order.intended_size
+
+    async def _cancel(order_id: str):
+        assert order_id == "ex1"
+        return {"id": order_id, "status": "CANCELLED"}
+
+    client.cancel_order = _cancel  # type: ignore[method-assign]
+
+    __import__("asyncio").run(manager.cancel_open_order(order))
+
+    assert order.cancel_requested is True
+    assert order.cancel_confirmed is True
+    assert order.lifecycle_status == OrderLifecycleStatus.CANCELLED
+    assert order.terminal_state is True
+    assert order.remaining_size == 0.0
+
+
+def test_mark_cancelled_by_reconciliation_marks_terminal(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.yaml", root / ".env.example")
+    client = PolymarketClient(config)
+    manager = LiveOrderManager(config, tmp_path, client, AuditLogger(tmp_path / "live_audit.jsonl"))
+    order = manager.create_entry_order(build_decision())
+    order.exchange_order_id = "ex1"
+    order.lifecycle_status = OrderLifecycleStatus.RESTING
+    order.remaining_size = order.intended_size
+
+    manager.mark_cancelled_by_reconciliation(order)
+
+    assert order.cancel_requested is True
+    assert order.cancel_confirmed is True
+    assert order.lifecycle_status == OrderLifecycleStatus.CANCELLED
+    assert order.terminal_state is True
+    assert order.remaining_size == 0.0

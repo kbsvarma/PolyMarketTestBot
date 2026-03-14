@@ -140,6 +140,8 @@ class LiveTradingEngine:
         return checks
 
     async def refresh_live_status(self) -> None:
+        if self.config.mode.value == "LIVE":
+            await self._sync_existing_open_orders()
         checks = await self.startup_validation()
         reconciliation_summary = checks.get("reconciliation_summary", {})
         unresolved = [
@@ -151,7 +153,13 @@ class LiveTradingEngine:
             current = self.state.read()
             if current.get("pause_reason") == "Live readiness gate failed." and not unresolved:
                 self.state.clear_pause()
-        health = await self.collect_health()
+        health = await self.collect_health(
+            reconciliation_override={
+                "clean": bool(checks.get("reconciliation_clean", False)),
+                "severity": str(checks.get("reconciliation_detail", "")),
+                "summary": reconciliation_summary,
+            }
+        )
         readiness = build_readiness_result(self.config, self.state, health, checks)
         positions_payload: list[dict] = []
         try:
@@ -214,7 +222,7 @@ class LiveTradingEngine:
             else:
                 self.state.pause("Live readiness gate failed.")
 
-    async def collect_health(self):
+    async def collect_health(self, reconciliation_override: dict[str, object] | None = None):
         now = datetime.now(timezone.utc)
         components: list[HealthComponent] = []
 
@@ -257,16 +265,54 @@ class LiveTradingEngine:
         except Exception as exc:
             components.append(HealthComponent(name="allowance", state=HealthState.UNHEALTHY, detail=str(exc)))
 
-        reconciliation = await self.reconcile()
+        if reconciliation_override is None:
+            reconciliation = await self.reconcile()
+            reconciliation_clean = reconciliation.clean
+            reconciliation_severity = reconciliation.severity
+            reconciliation_metadata = reconciliation.model_dump(mode="json")
+        else:
+            reconciliation_clean = bool(reconciliation_override.get("clean", False))
+            reconciliation_severity = str(reconciliation_override.get("severity", "UNKNOWN"))
+            reconciliation_metadata = reconciliation_override.get("summary", {})
         components.append(
             HealthComponent(
                 name="reconciliation",
-                state=HealthState.HEALTHY if reconciliation.clean else HealthState.UNHEALTHY,
-                detail=reconciliation.severity,
-                metadata=reconciliation.model_dump(mode="json"),
+                state=HealthState.HEALTHY if reconciliation_clean else HealthState.UNHEALTHY,
+                detail=reconciliation_severity,
+                metadata=reconciliation_metadata,
             )
         )
         return self.health_monitor.aggregate(components)
+
+    async def _sync_existing_open_orders(self) -> None:
+        live_orders = self.orders.load()
+        active_orders = [order for order in live_orders if not order.terminal_state and order.exchange_order_id]
+        if not active_orders:
+            return
+        try:
+            open_orders = await self.client.get_open_orders()
+        except Exception:
+            return
+        open_ids = {
+            str(item.get("exchange_order_id") or item.get("id") or item.get("orderID") or "")
+            for item in open_orders
+        }
+        updated = False
+        for order in active_orders:
+            if order.exchange_order_id in open_ids:
+                continue
+            try:
+                await self.order_manager.refresh_order(order)
+            except Exception:
+                self.order_manager.mark_cancelled_by_reconciliation(
+                    order,
+                    detail={"reason": "order missing from exchange open orders"},
+                )
+                updated = True
+            else:
+                updated = True
+        if updated:
+            self.orders.save(live_orders)
 
     async def reconcile(self):
         live_positions = [position.model_dump(mode="json") for position in self.positions.positions_for_mode(Mode.LIVE)]
@@ -316,6 +362,8 @@ class LiveTradingEngine:
         live_positions = self.positions.positions_for_mode(Mode.LIVE)
         live_orders = self.orders.load()
 
+        self.state.update_system_status(**self._operator_cap_state(live_positions, live_orders))
+
         await self._manage_existing_orders(live_orders, live_positions, decisions)
         await self._apply_live_exits(live_positions, live_orders)
 
@@ -326,6 +374,17 @@ class LiveTradingEngine:
             if decision.category not in self.config.live.selected_categories:
                 continue
             if any(order.local_decision_id == decision.local_decision_id and not order.terminal_state for order in live_orders):
+                continue
+            cap_block = self._operator_entry_block_reason(decision, live_positions, live_orders)
+            if cap_block is not None:
+                self.audit.record(
+                    "operator_cap_block",
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "decision_id": decision.local_decision_id,
+                        "reason": cap_block,
+                    },
+                )
                 continue
 
             tradability = await self.market_data.get_tradability(decision.market_id, decision.token_id)
@@ -354,11 +413,56 @@ class LiveTradingEngine:
             reconciliation_clean=reconciliation.clean,
             reconciliation_summary=reconciliation.model_dump(mode="json"),
             unresolved_live_order_ids=unresolved,
+            **self._operator_cap_state(live_positions, live_orders),
         )
         if not reconciliation.clean:
             self.state.pause(f"Live reconciliation mismatch: {reconciliation.severity}")
         self.positions.save_positions(paper_positions, live_positions)
         self.orders.save(live_orders)
+
+    def _operator_cap_state(self, live_positions: list[Position], live_orders: list[LiveOrder]) -> dict[str, object]:
+        active_positions = [position for position in live_positions if not position.closed and position.remaining_size > 0]
+        active_entry_orders = [order for order in live_orders if not order.terminal_state and not order.is_exit]
+        session_exposure = round(
+            sum(position.remaining_size * (position.current_mark_price or position.entry_price_actual or position.entry_price) for position in active_positions)
+            + sum(max(order.remaining_size, order.intended_size) * order.intended_price for order in active_entry_orders),
+            4,
+        )
+        occupied_slots = len(active_positions) + len(active_entry_orders)
+        return {
+            "operator_live_session_max_usd": self.config.env.operator_live_session_max_usd,
+            "operator_live_max_trade_usd": self.config.env.operator_live_max_trade_usd,
+            "operator_live_max_positions": self.config.env.operator_live_max_positions,
+            "operator_live_current_exposure_usd": session_exposure,
+            "operator_live_current_slots": occupied_slots,
+        }
+
+    def _operator_entry_block_reason(self, decision: TradeDecision, live_positions: list[Position], live_orders: list[LiveOrder]) -> str | None:
+        max_trade = self.config.env.operator_live_max_trade_usd
+        if max_trade is not None and max_trade > 0 and decision.scaled_notional > max_trade:
+            return f"OPERATOR_MAX_TRADE_USD exceeded: {decision.scaled_notional:.4f} > {max_trade:.4f}"
+
+        active_positions = [position for position in live_positions if not position.closed and position.remaining_size > 0]
+        active_entry_orders = [order for order in live_orders if not order.terminal_state and not order.is_exit]
+
+        max_positions = self.config.env.operator_live_max_positions
+        if max_positions is not None and max_positions > 0:
+            occupied_slots = len(active_positions) + len(active_entry_orders)
+            if occupied_slots >= max_positions:
+                return f"OPERATOR_MAX_POSITIONS reached: {occupied_slots} >= {max_positions}"
+
+        session_cap = self.config.env.operator_live_session_max_usd
+        if session_cap is not None and session_cap > 0:
+            current_exposure = sum(
+                position.remaining_size * (position.current_mark_price or position.entry_price_actual or position.entry_price)
+                for position in active_positions
+            ) + sum(max(order.remaining_size, order.intended_size) * order.intended_price for order in active_entry_orders)
+            if current_exposure + decision.scaled_notional > session_cap:
+                return (
+                    f"OPERATOR_SESSION_MAX_USD exceeded: "
+                    f"{current_exposure + decision.scaled_notional:.4f} > {session_cap:.4f}"
+                )
+        return None
 
     async def _manage_existing_orders(self, live_orders: list[LiveOrder], live_positions: list[Position], decisions: list[TradeDecision]) -> None:
         decision_map = {decision.local_decision_id: decision for decision in decisions}

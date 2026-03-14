@@ -74,6 +74,28 @@ def _build_operator_smoke_decision(config: AppConfig) -> TradeDecision | None:
     )
 
 
+def _operator_smoke_cancel_enabled() -> bool:
+    return os.getenv("POLYBOT_SMOKE_CANCEL_ENABLED", "false").lower() == "true"
+
+
+def _resolve_operator_smoke_cancel_order(root: Path) -> LiveOrder | None:
+    store = LiveOrderStore(root / "data" / "live_orders.json")
+    orders = store.load()
+    requested = os.getenv("POLYBOT_SMOKE_CANCEL_ORDER_ID", "").strip()
+    if requested:
+        for order in orders:
+            if requested in {order.local_order_id, order.exchange_order_id, order.client_order_id}:
+                return order
+        raise RuntimeError(f"Unable to find smoke order for POLYBOT_SMOKE_CANCEL_ORDER_ID={requested}")
+    for order in reversed(orders):
+        if not str(order.local_decision_id).startswith("operator-smoke-"):
+            continue
+        if order.terminal_state:
+            continue
+        return order
+    return None
+
+
 def _clear_stale_operator_smoke_orders(root: Path) -> None:
     store = LiveOrderStore(root / "data" / "live_orders.json")
     orders = store.load()
@@ -169,6 +191,33 @@ async def run() -> None:
             operator_smoke_decision.executable_price,
         )
         await live_engine.handle_decisions([operator_smoke_decision])
+        return
+
+    if config.mode.value == "LIVE" and _operator_smoke_cancel_enabled():
+        state.clear_pause()
+        state.update_system_status(
+            manual_live_enable=True,
+            manual_resume_required=False,
+            paused=False,
+            pause_reason="",
+        )
+        order = _resolve_operator_smoke_cancel_order(root)
+        if order is None:
+            logger.info("No non-terminal operator smoke order found to cancel.")
+            await live_engine.refresh_live_status()
+            return
+        logger.info(
+            "Cancelling explicit supervised smoke order local_order_id={} exchange_order_id={}",
+            order.local_order_id,
+            order.exchange_order_id,
+        )
+        live_orders = live_engine.orders.load()
+        live_order = next((item for item in live_orders if item.local_order_id == order.local_order_id), None)
+        if live_order is None:
+            raise RuntimeError(f"Unable to load operator smoke order {order.local_order_id} for cancellation.")
+        await live_engine.order_manager.cancel_open_order(live_order)
+        live_engine.orders.save(live_orders)
+        await live_engine.refresh_live_status()
         return
 
     discovery_result = await discovery.run_discovery_cycle()

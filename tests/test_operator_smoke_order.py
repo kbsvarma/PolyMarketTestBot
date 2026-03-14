@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from main import _build_operator_smoke_decision, _clear_stale_operator_smoke_orders
+from main import (
+    _build_operator_smoke_decision,
+    _clear_stale_operator_smoke_orders,
+    _operator_smoke_cancel_enabled,
+    _resolve_operator_smoke_cancel_order,
+)
 from src.config import load_config
 from src.live_orders import LiveOrderStore
 from src.models import EntryStyle, LiveOrder, OrderLifecycleStatus
@@ -118,3 +123,76 @@ def test_clear_stale_operator_smoke_orders_only_marks_local_pending_smoke_orders
     assert orders[0].lifecycle_status == OrderLifecycleStatus.REJECTED
     assert orders[0].terminal_state is True
     assert orders[1].lifecycle_status == OrderLifecycleStatus.SUBMITTING
+
+
+def test_operator_smoke_cancel_disabled_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("POLYBOT_SMOKE_CANCEL_ENABLED", raising=False)
+    assert _operator_smoke_cancel_enabled() is False
+
+
+def test_resolve_operator_smoke_cancel_order_picks_latest_non_terminal(tmp_path: Path) -> None:
+    store = LiveOrderStore(tmp_path / "data" / "live_orders.json")
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    store.save(
+        [
+            LiveOrder(
+                local_decision_id="operator-smoke-old",
+                local_order_id="o1",
+                client_order_id="c1",
+                market_id="m1",
+                token_id="t1",
+                side="BUY",
+                intended_price=0.5,
+                intended_size=2.0,
+                entry_style=EntryStyle.PASSIVE_LIMIT,
+                lifecycle_status=OrderLifecycleStatus.REJECTED,
+                terminal_state=True,
+            ),
+            LiveOrder(
+                local_decision_id="operator-smoke-new",
+                local_order_id="o2",
+                client_order_id="c2",
+                exchange_order_id="ex2",
+                market_id="m2",
+                token_id="t2",
+                side="BUY",
+                intended_price=0.5,
+                intended_size=2.0,
+                entry_style=EntryStyle.PASSIVE_LIMIT,
+                lifecycle_status=OrderLifecycleStatus.RESTING,
+            ),
+        ]
+    )
+
+    order = _resolve_operator_smoke_cancel_order(tmp_path)
+
+    assert order is not None
+    assert order.local_order_id == "o2"
+
+
+def test_resolve_operator_smoke_cancel_order_matches_requested_id(tmp_path: Path, monkeypatch) -> None:
+    store = LiveOrderStore(tmp_path / "data" / "live_orders.json")
+    (tmp_path / "data").mkdir(parents=True, exist_ok=True)
+    store.save(
+        [
+            LiveOrder(
+                local_decision_id="operator-smoke-new",
+                local_order_id="o2",
+                client_order_id="c2",
+                exchange_order_id="ex2",
+                market_id="m2",
+                token_id="t2",
+                side="BUY",
+                intended_price=0.5,
+                intended_size=2.0,
+                entry_style=EntryStyle.PASSIVE_LIMIT,
+                lifecycle_status=OrderLifecycleStatus.RESTING,
+            ),
+        ]
+    )
+    monkeypatch.setenv("POLYBOT_SMOKE_CANCEL_ORDER_ID", "ex2")
+
+    order = _resolve_operator_smoke_cancel_order(tmp_path)
+
+    assert order is not None
+    assert order.exchange_order_id == "ex2"

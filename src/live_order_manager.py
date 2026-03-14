@@ -93,6 +93,24 @@ class LiveOrderManager:
                 return "TIMED_OUT"
         return "TIMED_OUT"
 
+    async def cancel_open_order(self, order: LiveOrder) -> dict:
+        response = await self.client.cancel_order(order.exchange_order_id or order.client_order_id)
+        self._mark_cancelled(
+            order,
+            status=str(response.get("status") or "CANCELLED"),
+            audit_event="cancel_response",
+            response=response,
+        )
+        return response
+
+    def mark_cancelled_by_reconciliation(self, order: LiveOrder, detail: dict | None = None) -> None:
+        self._mark_cancelled(
+            order,
+            status="CANCELLED",
+            audit_event="cancel_inferred",
+            response=detail or {"reason": "order missing from exchange open orders"},
+        )
+
     async def maybe_reprice(self, order: LiveOrder, tradable: bool, drift_ok: bool) -> bool:
         if order.repriced_once or not tradable or not drift_ok:
             return False
@@ -158,6 +176,7 @@ class LiveOrderManager:
             "OPEN": OrderLifecycleStatus.RESTING,
             "PARTIALLY_FILLED": OrderLifecycleStatus.PARTIALLY_FILLED,
             "FILLED": OrderLifecycleStatus.FILLED,
+            "CANCELED": OrderLifecycleStatus.CANCELLED,
             "CANCELLED": OrderLifecycleStatus.CANCELLED,
             "REJECTED": OrderLifecycleStatus.REJECTED,
             "EXPIRED": OrderLifecycleStatus.EXPIRED,
@@ -165,11 +184,13 @@ class LiveOrderManager:
         return mapping.get(normalized, OrderLifecycleStatus.UNKNOWN)
 
     def _resolve_remaining_size(self, order: LiveOrder, status: dict) -> float:
+        if order.lifecycle_status in {OrderLifecycleStatus.CANCELLED, OrderLifecycleStatus.REJECTED, OrderLifecycleStatus.EXPIRED, OrderLifecycleStatus.FILLED}:
+            return 0.0
         raw_remaining = status.get("remaining_size")
         if raw_remaining not in (None, ""):
             try:
                 remaining = float(raw_remaining)
-                if remaining > 0 or order.lifecycle_status in {OrderLifecycleStatus.FILLED, OrderLifecycleStatus.CANCELLED, OrderLifecycleStatus.REJECTED, OrderLifecycleStatus.EXPIRED}:
+                if remaining > 0:
                     return remaining
             except (TypeError, ValueError):
                 pass
@@ -185,3 +206,25 @@ class LiveOrderManager:
                 pass
 
         return max(order.intended_size - order.filled_size, 0.0)
+
+    def _mark_cancelled(self, order: LiveOrder, status: str, audit_event: str, response: dict) -> None:
+        order.cancel_requested = True
+        order.cancel_confirmed = True
+        order.last_exchange_status = status
+        order.lifecycle_status = self._map_status(order.last_exchange_status)
+        if order.lifecycle_status == OrderLifecycleStatus.UNKNOWN:
+            order.lifecycle_status = OrderLifecycleStatus.CANCELLED
+        order.terminal_state = True
+        order.remaining_size = 0.0
+        order.last_update_at = datetime.now(timezone.utc)
+        order.raw_exchange_response_refs.append(
+            self.audit.record(
+                audit_event,
+                {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "exchange_order_id": order.exchange_order_id,
+                    "client_order_id": order.client_order_id,
+                    "response": response,
+                },
+            )
+        )

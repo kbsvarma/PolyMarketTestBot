@@ -126,6 +126,9 @@ class EnvConfig(BaseModel):
     polygon_rpc_url: str = "https://polygon-bor-rpc.publicnode.com"
     polygon_usdc_address: str = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
     polygon_usdce_address: str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+    operator_live_session_max_usd: float | None = None
+    operator_live_max_trade_usd: float | None = None
+    operator_live_max_positions: int | None = None
 
 
 class AppConfig(BaseModel):
@@ -201,6 +204,21 @@ def _load_env() -> EnvConfig:
         polygon_rpc_url=os.getenv("POLYGON_RPC_URL", "https://polygon-bor-rpc.publicnode.com"),
         polygon_usdc_address=os.getenv("POLYGON_USDC_ADDRESS", "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"),
         polygon_usdce_address=os.getenv("POLYGON_USDCE_ADDRESS", "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+        operator_live_session_max_usd=(
+            float(os.getenv("POLYBOT_LIVE_SESSION_MAX_USD", ""))
+            if os.getenv("POLYBOT_LIVE_SESSION_MAX_USD", "").strip()
+            else None
+        ),
+        operator_live_max_trade_usd=(
+            float(os.getenv("POLYBOT_LIVE_MAX_TRADE_USD", ""))
+            if os.getenv("POLYBOT_LIVE_MAX_TRADE_USD", "").strip()
+            else None
+        ),
+        operator_live_max_positions=(
+            int(os.getenv("POLYBOT_LIVE_MAX_POSITIONS", ""))
+            if os.getenv("POLYBOT_LIVE_MAX_POSITIONS", "").strip()
+            else None
+        ),
     )
 
 

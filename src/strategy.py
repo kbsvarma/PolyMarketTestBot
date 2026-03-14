@@ -444,6 +444,9 @@ class StrategyEngine:
 
     def _max_notional_for_mode(self) -> float:
         if self.config.mode.value == "LIVE":
+            operator_cap = self.config.env.operator_live_max_trade_usd
+            if operator_cap is not None and operator_cap > 0:
+                return min(self.config.risk.max_single_live_trade_usd, operator_cap)
             return self.config.risk.max_single_live_trade_usd
         state_snapshot = self.state.read()
         override = float(state_snapshot.get("paper_trade_notional_override", 0.0) or 0.0)
