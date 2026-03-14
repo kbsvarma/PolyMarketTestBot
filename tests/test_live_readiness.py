@@ -7,13 +7,13 @@ from src.models import HealthComponent, HealthState
 from src.state import AppStateStore
 
 
-def test_live_readiness_requires_manual_enable() -> None:
+def test_live_readiness_requires_manual_enable(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parent.parent
     config = load_config(root / "config.yaml", root / ".env.example")
     config = config.model_copy(update={"mode": "LIVE"})
-    store = AppStateStore(root / "data" / "app_state.json")
+    store = AppStateStore(tmp_path / "app_state.json")
     store.write({"mode": "LIVE", "manual_live_enable": False, "kill_switch": False, "paused": False})
-    health = HealthMonitor(root / "data" / "health_status.json").aggregate(
+    health = HealthMonitor(tmp_path / "health_status.json").aggregate(
         [HealthComponent(name="auth", state=HealthState.HEALTHY, detail="ok")]
     )
     readiness = build_readiness_result(
