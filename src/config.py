@@ -74,6 +74,7 @@ class BacktestConfig(BaseModel):
 class WalletSelectionConfig(BaseModel):
     top_research_wallets: int = 5
     approved_paper_wallets: int = 3
+    approved_live_wallets: int = 1
     min_trade_count: int = 12
     min_copyability_score: float = 0.55
     min_delay_viability_score: float = 0.5
@@ -129,6 +130,7 @@ class EnvConfig(BaseModel):
     operator_live_session_max_usd: float | None = None
     operator_live_max_trade_usd: float | None = None
     operator_live_max_positions: int | None = None
+    operator_live_wallet_count: int | None = None
 
 
 class AppConfig(BaseModel):
@@ -217,6 +219,11 @@ def _load_env() -> EnvConfig:
         operator_live_max_positions=(
             int(os.getenv("POLYBOT_LIVE_MAX_POSITIONS", ""))
             if os.getenv("POLYBOT_LIVE_MAX_POSITIONS", "").strip()
+            else None
+        ),
+        operator_live_wallet_count=(
+            int(os.getenv("POLYBOT_LIVE_WALLET_COUNT", ""))
+            if os.getenv("POLYBOT_LIVE_WALLET_COUNT", "").strip()
             else None
         ),
     )

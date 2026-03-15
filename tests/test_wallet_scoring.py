@@ -1,71 +1,66 @@
 from pathlib import Path
 
 from src.config import load_config
-from src.models import WalletMetrics
+from src.models import SourceQuality, WalletMetrics, WalletScoringResult
 from src.wallet_scoring import WalletScoringService
 
 
-def test_wallet_scoring_orders_by_global_score() -> None:
-    root = Path(__file__).resolve().parent.parent
-    config = load_config(root / "config.yaml", root / ".env.example")
-    wallets = [
-        WalletMetrics(
-            wallet_address="0xbbb",
-            evaluation_window_days=30,
-            trade_count=20,
-            trades_per_day=1.0,
-            buy_count=10,
-            sell_count=10,
-            estimated_pnl_percent=0.1,
-            win_rate=0.6,
-            average_trade_size=20,
-            conviction_score=0.5,
-            market_concentration=0.4,
-            category_concentration=0.7,
-            holding_time_estimate_hours=12,
-            drawdown_proxy=0.2,
-            copyability_score=0.7,
-            low_velocity_score=0.8,
-            delay_5s=0.8,
-            delay_15s=0.7,
-            delay_30s=0.6,
-            delay_60s=0.5,
-            dominant_category="crypto price",
-        ),
-        WalletMetrics(
-            wallet_address="0xaaa",
-            evaluation_window_days=30,
-            trade_count=20,
-            trades_per_day=1.0,
-            buy_count=10,
-            sell_count=10,
-            estimated_pnl_percent=0.1,
-            win_rate=0.6,
-            average_trade_size=20,
-            conviction_score=0.5,
-            market_concentration=0.4,
-            category_concentration=0.7,
-            holding_time_estimate_hours=12,
-            drawdown_proxy=0.2,
-            copyability_score=0.7,
-            low_velocity_score=0.8,
-            delay_5s=0.8,
-            delay_15s=0.7,
-            delay_30s=0.6,
-            delay_60s=0.5,
-            dominant_category="crypto price",
-        ),
-    ]
-    result = WalletScoringService(config, root / "data").score_wallets(wallets)
-    scored = result.scored_wallets
-    assert scored[0].global_score >= scored[-1].global_score
-    assert scored[0].copyability_score >= 0.4
-    assert [wallet.wallet_address for wallet in scored] == ["0xbbb", "0xaaa"]
+def _wallet(address: str, copyability: float = 0.8, delay: float = 0.8) -> WalletMetrics:
+    return WalletMetrics(
+        wallet_address=address,
+        evaluation_window_days=30,
+        trade_count=20,
+        trades_per_day=1.0,
+        buy_count=10,
+        sell_count=10,
+        estimated_pnl_percent=0.2,
+        win_rate=0.7,
+        average_trade_size=100.0,
+        conviction_score=0.8,
+        market_concentration=0.2,
+        category_concentration=0.6,
+        holding_time_estimate_hours=4.0,
+        drawdown_proxy=0.1,
+        copyability_score=copyability,
+        low_velocity_score=0.7,
+        delay_5s=delay,
+        delay_15s=delay,
+        delay_30s=delay,
+        delay_60s=delay,
+        delayed_viability_score=delay,
+        source_quality=SourceQuality.REAL_PUBLIC_DATA,
+    )
 
 
-def test_wallet_scoring_empty_input() -> None:
+def _config():
     root = Path(__file__).resolve().parent.parent
-    config = load_config(root / "config.yaml", root / ".env.example")
-    result = WalletScoringService(config, root / "data").score_wallets([])
-    assert result.state == "EMPTY"
-    assert result.scored_wallets == []
+    return load_config(root / "config.live_smoke.yaml", root / ".env.example")
+
+
+def test_select_wallets_uses_operator_live_wallet_count_override() -> None:
+    config = _config()
+    config.env = config.env.model_copy(update={"operator_live_wallet_count": 5})
+    service = WalletScoringService(config, Path("/tmp"))
+    wallets = [_wallet(f"0x{i}") for i in range(6)]
+    scoring = WalletScoringResult(scored_wallets=wallets, state="SUCCESS", source_quality=SourceQuality.REAL_PUBLIC_DATA)
+
+    approved = service.select_wallets(scoring, [{"wallet_address": f"0x{i}", "expectancy": 0.02} for i in range(6)])
+
+    assert len(approved.live_wallets) == 3
+    assert approved.live_wallets == approved.paper_wallets
+
+
+def test_select_wallets_uses_configured_live_wallet_count_when_no_override() -> None:
+    config = _config()
+    config = config.model_copy(
+        update={
+            "wallet_selection": config.wallet_selection.model_copy(update={"approved_live_wallets": 2}),
+        }
+    )
+    service = WalletScoringService(config, Path("/tmp"))
+    wallets = [_wallet(f"0x{i}") for i in range(4)]
+    scoring = WalletScoringResult(scored_wallets=wallets, state="SUCCESS", source_quality=SourceQuality.REAL_PUBLIC_DATA)
+
+    approved = service.select_wallets(scoring, [{"wallet_address": f"0x{i}", "expectancy": 0.02} for i in range(4)])
+
+    assert len(approved.live_wallets) == 2

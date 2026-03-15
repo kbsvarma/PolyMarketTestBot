@@ -112,7 +112,11 @@ class WalletScoringService:
         ]
         research = [wallet.wallet_address for wallet in scoring.scored_wallets[: self.config.wallet_selection.top_research_wallets]]
         paper = [wallet.wallet_address for wallet in eligible[: self.config.wallet_selection.approved_paper_wallets]]
-        return ApprovedWallets(research_wallets=research, paper_wallets=paper, live_wallets=paper[:1])
+        live_wallet_count = self.config.env.operator_live_wallet_count
+        if live_wallet_count is None:
+            live_wallet_count = self.config.wallet_selection.approved_live_wallets
+        live_wallet_count = max(int(live_wallet_count), 1)
+        return ApprovedWallets(research_wallets=research, paper_wallets=paper, live_wallets=paper[:live_wallet_count])
 
     def _persist(self, result: WalletScoringResult) -> None:
         if result.scored_wallets:

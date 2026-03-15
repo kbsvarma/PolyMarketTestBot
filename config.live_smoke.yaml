@@ -54,6 +54,7 @@ backtest:
 wallet_selection:
   top_research_wallets: 5
   approved_paper_wallets: 3
+  approved_live_wallets: 1
   min_trade_count: 12
   min_copyability_score: 0.55
   min_delay_viability_score: 0.50
