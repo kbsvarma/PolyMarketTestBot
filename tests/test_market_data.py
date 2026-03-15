@@ -19,4 +19,4 @@ def test_live_market_refresh_uses_wider_limit(tmp_path: Path) -> None:
 
     service.client.fetch_markets = _fetch_markets  # type: ignore[method-assign]
     asyncio.run(service.refresh_markets())
-    assert seen["limit"] == 500
+    assert seen["limit"] == config.strategies.strategy_market_page_size

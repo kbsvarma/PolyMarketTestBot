@@ -19,6 +19,7 @@ class AnalyticsEngine:
             pd.DataFrame(
                 [
                     {
+                        "strategy_name": "wallet_follow",
                         "entry_style": style.value,
                         "signal_count": 0,
                         "fill_rate": 0.0,
@@ -41,6 +42,7 @@ class AnalyticsEngine:
             return
         for column, default in {
             "status": "",
+            "strategy_name": "wallet_follow",
             "wallet_address": "",
             "category": "",
             "entry_style": "",
@@ -56,12 +58,13 @@ class AnalyticsEngine:
         paper["opened"] = paper["status"].fillna("").eq("OPENED")
         paper["skipped"] = paper["status"].fillna("").eq("SKIPPED")
         rows = []
-        for entry_style, group in paper.groupby("entry_style", dropna=False):
+        for (strategy_name, entry_style), group in paper.groupby(["strategy_name", "entry_style"], dropna=False):
             opened = group[group["opened"]]
             wallet_breakdown = opened.groupby("wallet_address")["realized_pnl"].sum().round(4).to_dict()
             category_breakdown = opened.groupby("category")["realized_pnl"].sum().round(4).to_dict()
             rows.append(
                 {
+                    "strategy_name": strategy_name,
                     "entry_style": entry_style,
                     "signal_count": int(len(group)),
                     "fill_rate": round(len(opened) / max(len(group), 1), 4),

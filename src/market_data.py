@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.config import AppConfig
@@ -17,9 +18,40 @@ class MarketDataService:
         self.market_cache: dict[str, MarketInfo] = {}
         self.token_cache: dict[str, MarketInfo] = {}
 
+    def _market_rank(self, market: MarketInfo) -> tuple[int, float, float]:
+        end_at = None
+        if market.end_date_iso:
+            try:
+                end_at = datetime.fromisoformat(market.end_date_iso.replace("Z", "+00:00"))
+            except ValueError:
+                end_at = None
+        now = datetime.now(timezone.utc)
+        hours_to_resolution = 9_999_999.0
+        if end_at is not None and end_at > now:
+            hours_to_resolution = (end_at - now).total_seconds() / 3600.0
+        active_rank = 0 if (market.active and not market.closed) else 1
+        return (active_rank, hours_to_resolution, -float(market.liquidity or 0.0))
+
     async def refresh_markets(self) -> dict[str, MarketInfo]:
-        limit = 500 if self.config.mode.value == "LIVE" else 100
-        markets = await self.client.fetch_markets(limit=limit)
+        page_size = self.config.strategies.strategy_market_page_size
+        max_pages = (
+            self.config.strategies.strategy_market_max_pages_live
+            if self.config.mode.value == "LIVE"
+            else self.config.strategies.strategy_market_max_pages_research
+        )
+        markets_by_token: dict[str, MarketInfo] = {}
+        for page in range(max_pages):
+            offset = page * page_size
+            try:
+                rows = await self.client.fetch_markets(limit=page_size, offset=offset, active_only=True)
+            except TypeError:
+                rows = await self.client.fetch_markets(limit=page_size)
+            if not rows:
+                break
+            for market in rows:
+                if market.token_id and market.token_id not in markets_by_token:
+                    markets_by_token[market.token_id] = market
+        markets = sorted(markets_by_token.values(), key=self._market_rank)
         self.market_cache = {market.market_id: market for market in markets}
         self.token_cache = {market.token_id: market for market in markets}
         return self.market_cache
@@ -27,14 +59,17 @@ class MarketDataService:
     async def fetch_orderbook(self, token_id: str) -> OrderbookSnapshot:
         return await self.client.get_orderbook(token_id)
 
-    async def fetch_market_metadata(self, market_id: str, token_id: str = "") -> dict[str, object]:
+    async def fetch_market_metadata(self, market_id: str, token_id: str = "", market_slug: str = "", outcome: str = "") -> dict[str, object]:
         if market_id not in self.market_cache and (not token_id or token_id not in self.token_cache):
             await self.refresh_markets()
         market = self.market_cache.get(market_id)
         if market is None and token_id:
             market = self.token_cache.get(token_id)
         if market is None:
-            market = await self.client.fetch_market_lookup(market_id, token_id)
+            try:
+                market = await self.client.fetch_market_lookup(market_id, token_id, market_slug=market_slug, outcome=outcome)
+            except TypeError:
+                market = await self.client.fetch_market_lookup(market_id, token_id)
             if market is not None:
                 self.market_cache[market.market_id] = market
                 self.token_cache[market.token_id] = market

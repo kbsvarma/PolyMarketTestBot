@@ -1,0 +1,32 @@
+[
+  {
+    "event_id": "fed-calendar-2026-06-10-rate-decision",
+    "title": "Will the Fed cut rates by June 2026?",
+    "market_slug": "will-the-fed-cut-rates-by-june-2026",
+    "outcome": "Yes",
+    "category": "macro / economics",
+    "published_at": "2026-06-10T14:00:00Z",
+    "fair_price": 0.68,
+    "source_price": 0.54,
+    "source_reliability": 0.95,
+    "confidence_score": 0.86,
+    "source_name": "Federal Reserve",
+    "source_url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+    "market_keywords": [
+      "fed",
+      "cut",
+      "rates",
+      "june",
+      "2026"
+    ],
+    "rationale": "Official FOMC release materially increased the probability of a June rate cut relative to market pricing.",
+    "required_conditions": [
+      "Statement language clearly signals easing bias",
+      "Mapped market slug and outcome are unambiguous"
+    ],
+    "disqualifiers": [
+      "Emergency unscheduled revision changes interpretation",
+      "Polymarket market mapping is ambiguous"
+    ]
+  }
+]

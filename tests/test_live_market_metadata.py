@@ -483,6 +483,99 @@ def test_live_tradability_failure_skips_instead_of_crashing(tmp_path: Path) -> N
     assert decisions[0].context["tradability_error"] == "tradability miss"
 
 
+def test_live_unknown_token_can_be_resolved_from_market_lookup(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.live_smoke.yaml", root / ".env.example")
+    config = config.model_copy(
+        update={
+            "risk": config.risk.model_copy(update={"require_cluster_confirmation_live": False}),
+            "live": config.live.model_copy(update={"only_cluster_confirmed": False}),
+        }
+    )
+    state = AppStateStore(tmp_path / "app_state.json")
+    state.write(
+        {
+            "mode": "LIVE",
+            "system_status": "LIVE_READY",
+            "wallet_discovery_state": DiscoveryState.SUCCESS.value,
+            "wallet_scoring_state": "SUCCESS",
+            "live_readiness_last_result": {"ready": True},
+            "allowance_sufficient": True,
+            "balance_visible": True,
+            "manual_live_enable": True,
+            "reconciliation_clean": True,
+            "heartbeat_ok": True,
+            "live_health_state": "HEALTHY",
+        }
+    )
+    engine = StrategyEngine(config, tmp_path, state)
+    detection = _detection().model_copy(
+        update={
+            "token_id": "unknown-token",
+            "market_slug": "resolved-market",
+            "market_metadata": {"outcome": "Yes"},
+        }
+    )
+
+    async def _refresh_markets() -> dict[str, object]:
+        return {}
+
+    async def _stream_watchlist(token_ids: list[str]) -> dict[str, dict]:
+        return {}
+
+    async def _fetch_market_metadata(market_id: str, token_id: str = "", market_slug: str = "", outcome: str = "") -> dict[str, object]:
+        assert market_slug == "resolved-market"
+        assert outcome == "Yes"
+        return {
+            "market_id": market_id,
+            "token_id": "resolved-token",
+            "title": "Resolved market",
+            "slug": market_slug,
+            "category": "politics",
+            "active": True,
+            "closed": False,
+        }
+
+    async def _tradability(market_id: str, token_id: str) -> dict[str, object]:
+        assert token_id == "resolved-token"
+        return {
+            "market_id": market_id,
+            "token_id": token_id,
+            "tradable": True,
+            "orderbook_enabled": True,
+            "category": "politics",
+            "title": "Resolved market",
+            "liquidity": 1000.0,
+        }
+
+    async def _orderbook(token_id: str):
+        from src.models import OrderbookLevel, OrderbookSnapshot
+
+        return OrderbookSnapshot(
+            token_id=token_id,
+            bids=[OrderbookLevel(price=0.50, size=1000.0)],
+            asks=[OrderbookLevel(price=0.50, size=1000.0)],
+        )
+
+    engine.market_data.refresh_markets = _refresh_markets  # type: ignore[method-assign]
+    engine.market_data.stream_watchlist = _stream_watchlist  # type: ignore[method-assign]
+    engine.market_data.fetch_market_metadata = _fetch_market_metadata  # type: ignore[method-assign]
+    engine.market_data.get_tradability = _tradability  # type: ignore[method-assign]
+    engine.market_data.fetch_orderbook = _orderbook  # type: ignore[method-assign]
+
+    decisions = asyncio.run(
+        engine.process_detections(
+            [detection],
+            ApprovedWallets(research_wallets=[], paper_wallets=[], live_wallets=["0xabc"]),
+            [_wallet()],
+        )
+    )
+
+    assert len(decisions) == 1
+    assert decisions[0].reason_code != "MISSING_TOKEN_ID"
+    assert decisions[0].token_id == "resolved-token"
+
+
 def test_live_orderbook_failure_skips_instead_of_crashing(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parent.parent
     config = load_config(root / "config.live_smoke.yaml", root / ".env.example")

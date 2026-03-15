@@ -19,11 +19,144 @@ from src.scheduler import AppScheduler
 from src.state import AppStateStore
 from src.strategy import StrategyEngine
 from src.trade_monitor import TradeMonitor
+from src.utils import append_jsonl, stable_event_key, write_json
 from src.wallet_discovery import WalletDiscoveryService
 from src.wallet_scoring import WalletScoringService
 from backtest.evaluator import BacktestEvaluator
 from src.live_orders import LiveOrderStore
-from src.models import DecisionAction, OrderLifecycleStatus, TradeDecision
+from src.models import DecisionAction, Mode, OrderLifecycleStatus, TradeDecision
+
+
+def _build_shadow_config(config: AppConfig) -> AppConfig:
+    shadow = config.model_copy(deep=True)
+    shadow.mode = Mode.PAPER
+    shadow.risk.max_single_live_trade_usd = min(
+        max(float(config.env.operator_live_max_trade_usd or config.risk.max_single_live_trade_usd), 1.0),
+        5.0,
+    )
+    shadow.risk.max_new_entries_per_hour = max(config.risk.max_new_entries_per_hour, 6)
+    shadow.risk.stale_signal_seconds = max(config.risk.stale_signal_seconds, 300)
+    shadow.risk.max_spread_pct = max(config.risk.max_spread_pct, 0.06)
+    shadow.risk.max_entry_drift_pct = max(config.risk.max_entry_drift_pct, 0.08)
+    shadow.risk.min_orderbook_depth_usd = min(config.risk.min_orderbook_depth_usd, 10.0)
+    shadow.risk.allow_categories = [
+        category
+        for category in config.categories.tracked
+        if category in {"politics", "regulatory / legal", "macro / economics", "geopolitics", "crypto price"}
+    ] or list(config.risk.allow_categories)
+    shadow.wallet_selection.approved_live_wallets = max(config.wallet_selection.approved_live_wallets, 5)
+    shadow.wallet_selection.approved_paper_wallets = max(config.wallet_selection.approved_paper_wallets, 5)
+    shadow.live.enable_multi_entry_style_live = True
+    shadow.live.only_cluster_confirmed = False
+    shadow.live.require_paper_validation = False
+    shadow.live.selected_categories = list(shadow.risk.allow_categories)
+    shadow.strategies.enable_event_driven_official = False
+    shadow.strategies.correlation_live_enabled = False
+    shadow.strategies.resolution_window_live_enabled = True
+    shadow.strategies.resolution_window_min_price = min(shadow.strategies.resolution_window_min_price, 0.6)
+    shadow.strategies.resolution_window_min_edge_pct = min(shadow.strategies.resolution_window_min_edge_pct, 0.02)
+    shadow.strategies.resolution_window_max_hours = max(shadow.strategies.resolution_window_max_hours, 240)
+    shadow.strategies.resolution_window_min_liquidity = min(shadow.strategies.resolution_window_min_liquidity, 50.0)
+    shadow.strategies.supplemental_paper_relaxed_enabled = True
+    return shadow
+
+
+def _decision_compare_key(decision: TradeDecision) -> str:
+    return stable_event_key(
+        decision.strategy_name,
+        decision.wallet_address,
+        decision.market_id,
+        decision.token_id,
+        decision.entry_style.value,
+    )
+
+
+def _decision_snapshot(decision: TradeDecision) -> dict[str, object]:
+    return {
+        "strategy_name": decision.strategy_name,
+        "allowed": decision.allowed,
+        "action": decision.action.value,
+        "reason_code": decision.reason_code,
+        "reason": decision.human_readable_reason,
+        "wallet_address": decision.wallet_address,
+        "market_id": decision.market_id,
+        "token_id": decision.token_id,
+        "entry_style": decision.entry_style.value,
+        "category": decision.category,
+        "scaled_notional": decision.scaled_notional,
+        "source_price": decision.source_price,
+        "executable_price": decision.executable_price,
+        "cluster_confirmed": decision.cluster_confirmed,
+        "source_quality": decision.context.get("source_quality", ""),
+        "trust_level": decision.context.get("trust_level", ""),
+    }
+
+
+def _write_shadow_cycle_artifacts(
+    *,
+    root: Path,
+    cycle_ts: str,
+    actual_decisions: list[TradeDecision],
+    shadow_decisions: list[TradeDecision],
+    shadow_state: AppStateStore,
+) -> None:
+    actual_map = {_decision_compare_key(decision): decision for decision in actual_decisions}
+    shadow_map = {_decision_compare_key(decision): decision for decision in shadow_decisions}
+    for key in sorted(actual_map.keys() | shadow_map.keys()):
+        actual = actual_map.get(key)
+        shadow = shadow_map.get(key)
+        append_jsonl(
+            root / "data" / "shadow_live_decisions.jsonl",
+            {
+                "ts": cycle_ts,
+                "decision_key": key,
+                "market_id": (shadow or actual).market_id if (shadow or actual) else "",
+                "token_id": (shadow or actual).token_id if (shadow or actual) else "",
+                "strategy_name": (shadow or actual).strategy_name if (shadow or actual) else "",
+                "actual": _decision_snapshot(actual) if actual is not None else None,
+                "shadow": _decision_snapshot(shadow) if shadow is not None else None,
+                "actual_would_trade": bool(actual and actual.allowed and actual.action == DecisionAction.LIVE_COPY),
+                "shadow_would_trade": bool(shadow and shadow.allowed and shadow.action == DecisionAction.PAPER_COPY),
+                "comparison": (
+                    "shadow_only"
+                    if shadow and (not actual or not actual.allowed)
+                    else "actual_only"
+                    if actual and (not shadow or not shadow.allowed)
+                    else "both"
+                    if actual and shadow and actual.allowed and shadow.allowed
+                    else "neither"
+                ),
+            },
+        )
+
+    paper_summary = shadow_state.read().get("paper_summary", {}) or {}
+    write_json(
+        root / "data" / "shadow_live_summary.json",
+        {
+            "updated_at": cycle_ts,
+            "actual_decision_count": len(actual_decisions),
+            "actual_trade_count": len(
+                [decision for decision in actual_decisions if decision.allowed and decision.action == DecisionAction.LIVE_COPY]
+            ),
+            "shadow_decision_count": len(shadow_decisions),
+            "shadow_trade_count": len(
+                [decision for decision in shadow_decisions if decision.allowed and decision.action == DecisionAction.PAPER_COPY]
+            ),
+            "shadow_only_count": len(
+                [
+                    key
+                    for key in shadow_map
+                    if key not in actual_map or not actual_map[key].allowed or actual_map[key].action != DecisionAction.LIVE_COPY
+                ]
+            ),
+            "paper_summary": paper_summary,
+            "shadow_net_pnl_total": float(paper_summary.get("net_pnl_total", 0.0) or 0.0),
+            "shadow_realized_pnl_total": float(paper_summary.get("realized_pnl_total", 0.0) or 0.0),
+            "shadow_unrealized_pnl_total": float(paper_summary.get("unrealized_pnl_total", 0.0) or 0.0),
+            "shadow_open_positions": int(paper_summary.get("open_positions", 0) or 0),
+            "shadow_open_notional": float(paper_summary.get("open_notional", 0.0) or 0.0),
+        },
+    )
 
 
 def _build_operator_smoke_decision(config: AppConfig) -> TradeDecision | None:
@@ -152,6 +285,24 @@ async def run() -> None:
     monitor = TradeMonitor(config, root / "data", state)
     reporter = ReportWriter(config, root / "data", state)
     analytics = AnalyticsEngine(config, root / "data")
+    shadow_dir = root / "data" / "shadow"
+    shadow_config = _build_shadow_config(config)
+    shadow_state = AppStateStore(shadow_dir / "app_state.json")
+    shadow_state.update_system_status(
+        mode=shadow_config.mode.value,
+        system_status=shadow_config.mode.value,
+        status=shadow_config.mode.value,
+        paper_run_enabled=True,
+        manual_live_enable=True,
+        manual_resume_required=False,
+        reconciliation_clean=True,
+        paper_bankroll_override=float(config.env.operator_live_session_max_usd or 30.0),
+        paper_trade_notional_override=float(config.env.operator_live_max_trade_usd or min(config.risk.max_single_live_trade_usd, 5.0)),
+    )
+    shadow_strategy = StrategyEngine(shadow_config, shadow_dir, shadow_state)
+    shadow_paper_engine = PaperTradingEngine(shadow_config, shadow_dir, shadow_state)
+    shadow_reporter = ReportWriter(shadow_config, shadow_dir, shadow_state)
+    shadow_analytics = AnalyticsEngine(shadow_config, shadow_dir)
 
     has_wallet_credentials = bool(
         config.env.polymarket_private_key
@@ -281,12 +432,24 @@ async def run() -> None:
         )
         detections = await monitor.poll_wallets(watched_wallets)
         decisions = await strategy.process_detections(detections, approved_wallets, scoring_result.scored_wallets)
+        shadow_decisions = await shadow_strategy.process_detections(detections, approved_wallets, scoring_result.scored_wallets)
         if config.mode.value != "PAPER" or state_snapshot.get("paper_run_enabled", False):
             await paper_engine.handle_decisions(decisions)
+        await shadow_paper_engine.handle_decisions(shadow_decisions)
         await live_engine.handle_decisions(decisions)
         reporter.write_daily_summary(scoring_result.scored_wallets, decisions)
         paper_quality = reporter.write_paper_quality_summary(decisions)
+        shadow_reporter.write_daily_summary(scoring_result.scored_wallets, shadow_decisions)
+        shadow_reporter.write_paper_quality_summary(shadow_decisions)
         analytics.write_strategy_comparison()
+        shadow_analytics.write_strategy_comparison()
+        _write_shadow_cycle_artifacts(
+            root=root,
+            cycle_ts=datetime.now(timezone.utc).isoformat(),
+            actual_decisions=decisions,
+            shadow_decisions=shadow_decisions,
+            shadow_state=shadow_state,
+        )
         alerts.emit_health_alerts(state.read())
         state.update_system_status(
             mode=config.mode.value,

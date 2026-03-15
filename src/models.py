@@ -226,6 +226,7 @@ class RiskResult(BaseModel):
 
 
 class TradeDecision(BaseModel):
+    strategy_name: str = "wallet_follow"
     allowed: bool
     action: DecisionAction
     reason_code: str
@@ -277,6 +278,7 @@ class MarketInfo(BaseModel):
 class Position(BaseModel):
     position_id: str
     mode: Mode
+    strategy_name: str = "wallet_follow"
     wallet_address: str
     market_id: str
     token_id: str
@@ -360,6 +362,7 @@ class LiveOrder(BaseModel):
     local_decision_id: str
     local_order_id: str
     client_order_id: str
+    strategy_name: str = "wallet_follow"
     exchange_order_id: str = ""
     market_id: str
     token_id: str

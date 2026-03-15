@@ -87,6 +87,34 @@ live:
     - politics
     - crypto price
     - macro / economics
+strategies:
+  enable_event_driven_official: true
+  enable_correlation_dislocation: true
+  enable_resolution_window: true
+  strategy_market_page_size: 250
+  strategy_market_max_pages_live: 4
+  strategy_market_max_pages_research: 2
+  official_signal_file: data/official_event_signals.json
+  official_signal_max_age_minutes: 240
+  official_signal_min_edge_pct: 0.08
+  official_signal_min_source_reliability: 0.70
+  official_signal_min_confidence: 0.72
+  official_signal_live_enabled: false
+  correlation_min_gap_pct: 0.03
+  correlation_min_group_size: 2
+  correlation_max_groups: 16
+  correlation_near_miss_gap_ratio: 0.80
+  correlation_live_enabled: false
+  supplemental_paper_relaxed_enabled: true
+  supplemental_paper_relaxed_min_confidence: 0.72
+  resolution_window_max_hours: 168
+  resolution_window_min_price: 0.68
+  resolution_window_min_edge_pct: 0.04
+  resolution_window_near_miss_edge_ratio: 0.50
+  resolution_window_near_miss_price_buffer: 0.05
+  resolution_window_target_fair_price: 0.94
+  resolution_window_min_liquidity: 100.0
+  resolution_window_live_enabled: false
 endpoints:
   gamma_base_url: https://gamma-api.polymarket.com
   clob_base_url: https://clob.polymarket.com

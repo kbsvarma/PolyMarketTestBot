@@ -46,7 +46,7 @@ def test_select_wallets_uses_operator_live_wallet_count_override() -> None:
 
     approved = service.select_wallets(scoring, [{"wallet_address": f"0x{i}", "expectancy": 0.02} for i in range(6)])
 
-    assert len(approved.live_wallets) == 3
+    assert len(approved.live_wallets) == 5
     assert approved.live_wallets == approved.paper_wallets
 
 

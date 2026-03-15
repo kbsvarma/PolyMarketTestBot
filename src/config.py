@@ -104,6 +104,36 @@ class LiveConfig(BaseModel):
     enable_multi_entry_style_live: bool = False
 
 
+class StrategyConfig(BaseModel):
+    enable_event_driven_official: bool = True
+    enable_correlation_dislocation: bool = True
+    enable_resolution_window: bool = True
+    strategy_market_page_size: int = 250
+    strategy_market_max_pages_live: int = 4
+    strategy_market_max_pages_research: int = 2
+    official_signal_file: str = "data/official_event_signals.json"
+    official_signal_max_age_minutes: int = 240
+    official_signal_min_edge_pct: float = 0.08
+    official_signal_min_source_reliability: float = 0.7
+    official_signal_min_confidence: float = 0.72
+    official_signal_live_enabled: bool = False
+    correlation_min_gap_pct: float = 0.03
+    correlation_min_group_size: int = 2
+    correlation_max_groups: int = 16
+    correlation_near_miss_gap_ratio: float = 0.8
+    correlation_live_enabled: bool = False
+    supplemental_paper_relaxed_enabled: bool = True
+    supplemental_paper_relaxed_min_confidence: float = 0.72
+    resolution_window_max_hours: int = 168
+    resolution_window_min_price: float = 0.68
+    resolution_window_min_edge_pct: float = 0.04
+    resolution_window_near_miss_edge_ratio: float = 0.5
+    resolution_window_near_miss_price_buffer: float = 0.05
+    resolution_window_target_fair_price: float = 0.94
+    resolution_window_min_liquidity: float = 100.0
+    resolution_window_live_enabled: bool = False
+
+
 class EndpointConfig(BaseModel):
     gamma_base_url: str = "https://gamma-api.polymarket.com"
     clob_base_url: str = "https://clob.polymarket.com"
@@ -145,6 +175,7 @@ class AppConfig(BaseModel):
     categories: CategoriesConfig = Field(default_factory=CategoriesConfig)
     alerts: AlertsConfig = Field(default_factory=AlertsConfig)
     live: LiveConfig = Field(default_factory=LiveConfig)
+    strategies: StrategyConfig = Field(default_factory=StrategyConfig)
     endpoints: EndpointConfig = Field(default_factory=EndpointConfig)
     env: EnvConfig = Field(default_factory=EnvConfig)
 
@@ -155,8 +186,8 @@ RUNTIME_FILES: dict[str, str] = {
     "data/category_wallet_scorecard.csv": "wallet_address,category,score,trade_count,win_rate,copyability_score,delay_viability_score\n",
     "data/detected_wallet_trades.csv": "event_key,local_detection_timestamp,source_trade_timestamp,wallet_address,market_title,market_slug,market_id,token_id,side,price,size,notional,transaction_hash,detection_latency_seconds,best_bid,best_ask,depth_available,category\n",
     "data/clustered_signals.csv": "cluster_id,market_id,token_id,side,wallet_count,cluster_strength,first_seen,last_seen,category\n",
-    "data/strategy_comparison.csv": "entry_style,signal_count,fill_rate,missed_trade_rate,avg_slippage,avg_fees,realized_pnl,unrealized_pnl,pnl_by_wallet,pnl_by_category,pnl_by_delay_bucket\n",
-    "data/paper_trade_history.csv": "position_id,market_id,token_id,wallet_address,category,entry_style,entry_price,quantity,notional,fees_paid,realized_pnl,unrealized_pnl,entry_reason,exit_reason,cluster_confirmed,hedge_suspicion_score,opened_at,closed,status,reason_code\n",
+    "data/strategy_comparison.csv": "strategy_name,entry_style,signal_count,fill_rate,missed_trade_rate,avg_slippage,avg_fees,realized_pnl,unrealized_pnl,pnl_by_wallet,pnl_by_category,pnl_by_delay_bucket\n",
+    "data/paper_trade_history.csv": "position_id,market_id,token_id,strategy_name,wallet_address,category,entry_style,entry_price,quantity,notional,fees_paid,realized_pnl,unrealized_pnl,entry_reason,exit_reason,cluster_confirmed,hedge_suspicion_score,opened_at,closed,status,reason_code\n",
     "data/live_trade_history.csv": "position_id,market_id,token_id,wallet_address,category,entry_style,entry_price,quantity,notional,fees_paid,realized_pnl,unrealized_pnl,entry_reason,exit_reason,cluster_confirmed,hedge_suspicion_score,opened_at,closed,status,reason_code\n",
     "data/positions.json": "{\"paper\": [], \"live\": []}",
     "data/daily_summary.json": "{}",
@@ -165,6 +196,8 @@ RUNTIME_FILES: dict[str, str] = {
     "data/live_orders.json": "[]",
     "data/live_audit.jsonl": "",
     "data/live_decisions.jsonl": "",
+    "data/shadow_live_decisions.jsonl": "",
+    "data/shadow_live_summary.json": "{}",
     "data/paper_audit.jsonl": "",
     "data/paper_decision_trace.jsonl": "",
     "data/wallet_discovery_diagnostics.json": "{}",
@@ -172,6 +205,17 @@ RUNTIME_FILES: dict[str, str] = {
     "data/paper_quality_summary.json": "{}",
     "data/source_quality_summary.json": "{}",
     "data/health_status.json": "{}",
+    "data/official_event_signals.json": "[]",
+    "data/strategy_signal_log.jsonl": "",
+    "data/shadow/positions.json": "{\"paper\": [], \"live\": []}",
+    "data/shadow/app_state.json": "{\"status\": \"INIT\", \"system_status\": \"INIT\", \"paused\": false, \"manual_resume_required\": false}",
+    "data/shadow/paper_trade_history.csv": "position_id,market_id,token_id,strategy_name,wallet_address,category,entry_style,entry_price,quantity,notional,fees_paid,realized_pnl,unrealized_pnl,entry_reason,exit_reason,cluster_confirmed,hedge_suspicion_score,opened_at,closed,status,reason_code\n",
+    "data/shadow/paper_audit.jsonl": "",
+    "data/shadow/paper_quality_summary.json": "{}",
+    "data/shadow/daily_summary.json": "{}",
+    "data/shadow/source_quality_summary.json": "{}",
+    "data/shadow/strategy_comparison.csv": "strategy_name,entry_style,signal_count,fill_rate,missed_trade_rate,avg_slippage,avg_fees,realized_pnl,unrealized_pnl,pnl_by_wallet,pnl_by_category,pnl_by_delay_bucket\n",
+    "data/shadow/strategy_signal_log.jsonl": "",
     "logs/system.log": "",
     "logs/errors.log": "",
 }

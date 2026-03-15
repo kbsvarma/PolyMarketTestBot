@@ -15,15 +15,15 @@ risk:
   max_wallet_exposure_pct: 0.06
   copy_fraction_min: 0.03
   copy_fraction_max: 0.05
-  max_single_live_trade_usd: 1.0
+  max_single_live_trade_usd: 3.0
   daily_stop_loss_pct: 0.05
-  max_new_entries_per_hour: 1
-  stale_signal_seconds: 90
+  max_new_entries_per_hour: 3
+  stale_signal_seconds: 180
   stale_market_data_seconds: 15
-  max_spread_pct: 0.025
-  max_entry_drift_pct: 0.03
+  max_spread_pct: 0.04
+  max_entry_drift_pct: 0.05
   max_slippage_pct: 0.03
-  min_orderbook_depth_usd: 50.0
+  min_orderbook_depth_usd: 25.0
   max_hedge_suspicion_score: 0.72
   require_cluster_confirmation_live: false
   heartbeat_timeout_seconds: 30
@@ -31,6 +31,9 @@ risk:
   max_reprice_attempts: 1
   allow_categories:
     - politics
+    - regulatory / legal
+    - macro / economics
+    - geopolitics
 cluster:
   enabled: true
   confirmation_window_seconds: 180
@@ -53,8 +56,8 @@ backtest:
   min_wallet_copyability_score: 0.55
 wallet_selection:
   top_research_wallets: 5
-  approved_paper_wallets: 3
-  approved_live_wallets: 1
+  approved_paper_wallets: 5
+  approved_live_wallets: 5
   min_trade_count: 12
   min_copyability_score: 0.55
   min_delay_viability_score: 0.50
@@ -81,9 +84,40 @@ live:
   emergency_flatten_flag: false
   heartbeat_required: true
   bounded_execution_seconds: 20
-  enable_multi_entry_style_live: false
+  enable_multi_entry_style_live: true
   selected_categories:
     - politics
+    - regulatory / legal
+    - macro / economics
+    - geopolitics
+strategies:
+  enable_event_driven_official: true
+  enable_correlation_dislocation: true
+  enable_resolution_window: true
+  strategy_market_page_size: 250
+  strategy_market_max_pages_live: 4
+  strategy_market_max_pages_research: 2
+  official_signal_file: data/official_event_signals.json
+  official_signal_max_age_minutes: 240
+  official_signal_min_edge_pct: 0.08
+  official_signal_min_source_reliability: 0.70
+  official_signal_min_confidence: 0.72
+  official_signal_live_enabled: false
+  correlation_min_gap_pct: 0.03
+  correlation_min_group_size: 2
+  correlation_max_groups: 16
+  correlation_near_miss_gap_ratio: 0.80
+  correlation_live_enabled: false
+  supplemental_paper_relaxed_enabled: true
+  supplemental_paper_relaxed_min_confidence: 0.72
+  resolution_window_max_hours: 168
+  resolution_window_min_price: 0.65
+  resolution_window_min_edge_pct: 0.03
+  resolution_window_near_miss_edge_ratio: 0.50
+  resolution_window_near_miss_price_buffer: 0.05
+  resolution_window_target_fair_price: 0.94
+  resolution_window_min_liquidity: 100.0
+  resolution_window_live_enabled: true
 endpoints:
   gamma_base_url: https://gamma-api.polymarket.com
   clob_base_url: https://clob.polymarket.com

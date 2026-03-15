@@ -26,6 +26,8 @@ class TradeMonitor:
             activities = await self.client.fetch_wallet_activity(wallet, limit=20)
             for row in activities:
                 detection = self._row_to_detection(wallet, row)
+                if detection is None:
+                    continue
                 if detection.event_key in self.seen_keys:
                     continue
                 self.seen_keys.add(detection.event_key)
@@ -33,8 +35,10 @@ class TradeMonitor:
                 append_csv_row(self.data_dir / "detected_wallet_trades.csv", detection.model_dump(mode="json"))
         return detections
 
-    def _row_to_detection(self, wallet: str, row: dict) -> DetectionEvent:
+    def _row_to_detection(self, wallet: str, row: dict) -> DetectionEvent | None:
         timestamp = self._parse_timestamp(row.get("timestamp") or row.get("time"))
+        if self._is_expired_or_stale(row, timestamp):
+            return None
         tx_hash = str(row.get("tx_hash") or row.get("transactionHash") or row.get("hash") or f"local-{wallet[-4:]}-{int(timestamp.timestamp())}")
         market_id = str(row.get("market_id") or row.get("conditionId") or row.get("market") or row.get("slug") or "unknown-market")
         token_id = str(
@@ -46,6 +50,8 @@ class TradeMonitor:
             or "unknown-token"
         )
         side = str(row.get("side") or row.get("type") or "BUY").upper()
+        if side in {"REDEEM", "REWARD", "MERGE", "SPLIT"}:
+            return None
         event_key = self.make_event_key(wallet, market_id, token_id, tx_hash, side)
         local_now = datetime.now(timezone.utc)
         latency = max((local_now - timestamp).total_seconds(), 0.0)
@@ -72,9 +78,27 @@ class TradeMonitor:
             depth_available=float(row.get("depth_available")) if row.get("depth_available") is not None else None,
             category=category,
             source_alias=str(row.get("alias") or row.get("pseudonym") or row.get("name") or ""),
-            market_metadata={"raw": row},
+            market_metadata={"raw": row, "outcome": row.get("outcome") or row.get("outcome_name") or row.get("outcomeName") or ""},
             source_quality=SourceQuality(str(row.get("source_quality") or SourceQuality.REAL_PUBLIC_DATA.value)),
         )
+
+    def _is_expired_or_stale(self, row: dict, timestamp: datetime) -> bool:
+        now = datetime.now(timezone.utc)
+        if bool(row.get("closed")):
+            return True
+        for key in ("endDate", "end_date_iso", "end_date", "expiration", "expiresAt"):
+            raw = row.get(key)
+            if not raw:
+                continue
+            end_at = self._parse_timestamp(raw)
+            if end_at <= now:
+                return True
+        latency_seconds = max((now - timestamp).total_seconds(), 0.0)
+        if self.config.mode.value == "LIVE":
+            max_age = max(self.config.risk.stale_signal_seconds * 2, 600)
+        else:
+            max_age = max(self.config.risk.stale_signal_seconds * 20, 86_400)
+        return latency_seconds > max_age
 
     def _infer_category(self, row: dict) -> str:
         explicit = str(row.get("category") or "").strip()

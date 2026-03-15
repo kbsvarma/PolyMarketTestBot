@@ -39,6 +39,7 @@ class LiveOrderStore:
             local_decision_id=decision.local_decision_id,
             local_order_id=local_order_id,
             client_order_id=stable_event_key(decision.local_decision_id, decision.market_id, decision.token_id, decision.entry_style.value),
+            strategy_name=decision.strategy_name,
             market_id=decision.market_id,
             token_id=decision.token_id,
             side="BUY",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import json
 from typing import Any
 
 try:
@@ -152,29 +153,52 @@ class PolymarketClient:
             return {"type": "list", "length": len(payload)}
         return {"type": type(payload).__name__}
 
-    def _market_info_from_item(self, item: dict[str, Any]) -> MarketInfo | None:
-        token_id = ""
-        clob_token_ids = item.get("clobTokenIds")
-        if isinstance(clob_token_ids, list) and clob_token_ids:
-            token_id = str(clob_token_ids[0])
-        elif isinstance(clob_token_ids, str):
-            token_id = clob_token_ids.split(",")[0].strip("[]\" ")
-        row = MarketInfo(
-            market_id=str(item.get("conditionId") or item.get("id") or item.get("slug") or ""),
-            token_id=token_id or str(item.get("tokenId") or item.get("clobTokenId") or item.get("asset_id") or ""),
-            title=str(item.get("question") or item.get("title") or item.get("description") or "Unknown market"),
-            slug=str(item.get("slug") or item.get("marketSlug") or ""),
-            category=str(item.get("category") or "unknown"),
-            active=bool(item.get("active", True)),
-            closed=bool(item.get("closed", False)),
-            liquidity=float(item.get("liquidity") or 0.0),
-            volume=float(item.get("volume") or item.get("volumeNum") or 0.0),
-            end_date_iso=item.get("endDate") or item.get("end_date_iso"),
-            source_quality=SourceQuality.REAL_PUBLIC_DATA,
-        )
-        if row.market_id and row.token_id:
-            return row
-        return None
+    def _parse_listish(self, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+            return [part.strip("[]\" '") for part in text.split(",") if part.strip("[]\" '")]
+        return [str(value).strip()]
+
+    def _market_infos_from_item(self, item: dict[str, Any]) -> list[MarketInfo]:
+        market_id = str(item.get("conditionId") or item.get("id") or item.get("slug") or "")
+        title = str(item.get("question") or item.get("title") or item.get("description") or "Unknown market")
+        slug = str(item.get("slug") or item.get("marketSlug") or "")
+        category = str(item.get("category") or "unknown")
+        token_ids = self._parse_listish(item.get("clobTokenIds"))
+        if not token_ids:
+            token_ids = self._parse_listish(item.get("tokenId") or item.get("clobTokenId") or item.get("asset_id"))
+        outcomes = self._parse_listish(item.get("outcomes") or item.get("outcomeNames") or item.get("outcome"))
+        rows: list[MarketInfo] = []
+        for idx, token_id in enumerate(token_ids):
+            outcome_suffix = f" [{outcomes[idx]}]" if idx < len(outcomes) and outcomes[idx] else ""
+            row = MarketInfo(
+                market_id=market_id,
+                token_id=str(token_id),
+                title=f"{title}{outcome_suffix}",
+                slug=slug,
+                category=category,
+                active=bool(item.get("active", True)),
+                closed=bool(item.get("closed", False)),
+                liquidity=float(item.get("liquidity") or 0.0),
+                volume=float(item.get("volume") or item.get("volumeNum") or 0.0),
+                end_date_iso=item.get("endDate") or item.get("end_date_iso"),
+                source_quality=SourceQuality.REAL_PUBLIC_DATA,
+            )
+            if row.market_id and row.token_id:
+                rows.append(row)
+        return rows
 
     def _extract_market_rows(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
@@ -367,14 +391,18 @@ class PolymarketClient:
         wait=wait_exponential(multiplier=1, min=1, max=3),
         retry=retry_if_exception_type(RuntimeError),
     )
-    async def fetch_markets(self, limit: int = 100) -> list[MarketInfo]:
+    async def fetch_markets(self, limit: int = 100, offset: int = 0, active_only: bool = False) -> list[MarketInfo]:
         try:
-            payload = await self._get_json(f"{self.gamma_url}/markets", params={"limit": limit})
+            params: dict[str, Any] = {"limit": limit}
+            if offset > 0:
+                params["offset"] = offset
+            if active_only:
+                params["active"] = "true"
+                params["closed"] = "false"
+            payload = await self._get_json(f"{self.gamma_url}/markets", params=params)
             rows: list[MarketInfo] = []
             for item in self._extract_market_rows(payload):
-                row = self._market_info_from_item(item)
-                if row is not None:
-                    rows.append(row)
+                rows.extend(self._market_infos_from_item(item))
             rows = self._ensure_live_data(rows, "markets")
             return rows
         except Exception:
@@ -382,7 +410,7 @@ class PolymarketClient:
                 raise RuntimeError("Unable to fetch real markets in LIVE mode.")
             return self._fallback_markets()
 
-    async def fetch_market_lookup(self, market_id: str, token_id: str = "") -> MarketInfo | None:
+    async def fetch_market_lookup(self, market_id: str, token_id: str = "", market_slug: str = "", outcome: str = "") -> MarketInfo | None:
         candidates: list[tuple[str, dict[str, Any] | None]] = []
         if market_id:
             candidates.extend(
@@ -391,6 +419,13 @@ class PolymarketClient:
                     (f"{self.gamma_url}/markets", {"conditionId": market_id}),
                     (f"{self.gamma_url}/markets", {"id": market_id}),
                     (f"{self.gamma_url}/markets", {"market": market_id}),
+                ]
+            )
+        if market_slug:
+            candidates.extend(
+                [
+                    (f"{self.gamma_url}/markets", {"slug": market_slug}),
+                    (f"{self.gamma_url}/markets", {"marketSlug": market_slug}),
                 ]
             )
         if token_id and token_id not in {"unknown-token", "unknown", "None"}:
@@ -411,16 +446,28 @@ class PolymarketClient:
             exact_match: MarketInfo | None = None
             fallback_match: MarketInfo | None = None
             for item in rows:
-                market = self._market_info_from_item(item)
-                if market is None:
-                    continue
-                if market.market_id == market_id and (not token_id or market.token_id == token_id):
-                    exact_match = market
+                outcome_names = [name.lower() for name in self._parse_listish(item.get("outcomes") or item.get("outcomeNames") or item.get("outcome"))]
+                for idx, market in enumerate(self._market_infos_from_item(item)):
+                    if market.market_id == market_id and token_id and market.token_id == token_id:
+                        exact_match = market
+                        break
+                    if market.market_id == market_id and not token_id and outcome and idx < len(outcome_names) and outcome.lower() == outcome_names[idx]:
+                        exact_match = market
+                        break
+                    if market_slug and market.slug == market_slug and token_id and market.token_id == token_id:
+                        exact_match = market
+                        break
+                    if market_slug and market.slug == market_slug and not token_id and outcome and idx < len(outcome_names) and outcome.lower() == outcome_names[idx]:
+                        exact_match = market
+                        break
+                    if token_id and market.token_id == token_id:
+                        fallback_match = market
+                    elif market.market_id == market_id and fallback_match is None:
+                        fallback_match = market
+                    elif market_slug and market.slug == market_slug and fallback_match is None:
+                        fallback_match = market
+                if exact_match is not None:
                     break
-                if token_id and market.token_id == token_id:
-                    fallback_match = market
-                elif market.market_id == market_id and fallback_match is None:
-                    fallback_match = market
             if exact_match is not None:
                 return exact_match
             if fallback_match is not None:
