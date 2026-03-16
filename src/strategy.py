@@ -6,9 +6,10 @@ from pathlib import Path
 from src.clustering import cluster_detections
 from src.config import AppConfig
 from src.external_signals import OfficialSignalStore, mapping_confidence, parse_signal_timestamp, resolve_official_signal_market
+from src.live_orders import LiveOrderStore
 from src.market_data import MarketDataService
 from src.market_relationships import build_relationship_groups, find_best_dislocation_pair
-from src.models import ApprovedWallets, DecisionAction, DetectionEvent, EntryStyle, SourceQuality, TradeDecision, WalletMetrics
+from src.models import ApprovedWallets, DecisionAction, DetectionEvent, EntryStyle, FillEstimate, MarketInfo, OrderLifecycleStatus, OrderbookSnapshot, SourceQuality, TradeDecision, WalletMetrics
 from src.orderbook import estimate_fill
 from src.paper_quality import classify_trust_level, counts_as_trustworthy_approval
 from src.positions import PositionStore
@@ -26,12 +27,159 @@ class StrategyEngine:
         self.market_data = MarketDataService(config, data_dir)
         self.risk = RiskManager(config)
         self.positions = PositionStore(data_dir / "positions.json")
+        self.live_orders = LiveOrderStore(data_dir / "live_orders.json")
         self.trace_path = data_dir / "paper_decision_trace.jsonl"
         self.signal_log_path = data_dir / "strategy_signal_log.jsonl"
         self.official_signals = OfficialSignalStore(data_dir / Path(config.strategies.official_signal_file).name)
 
     def _wallet_map(self, wallets: list[WalletMetrics]) -> dict[str, WalletMetrics]:
         return {wallet.wallet_address: wallet for wallet in wallets}
+
+    def _effective_detection_category(
+        self,
+        detection: DetectionEvent,
+        wallet: WalletMetrics,
+        market_meta: dict[str, object] | None = None,
+    ) -> str:
+        explicit = str(detection.category or "").strip()
+        if explicit and explicit != "unknown":
+            return explicit
+        if market_meta:
+            resolved = str(market_meta.get("category") or "").strip()
+            if resolved and resolved != "unknown":
+                return resolved
+        wallet_category = str(wallet.dominant_category or "").strip()
+        if wallet_category:
+            return wallet_category
+        return "unknown"
+
+    def _count_paper_entries_last_hour(self, stored_positions: dict[str, list[dict]], now: datetime) -> int:
+        cutoff = now.timestamp() - 3600.0
+        count = 0
+        for payload in stored_positions.get("paper", []):
+            opened_at = payload.get("opened_at") or payload.get("entry_time")
+            if not opened_at:
+                continue
+            try:
+                opened_ts = datetime.fromisoformat(str(opened_at).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if opened_ts >= cutoff:
+                count += 1
+        return count
+
+    def _count_live_entries_last_hour(self, now: datetime) -> int:
+        cutoff = now.timestamp() - 3600.0
+        count = 0
+        seen_order_ids: set[str] = set()
+        for order in self.live_orders.load():
+            order_key = order.local_order_id or order.exchange_order_id or order.client_order_id
+            if order_key in seen_order_ids:
+                continue
+            seen_order_ids.add(order_key)
+            if order.is_exit:
+                continue
+            if order.lifecycle_status == OrderLifecycleStatus.REJECTED:
+                continue
+            observed_at = order.submitted_at or order.created_at
+            if observed_at.timestamp() >= cutoff:
+                count += 1
+        return count
+
+    def _actual_entries_last_hour(self, stored_positions: dict[str, list[dict]], now: datetime) -> int:
+        if self.config.mode.value == "LIVE":
+            return self._count_live_entries_last_hour(now)
+        return self._count_paper_entries_last_hour(stored_positions, now)
+
+    def _detection_priority_key(self, detection: DetectionEvent) -> tuple[datetime, datetime, float]:
+        return (
+            detection.source_trade_timestamp,
+            detection.local_detection_timestamp,
+            float(detection.notional or 0.0),
+        )
+
+    def _dedupe_wallet_follow_detections(self, detections: list[DetectionEvent]) -> tuple[list[DetectionEvent], dict[str, int]]:
+        kept_by_key: dict[tuple[str, str, str, str], DetectionEvent] = {}
+        burst_sizes: dict[tuple[str, str, str, str], int] = {}
+        for detection in detections:
+            key = (
+                detection.wallet_address,
+                detection.market_id,
+                detection.token_id,
+                detection.side,
+            )
+            burst_sizes[key] = burst_sizes.get(key, 0) + 1
+            current = kept_by_key.get(key)
+            if current is None or self._detection_priority_key(detection) > self._detection_priority_key(current):
+                kept_by_key[key] = detection
+        deduped = sorted(kept_by_key.values(), key=self._detection_priority_key, reverse=True)
+        burst_sizes_by_event = {
+            detection.event_key: burst_sizes[key]
+            for key, detection in kept_by_key.items()
+        }
+        return deduped, burst_sizes_by_event
+
+    def _build_signal_consensus_maps(
+        self,
+        detections: list[DetectionEvent],
+    ) -> tuple[
+        dict[tuple[str, str, str], set[str]],
+        dict[tuple[str, str, str], float],
+        dict[tuple[str, str], dict[str, dict[str, object]]],
+    ]:
+        side_wallets: dict[tuple[str, str, str], set[str]] = {}
+        side_notional: dict[tuple[str, str, str], float] = {}
+        market_summary: dict[tuple[str, str], dict[str, dict[str, object]]] = {}
+        for detection in detections:
+            side_key = (detection.market_id, detection.token_id, detection.side)
+            market_key = (detection.market_id, detection.token_id)
+            side_wallets.setdefault(side_key, set()).add(detection.wallet_address)
+            side_notional[side_key] = round(side_notional.get(side_key, 0.0) + float(detection.notional or 0.0), 6)
+            side_summary = market_summary.setdefault(market_key, {})
+            summary = side_summary.setdefault(
+                detection.side,
+                {
+                    "wallets": set(),
+                    "notional": 0.0,
+                },
+            )
+            summary["wallets"].add(detection.wallet_address)
+            summary["notional"] = round(float(summary.get("notional", 0.0) or 0.0) + float(detection.notional or 0.0), 6)
+        return side_wallets, side_notional, market_summary
+
+    def _signal_consensus_context(
+        self,
+        detection: DetectionEvent,
+        cluster_strength: float,
+        side_wallets: dict[tuple[str, str, str], set[str]],
+        side_notional: dict[tuple[str, str, str], float],
+        market_summary: dict[tuple[str, str], dict[str, dict[str, object]]],
+    ) -> dict[str, object]:
+        side_key = (detection.market_id, detection.token_id, detection.side)
+        market_key = (detection.market_id, detection.token_id)
+        same_side_wallets = len(side_wallets.get(side_key, set()))
+        same_side_notional = float(side_notional.get(side_key, 0.0) or 0.0)
+        opposing_wallets = 0
+        opposing_notional = 0.0
+        for side, summary in market_summary.get(market_key, {}).items():
+            if side == detection.side:
+                continue
+            opposing_wallets += len(summary.get("wallets", set()))
+            opposing_notional += float(summary.get("notional", 0.0) or 0.0)
+        total_wallets = same_side_wallets + opposing_wallets
+        consensus_ratio = same_side_wallets / max(total_wallets, 1)
+        notional_ratio = same_side_notional / max(same_side_notional + opposing_notional, 1e-6)
+        thesis = "wallet_consensus" if same_side_wallets >= self.config.cluster.min_wallets else "single_wallet_copy"
+        return {
+            "same_side_wallets": same_side_wallets,
+            "same_side_notional": round(same_side_notional, 6),
+            "opposing_wallets": opposing_wallets,
+            "opposing_notional": round(opposing_notional, 6),
+            "consensus_ratio": round(consensus_ratio, 4),
+            "notional_ratio": round(notional_ratio, 4),
+            "cluster_strength": round(cluster_strength, 4),
+            "selection_thesis": thesis,
+        }
 
     async def process_detections(
         self,
@@ -40,11 +188,16 @@ class StrategyEngine:
         wallets: list[WalletMetrics],
     ) -> list[TradeDecision]:
         wallet_map = self._wallet_map(wallets)
+        detections, burst_sizes = self._dedupe_wallet_follow_detections(detections)
         clusters = cluster_detections(self.config, detections, self.data_dir)
         cluster_lookup = {(cluster.market_id, cluster.token_id): cluster for cluster in clusters}
+        side_wallets, side_notional, market_summary = self._build_signal_consensus_maps(detections)
         decisions: list[TradeDecision] = []
 
         stored_positions = self.positions.load()
+        cycle_now = datetime.now(timezone.utc)
+        entries_last_hour = self._actual_entries_last_hour(stored_positions, cycle_now)
+        category_fill_success, overall_fill_success = self._recent_live_fill_success()
         active_positions = stored_positions.get("paper", []) + stored_positions.get("live", [])
         active_market_exposure: dict[str, float] = {}
         active_wallet_exposure: dict[str, float] = {}
@@ -75,8 +228,9 @@ class StrategyEngine:
             wallet = wallet_map.get(detection.wallet_address)
             if not wallet:
                 continue
+            burst_size = burst_sizes.get(detection.event_key, 1)
             state_snapshot = self.state.read()
-            decision_category = detection.category if detection.category != "unknown" else wallet.dominant_category
+            decision_category = self._effective_detection_category(detection, wallet)
             discovery_state = str(state_snapshot.get("wallet_discovery_state", "UNKNOWN"))
             scoring_state = str(state_snapshot.get("wallet_scoring_state", "UNKNOWN"))
             decision_source_quality = min([wallet.source_quality, detection.source_quality], key=quality_rank)
@@ -177,6 +331,7 @@ class StrategyEngine:
                     )
                     decisions.append(skip)
                     continue
+            decision_category = self._effective_detection_category(detection, wallet, market_meta)
             resolved_market_id = str(market_meta.get("market_id") or detection.market_id)
             resolved_token_id = str(detection.token_id or "").strip()
             if not resolved_token_id or resolved_token_id == "unknown-token":
@@ -285,16 +440,34 @@ class StrategyEngine:
                 continue
             cluster = cluster_lookup.get((detection.market_id, detection.token_id))
             cluster_confirmed = cluster is not None
+            consensus_context = self._signal_consensus_context(
+                detection,
+                cluster.cluster_strength if cluster else 0.0,
+                side_wallets,
+                side_notional,
+                market_summary,
+            )
             copy_fraction = self._select_copy_fraction(wallet)
             scaled_notional = min(detection.notional * copy_fraction, self._max_notional_for_mode())
 
             best_decision = self._skip_decision(detection, wallet, scaled_notional, "NO_VALID_ENTRY_STYLE", "No entry style passed all checks.")
             style_evaluations: list[dict[str, object]] = []
             for entry_style in self.config.entry_styles.compare:
-                fill = estimate_fill(orderbook, scaled_notional, self.config.risk.max_slippage_pct)
+                fill = self._estimate_entry_fill(
+                    detection=detection,
+                    orderbook=orderbook,
+                    target_notional=scaled_notional,
+                    entry_style=entry_style,
+                )
                 drift_pct = abs(fill.executable_price - detection.price) / max(detection.price, 1e-6)
                 hybrid_modifier = self._hybrid_confirmation_modifier(detection, ws_snapshots.get(detection.token_id, {}))
                 entry_style_allowed = self._entry_style_allowed(entry_style, cluster_confirmed)
+                stale_signal_limit = self._stale_signal_threshold_seconds(
+                    strategy_name="wallet_follow",
+                    entry_style=entry_style,
+                    category=decision_category,
+                    source_quality=decision_source_quality,
+                )
                 risk = self.risk.evaluate(
                     detection=detection,
                     wallet=wallet,
@@ -307,7 +480,7 @@ class StrategyEngine:
                     cluster_confirmed=cluster_confirmed,
                     infra_ok=bool(market_meta.get("active", True)) and not state_snapshot.get("paused", False),
                     entry_style_allowed=entry_style_allowed,
-                    category=detection.category,
+                    category=decision_category,
                     market_id=detection.market_id,
                     has_conflicting_position=self._has_conflicting_position(active_positions, detection),
                     data_age_seconds=(datetime.now(timezone.utc) - orderbook.timestamp).total_seconds(),
@@ -323,6 +496,8 @@ class StrategyEngine:
                     allowance_sufficient=bool(state_snapshot.get("allowance_sufficient", True)),
                     tradable=bool(tradability.get("tradable")) and bool(tradability.get("orderbook_enabled")),
                     bankroll_override=self._paper_bankroll() if self.config.mode.value != "LIVE" else None,
+                    entries_last_hour_override=entries_last_hour,
+                    stale_signal_seconds_override=stale_signal_limit,
                 )
                 if self.config.mode.value != "LIVE" and decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK:
                     risk = risk.model_copy(
@@ -369,6 +544,52 @@ class StrategyEngine:
                             "context": {**risk.context, "hybrid_modifier": hybrid_modifier},
                         }
                     )
+                live_fillability: dict[str, object] | None = None
+                live_signal_quality: dict[str, object] | None = None
+                if self.config.mode.value == "LIVE" and risk.reason_code in {"OK", "ENTRY_DRIFT", "WIDE_SPREAD", "FILLABILITY", "SLIPPAGE"}:
+                    live_fillability = self._live_fillability_assessment(
+                        category=decision_category,
+                        entry_style=entry_style,
+                        detection=detection,
+                        orderbook=orderbook,
+                        fill=fill,
+                        tradability=tradability,
+                        target_notional=scaled_notional,
+                        drift_pct=drift_pct,
+                        stale_signal_limit_seconds=stale_signal_limit,
+                        category_fill_success=category_fill_success,
+                        overall_fill_success=overall_fill_success,
+                    )
+                    if not bool(live_fillability.get("passed")):
+                        risk = risk.model_copy(
+                            update={
+                                "allowed": False,
+                                "reason_code": str(live_fillability.get("reason_code") or "LIVE_FILLABILITY_SCORE"),
+                                "human_readable_reason": str(live_fillability.get("reason") or "Live fillability score below threshold."),
+                                "context": {**risk.context, **live_fillability},
+                            }
+                        )
+                if self.config.mode.value == "LIVE" and risk.allowed:
+                    live_signal_quality = self._live_signal_quality_assessment(
+                        category=decision_category,
+                        entry_style=entry_style,
+                        detection=detection,
+                        wallet=wallet,
+                        executable_price=fill.executable_price,
+                        source_quality=decision_source_quality,
+                        stale_signal_limit_seconds=stale_signal_limit,
+                        consensus_context=consensus_context,
+                        burst_size=burst_size,
+                    )
+                    if not bool(live_signal_quality.get("passed")):
+                        risk = risk.model_copy(
+                            update={
+                                "allowed": False,
+                                "reason_code": str(live_signal_quality.get("reason_code") or "LOW_SIGNAL_QUALITY"),
+                                "human_readable_reason": str(live_signal_quality.get("reason") or "Live signal quality too weak."),
+                                "context": {**risk.context, **live_signal_quality},
+                            }
+                        )
                 style_evaluations.append(
                     {
                         "entry_style": entry_style.value,
@@ -380,6 +601,9 @@ class StrategyEngine:
                         "spread_pct": fill.spread_pct,
                         "slippage_pct": fill.slippage_pct,
                         "entry_drift_pct": round(drift_pct, 6),
+                        "live_fillability_score": None if live_fillability is None else live_fillability.get("score"),
+                        "signal_quality_score": None if live_signal_quality is None else live_signal_quality.get("score"),
+                        "stale_signal_limit_seconds": stale_signal_limit,
                     }
                 )
 
@@ -411,15 +635,28 @@ class StrategyEngine:
                         "market_meta": market_meta,
                         "tradability": tradability,
                         "cluster_strength": cluster.cluster_strength if cluster else 0.0,
+                        "signal_consensus": consensus_context,
                         "hybrid_modifier": hybrid_modifier,
+                        "burst_size": burst_size,
                         "ws_snapshot": ws_snapshots.get(detection.token_id, {}),
                         "style_evaluations": style_evaluations,
+                        "live_fillability_score": None if live_fillability is None else live_fillability.get("score"),
+                        "live_fillability": live_fillability or {},
+                        "signal_quality_score": None if live_signal_quality is None else live_signal_quality.get("score"),
+                        "signal_quality": live_signal_quality or {},
+                        "stale_signal_limit_seconds": stale_signal_limit,
+                        "wallet_global_score": wallet.global_score,
                         "discovery_state": discovery_state,
                         "scoring_state": scoring_state,
                         "source_quality": decision_source_quality.value,
+                        "selection_thesis": str(consensus_context.get("selection_thesis") or "wallet_follow"),
                     },
                 )
-                if self._decision_rank(decision, wallet, hybrid_modifier) > self._decision_rank(best_decision, wallet, 0.0):
+                if self._decision_rank(decision, wallet, hybrid_modifier) > self._decision_rank(
+                    best_decision,
+                    wallet,
+                    float(best_decision.context.get("hybrid_modifier", 0.0) or 0.0),
+                ):
                     best_decision = decision
 
             if (
@@ -467,10 +704,23 @@ class StrategyEngine:
                 fallback_in_use=fallback_used,
                 scoring_state=scoring_state,
             )
+            best_decision.context["selection_score"] = self._decision_rank(
+                best_decision,
+                wallet,
+                float(best_decision.context.get("hybrid_modifier", 0.0) or 0.0),
+            )
             self._write_decision_trace(detection, best_decision, cluster_confirmed, style_evaluations, discovery_state, scoring_state, decision_source_quality)
             decisions.append(best_decision)
         decisions.extend(
             await self._generate_event_driven_official_decisions(
+                stored_positions=active_positions,
+                total_exposure=total_exposure,
+                active_market_exposure=active_market_exposure,
+                active_wallet_exposure=active_wallet_exposure,
+            )
+        )
+        decisions.extend(
+            await self._generate_paired_binary_arb_decisions(
                 stored_positions=active_positions,
                 total_exposure=total_exposure,
                 active_market_exposure=active_market_exposure,
@@ -493,6 +743,8 @@ class StrategyEngine:
                 active_wallet_exposure=active_wallet_exposure,
             )
         )
+        if self.config.mode.value == "LIVE":
+            decisions.sort(key=self._execution_priority, reverse=True)
         return decisions
 
     def _select_copy_fraction(self, wallet: WalletMetrics) -> float:
@@ -516,6 +768,261 @@ class StrategyEngine:
             return override
         return self._paper_bankroll() * self.config.risk.max_market_exposure_pct
 
+    def _recent_live_fill_success(self) -> tuple[dict[str, float], float]:
+        cutoff = datetime.now(timezone.utc).timestamp() - 86_400.0
+        attempts_by_category: dict[str, int] = {}
+        fills_by_category: dict[str, int] = {}
+        total_attempts = 0
+        total_fills = 0
+        for order in self.live_orders.load():
+            if order.is_exit:
+                continue
+            observed_at = order.submitted_at or order.created_at
+            if observed_at.timestamp() < cutoff:
+                continue
+            category = str(order.category or "unknown")
+            attempts_by_category[category] = attempts_by_category.get(category, 0) + 1
+            total_attempts += 1
+            if order.filled_size > 0 or order.lifecycle_status in {OrderLifecycleStatus.PARTIALLY_FILLED, OrderLifecycleStatus.FILLED}:
+                fills_by_category[category] = fills_by_category.get(category, 0) + 1
+                total_fills += 1
+        ratios = {
+            category: round(fills_by_category.get(category, 0) / max(attempts, 1), 4)
+            for category, attempts in attempts_by_category.items()
+        }
+        overall = round(total_fills / max(total_attempts, 1), 4) if total_attempts else 0.55
+        return ratios, overall
+
+    def _live_category_priority(self, category: str) -> float:
+        normalized = str(category or "unknown").strip().lower()
+        if normalized in {"politics", "macro / economics", "entertainment / pop culture", "regulatory / legal"}:
+            return 1.0
+        if normalized == "geopolitics":
+            return 0.85
+        if normalized == "crypto price":
+            return 0.4
+        if normalized == "sports":
+            return 0.15
+        return 0.45
+
+    def _stale_signal_threshold_seconds(
+        self,
+        *,
+        strategy_name: str,
+        entry_style: EntryStyle,
+        category: str,
+        source_quality: SourceQuality,
+    ) -> float | None:
+        if self.config.mode.value != "LIVE":
+            return None
+        base = float(self.config.risk.stale_signal_seconds)
+        if strategy_name == "event_driven_official":
+            return max(base, float(self.config.strategies.official_signal_max_age_minutes) * 60.0)
+        if (
+            strategy_name == "wallet_follow"
+            and entry_style in {EntryStyle.PASSIVE_LIMIT, EntryStyle.POST_ONLY_MAKER}
+            and category in self.config.live.selected_categories
+            and source_quality == SourceQuality.REAL_PUBLIC_DATA
+        ):
+            return max(base, float(self.config.live.passive_signal_ttl_seconds))
+        return None
+
+    async def _direct_resolve_official_signal_market(self, row: dict[str, object]) -> tuple[MarketInfo | None, str]:
+        market_id = str(row.get("market_id") or "").strip()
+        token_id = str(row.get("token_id") or "").strip()
+        market_slug = str(row.get("market_slug") or row.get("slug") or "").strip()
+        outcome = str(row.get("outcome") or "").strip()
+        if not any([market_id, token_id, market_slug]):
+            return None, "missing_mapping_hints"
+        try:
+            market_meta = await self.market_data.fetch_market_metadata(
+                market_id,
+                token_id,
+                market_slug,
+                outcome,
+            )
+        except RuntimeError:
+            return None, "no_market_match"
+        resolved_market_id = str(market_meta.get("market_id") or market_id).strip()
+        resolved_token_id = str(market_meta.get("token_id") or token_id).strip()
+        if not resolved_market_id or not resolved_token_id:
+            return None, "missing_direct_market_lookup"
+        market = MarketInfo(
+                market_id=resolved_market_id,
+                token_id=resolved_token_id,
+                title=str(market_meta.get("title") or row.get("title") or resolved_market_id),
+                slug=str(market_meta.get("slug") or market_slug),
+                category=str(market_meta.get("category") or row.get("category") or "unknown"),
+                active=bool(market_meta.get("active", True)),
+                closed=bool(market_meta.get("closed", False)),
+                liquidity=float(market_meta.get("liquidity", 0.0) or 0.0),
+            )
+        self.market_data.market_cache[market.market_id] = market
+        self.market_data.token_cache[market.token_id] = market
+        return (market, "direct_market_lookup")
+
+    def _live_fillability_assessment(
+        self,
+        *,
+        category: str,
+        entry_style: EntryStyle,
+        detection: DetectionEvent,
+        orderbook: OrderbookSnapshot,
+        fill: FillEstimate,
+        tradability: dict[str, object],
+        target_notional: float,
+        drift_pct: float,
+        stale_signal_limit_seconds: float | None,
+        category_fill_success: dict[str, float],
+        overall_fill_success: float,
+    ) -> dict[str, object]:
+        executable_price = float(fill.executable_price or 0.0)
+        hard_floor = float(self.config.live.hard_skip_price_floor)
+        hard_ceiling = float(self.config.live.hard_skip_price_ceiling)
+        if executable_price <= hard_floor or executable_price >= hard_ceiling:
+            return {
+                "passed": False,
+                "score": 0.0,
+                "reason_code": "EXTREME_PRICE_BOOK",
+                "reason": "Executable live entry sits in an extreme price band.",
+                "executable_price": executable_price,
+            }
+
+        preferred_min = float(self.config.live.preferred_entry_price_min)
+        preferred_max = float(self.config.live.preferred_entry_price_max)
+        if preferred_min <= executable_price <= preferred_max:
+            price_band_score = 1.0
+        elif 0.05 <= executable_price <= 0.90:
+            price_band_score = 0.65
+        else:
+            price_band_score = 0.25
+
+        best_ask_depth_usd = 0.0
+        if orderbook.asks:
+            best_ask_depth_usd = orderbook.asks[0].price * orderbook.asks[0].size
+        depth_score = clamp(best_ask_depth_usd / max(target_notional * 3.0, 1.0), 0.0, 1.0)
+        spread_score = clamp(1.0 - (fill.spread_pct / max(self.config.risk.max_spread_pct, 1e-6)), 0.0, 1.0)
+        drift_score = clamp(1.0 - (drift_pct / max(self.config.risk.max_entry_drift_pct, 1e-6)), 0.0, 1.0)
+        freshness_limit = float(stale_signal_limit_seconds or self.config.risk.stale_signal_seconds or 1.0)
+        freshness_score = clamp(1.0 - (float(detection.detection_latency_seconds or 0.0) / max(freshness_limit, 1.0)), 0.0, 1.0)
+        tradability_confidence = 0.65 if bool(tradability.get("derived_from_orderbook")) else 1.0
+        recent_fill_success = category_fill_success.get(category, overall_fill_success)
+        category_priority = self._live_category_priority(category)
+        style_bias = 1.0 if entry_style in {EntryStyle.PASSIVE_LIMIT, EntryStyle.POST_ONLY_MAKER} else 0.35
+        score = clamp(
+            price_band_score * 0.22
+            + depth_score * 0.18
+            + spread_score * 0.14
+            + drift_score * 0.14
+            + freshness_score * 0.12
+            + tradability_confidence * 0.10
+            + recent_fill_success * 0.06
+            + category_priority * 0.02
+            + style_bias * 0.02,
+            0.0,
+            1.0,
+        )
+        return {
+            "passed": score >= float(self.config.live.minimum_fillability_score),
+            "score": round(score, 4),
+            "reason_code": "LIVE_FILLABILITY_SCORE",
+            "reason": "Live fillability score below threshold.",
+            "price_band_score": round(price_band_score, 4),
+            "depth_score": round(depth_score, 4),
+            "spread_score": round(spread_score, 4),
+            "drift_score": round(drift_score, 4),
+            "freshness_score": round(freshness_score, 4),
+            "stale_signal_limit_seconds": round(freshness_limit, 4),
+            "tradability_confidence": tradability_confidence,
+            "recent_fill_success": round(recent_fill_success, 4),
+            "category_priority": round(category_priority, 4),
+            "style_bias": round(style_bias, 4),
+        }
+
+    def _live_signal_quality_assessment(
+        self,
+        *,
+        category: str,
+        entry_style: EntryStyle,
+        detection: DetectionEvent,
+        wallet: WalletMetrics,
+        executable_price: float,
+        source_quality: SourceQuality,
+        stale_signal_limit_seconds: float | None,
+        consensus_context: dict[str, object],
+        burst_size: int,
+    ) -> dict[str, object]:
+        same_side_wallets = int(consensus_context.get("same_side_wallets", 1) or 1)
+        opposing_wallets = int(consensus_context.get("opposing_wallets", 0) or 0)
+        consensus_ratio = float(consensus_context.get("consensus_ratio", 1.0) or 1.0)
+        notional_ratio = float(consensus_context.get("notional_ratio", 1.0) or 1.0)
+        cluster_strength = float(consensus_context.get("cluster_strength", 0.0) or 0.0)
+        if opposing_wallets > same_side_wallets:
+            return {
+                "passed": False,
+                "score": 0.0,
+                "reason_code": "SIGNAL_CONFLICT",
+                "reason": "Recent wallet flow is conflicting on this market.",
+                "same_side_wallets": same_side_wallets,
+                "opposing_wallets": opposing_wallets,
+                "consensus_ratio": round(consensus_ratio, 4),
+                "notional_ratio": round(notional_ratio, 4),
+            }
+
+        price = float(executable_price or detection.price or 0.0)
+        if self.config.live.preferred_entry_price_min <= price <= self.config.live.preferred_entry_price_max:
+            price_band_score = 1.0
+        elif 0.05 <= price <= 0.90:
+            price_band_score = 0.7
+        else:
+            price_band_score = 0.25
+
+        freshness_limit = float(stale_signal_limit_seconds or self.config.risk.stale_signal_seconds or 1.0)
+        freshness_score = clamp(1.0 - (float(detection.detection_latency_seconds or 0.0) / max(freshness_limit, 1.0)), 0.0, 1.0)
+        source_quality_score = {
+            SourceQuality.REAL_PUBLIC_DATA: 1.0,
+            SourceQuality.DEGRADED_PUBLIC_DATA: 0.65,
+            SourceQuality.SYNTHETIC_FALLBACK: 0.0,
+        }.get(source_quality, 0.5)
+        category_priority = self._live_category_priority(category)
+        style_score = 1.0 if entry_style in {EntryStyle.PASSIVE_LIMIT, EntryStyle.POST_ONLY_MAKER} else 0.35
+        wallet_score = clamp(float(wallet.global_score or 0.0), 0.0, 1.0)
+        burst_penalty = max(burst_size - 1, 0) * 0.04
+        opposing_share_penalty = clamp(opposing_wallets / max(same_side_wallets + opposing_wallets, 1), 0.0, 1.0) * 0.12
+        score = clamp(
+            wallet_score * 0.2
+            + consensus_ratio * 0.22
+            + notional_ratio * 0.14
+            + max(cluster_strength, 0.35 if same_side_wallets >= 2 else 0.0) * 0.16
+            + freshness_score * 0.14
+            + category_priority * 0.1
+            + source_quality_score * 0.08
+            + price_band_score * 0.06
+            + style_score * 0.04
+            - burst_penalty
+            - opposing_share_penalty,
+            0.0,
+            1.0,
+        )
+        return {
+            "passed": score >= float(self.config.live.minimum_signal_quality_score),
+            "score": round(score, 4),
+            "reason_code": "LOW_SIGNAL_QUALITY",
+            "reason": "Live signal quality score below threshold.",
+            "same_side_wallets": same_side_wallets,
+            "opposing_wallets": opposing_wallets,
+            "consensus_ratio": round(consensus_ratio, 4),
+            "notional_ratio": round(notional_ratio, 4),
+            "cluster_strength": round(cluster_strength, 4),
+            "wallet_score": round(wallet_score, 4),
+            "freshness_score": round(freshness_score, 4),
+            "category_priority": round(category_priority, 4),
+            "source_quality_score": round(source_quality_score, 4),
+            "price_band_score": round(price_band_score, 4),
+            "style_score": round(style_score, 4),
+            "selection_thesis": str(consensus_context.get("selection_thesis") or "wallet_follow"),
+        }
+
     def _entry_style_allowed(self, entry_style: EntryStyle, cluster_confirmed: bool) -> bool:
         if self.config.mode.value == "LIVE" and self.config.live.only_cluster_confirmed and not cluster_confirmed:
             return False
@@ -527,18 +1034,133 @@ class StrategyEngine:
             return False
         return True
 
+    def _estimate_entry_fill(
+        self,
+        detection: DetectionEvent,
+        orderbook: OrderbookSnapshot,
+        target_notional: float,
+        entry_style: EntryStyle,
+    ) -> FillEstimate:
+        if entry_style == EntryStyle.FOLLOW_TAKER:
+            return estimate_fill(orderbook, target_notional, self.config.risk.max_slippage_pct)
+        return self._estimate_resting_fill(detection, orderbook, target_notional, entry_style)
+
+    def _estimate_resting_fill(
+        self,
+        detection: DetectionEvent,
+        orderbook: OrderbookSnapshot,
+        target_notional: float,
+        entry_style: EntryStyle,
+    ) -> FillEstimate:
+        best_bid = orderbook.bids[0].price if orderbook.bids else 0.0
+        best_ask = orderbook.asks[0].price if orderbook.asks else 0.0
+        if best_bid <= 0 and best_ask <= 0:
+            return FillEstimate(
+                fillable=False,
+                executable_price=0.0,
+                spread_pct=1.0,
+                slippage_pct=1.0,
+                filled_notional=0.0,
+                reason="No usable orderbook levels available for resting entry.",
+            )
+
+        tick_size = 0.01
+        source_price = round(clamp(detection.price, tick_size, 0.99), 6)
+        limit_price = source_price
+        if entry_style == EntryStyle.POST_ONLY_MAKER and best_ask > 0:
+            limit_price = min(limit_price, max(round(best_ask - tick_size, 6), tick_size))
+        elif entry_style == EntryStyle.PASSIVE_LIMIT and best_ask > 0 and limit_price > best_ask:
+            limit_price = round(best_ask, 6)
+
+        executable_price = round(clamp(limit_price, tick_size, 0.99), 6)
+        estimated_size = round(target_notional / max(executable_price, 1e-6), 6)
+        visible_depth = sum(level.price * level.size for level in (orderbook.bids or orderbook.asks))
+        price_gap_to_ask = max(best_ask - executable_price, 0.0) if best_ask > 0 else 0.0
+        reason = "Resting limit entry priced from source trade."
+        if entry_style == EntryStyle.POST_ONLY_MAKER:
+            reason = "Post-only maker entry priced below top ask."
+        return FillEstimate(
+            fillable=True,
+            executable_price=executable_price,
+            spread_pct=0.0 if price_gap_to_ask > 0 else round(max(best_ask - best_bid, 0.0) / max(best_ask, 1e-6), 6),
+            slippage_pct=0.0,
+            filled_notional=round(target_notional, 6),
+            reason=reason,
+            depth_consumed_pct=round(target_notional / max(visible_depth, target_notional, 1e-6), 6),
+            max_size_within_slippage=estimated_size,
+        )
+
     def _decision_rank(self, decision: TradeDecision, wallet: WalletMetrics, hybrid_modifier: float) -> float:
         if not decision.allowed:
-            return -100.0
+            fill = decision.context.get("fill", {})
+            risk_context = decision.context.get("risk_context", {})
+            drift = float(risk_context.get("entry_drift_pct", 0.0) or 0.0)
+            spread = float(fill.get("spread_pct", 0.0) or 0.0)
+            slippage = float(fill.get("slippage_pct", 0.0) or 0.0)
+            reason_bonus = {
+                "EXTREME_PRICE_BOOK": 95.0,
+                "ENTRY_DRIFT": 90.0,
+                "LIVE_FILLABILITY_SCORE": 85.0,
+                "WIDE_SPREAD": 80.0,
+                "FILLABILITY": 70.0,
+                "SLIPPAGE": 60.0,
+                "CATEGORY_BLOCKED": 50.0,
+                "ENTRY_STYLE_BLOCKED": 40.0,
+                "NO_VALID_ENTRY_STYLE": -500.0,
+            }.get(decision.reason_code, 10.0)
+            return -1000.0 + reason_bonus - drift - spread - slippage
         fill = decision.context.get("fill", {})
         slippage = float(fill.get("slippage_pct", 1.0))
-        return (
-            wallet.global_score
+        burst_size = int(decision.context.get("burst_size", 1) or 1)
+        price = float(decision.executable_price or 0.0)
+        fillability_score = float(decision.context.get("live_fillability_score", 0.5) or 0.5)
+        signal_quality_score = float(decision.context.get("signal_quality_score", 0.5) or 0.5)
+        freshness_score = float((decision.context.get("live_fillability") or {}).get("freshness_score", 0.5) or 0.5)
+        category_priority = self._live_category_priority(decision.category)
+        confidence_score = float(decision.context.get("confidence_score", 0.0) or 0.0)
+        selection_thesis = str(decision.context.get("selection_thesis") or "")
+        strategy_bonus = 0.0
+        if decision.strategy_name == "event_driven_official":
+            strategy_bonus = 0.12
+        elif decision.strategy_name == "paired_binary_arb":
+            strategy_bonus = 0.14
+        elif selection_thesis == "wallet_consensus":
+            strategy_bonus = 0.06
+        extreme_price_penalty = 0.0
+        if price >= 0.98 or price <= 0.02:
+            extreme_price_penalty = 0.6
+        elif price >= 0.95 or price <= 0.05:
+            extreme_price_penalty = 0.35
+        elif not (self.config.live.preferred_entry_price_min <= price <= self.config.live.preferred_entry_price_max):
+            extreme_price_penalty = 0.1
+        burst_penalty = max(burst_size - 1, 0) * 0.05
+        return round(
+            wallet.global_score * 0.55
+            + fillability_score * 0.55
+            + signal_quality_score * 0.3
+            + freshness_score * 0.15
+            + category_priority * 0.2
+            + confidence_score * 0.15
+            + strategy_bonus
             + (0.15 if decision.cluster_confirmed else 0.0)
             + hybrid_modifier
             - slippage
-            - wallet.hedge_suspicion_score * 0.4
+            - extreme_price_penalty
+            - burst_penalty
+            - wallet.hedge_suspicion_score * 0.4,
+            6,
         )
+
+    def _execution_priority(self, decision: TradeDecision) -> tuple[int, float]:
+        action_priority = 1 if decision.allowed and decision.action == DecisionAction.LIVE_COPY else 0
+        wallet = self._strategy_wallet(decision.strategy_name)
+        wallet.global_score = float(decision.context.get("wallet_global_score", wallet.global_score) or wallet.global_score)
+        score = self._decision_rank(
+            decision,
+            wallet,
+            float(decision.context.get("hybrid_modifier", 0.0) or 0.0),
+        )
+        return (action_priority, score)
 
     def _skip_decision(self, detection: DetectionEvent, wallet: WalletMetrics, scaled_notional: float, reason_code: str, reason: str) -> TradeDecision:
         return TradeDecision(
@@ -624,13 +1246,54 @@ class StrategyEngine:
             },
         )
 
-    def _has_conflicting_position(self, active_positions: list[dict], detection: DetectionEvent) -> bool:
+    def _position_thesis_type(self, position: dict[str, object]) -> str:
+        return str(position.get("thesis_type") or "directional")
+
+    def _binary_outcome_side(self, title: str) -> str:
+        normalized = str(title or "").strip().lower()
+        if normalized.endswith("[yes]"):
+            return "YES"
+        if normalized.endswith("[no]"):
+            return "NO"
+        return ""
+
+    def _has_conflicting_market_position(
+        self,
+        active_positions: list[dict],
+        *,
+        market_id: str,
+        token_id: str,
+        thesis_type: str = "directional",
+        bundle_id: str = "",
+    ) -> bool:
         for position in active_positions:
             if position.get("closed"):
                 continue
-            if position.get("market_id") == detection.market_id and position.get("wallet_address") == detection.wallet_address:
+            if position.get("market_id") != market_id:
+                continue
+            existing_token_id = str(position.get("token_id") or "")
+            existing_thesis = self._position_thesis_type(position)
+            existing_bundle_id = str(position.get("bundle_id") or "")
+            if thesis_type == "paired_arb":
+                if existing_bundle_id == bundle_id and existing_token_id == token_id:
+                    return True
+                if existing_bundle_id == bundle_id and existing_token_id != token_id:
+                    continue
                 return True
+            if existing_thesis == "paired_arb":
+                return True
+            if existing_token_id == token_id:
+                return True
+            return True
         return False
+
+    def _has_conflicting_position(self, active_positions: list[dict], detection: DetectionEvent) -> bool:
+        return self._has_conflicting_market_position(
+            active_positions,
+            market_id=detection.market_id,
+            token_id=detection.token_id,
+            thesis_type="directional",
+        )
 
     def _hybrid_confirmation_modifier(self, detection: DetectionEvent, ws_snapshot: dict) -> float:
         if detection.category == "crypto price":
@@ -683,6 +1346,7 @@ class StrategyEngine:
                 "cluster_state": "CONFIRMED" if cluster_confirmed else "SINGLE_WALLET",
                 "freshness_state": "FRESH" if detection.detection_latency_seconds <= self.config.risk.stale_signal_seconds else "STALE",
                 "fillability_state": "FILLABLE" if fill.get("fillable") else "UNFILLABLE",
+                "signal_quality_state": "STRONG" if float(decision.context.get("signal_quality_score", 0.0) or 0.0) >= float(self.config.live.minimum_signal_quality_score) else "WEAK",
                 "risk_allowed": decision.allowed,
                 "risk_reason_code": decision.reason_code,
                 "risk_reason": decision.human_readable_reason,
@@ -691,12 +1355,35 @@ class StrategyEngine:
                 "final_action": decision.action.value,
                 "reason_code": decision.reason_code,
                 "entry_style": decision.entry_style.value,
+                "thesis_type": decision.thesis_type,
+                "bundle_id": decision.bundle_id,
+                "bundle_role": decision.bundle_role,
+                "paired_token_id": decision.paired_token_id,
                 "style_evaluations": style_evaluations,
                 "scaled_notional": decision.scaled_notional,
             },
         )
 
     def _strategy_wallet(self, strategy_name: str) -> WalletMetrics:
+        global_score = 0.75
+        conviction_score = 0.8
+        copyability_score = 0.8
+        if strategy_name == "event_driven_official":
+            global_score = 0.88
+            conviction_score = 0.9
+            copyability_score = 0.86
+        elif strategy_name == "paired_binary_arb":
+            global_score = 0.92
+            conviction_score = 0.94
+            copyability_score = 0.9
+        elif strategy_name == "resolution_window":
+            global_score = 0.66
+            conviction_score = 0.72
+            copyability_score = 0.68
+        elif strategy_name == "correlation_dislocation":
+            global_score = 0.62
+            conviction_score = 0.68
+            copyability_score = 0.64
         return WalletMetrics(
             wallet_address=f"strategy:{strategy_name}",
             evaluation_window_days=30,
@@ -707,12 +1394,12 @@ class StrategyEngine:
             estimated_pnl_percent=0.2,
             win_rate=0.6,
             average_trade_size=100.0,
-            conviction_score=0.8,
+            conviction_score=conviction_score,
             market_concentration=0.2,
             category_concentration=0.5,
             holding_time_estimate_hours=6.0,
             drawdown_proxy=0.1,
-            copyability_score=0.8,
+            copyability_score=copyability_score,
             low_velocity_score=0.8,
             delay_5s=0.8,
             delay_15s=0.8,
@@ -720,7 +1407,7 @@ class StrategyEngine:
             delay_60s=0.8,
             delayed_viability_score=0.8,
             hedge_suspicion_score=0.0,
-            global_score=0.75,
+            global_score=global_score,
             dominant_category="unknown",
             source_quality=SourceQuality.REAL_PUBLIC_DATA,
         )
@@ -736,6 +1423,8 @@ class StrategyEngine:
     def _strategy_live_enabled(self, strategy_name: str) -> bool:
         if strategy_name == "event_driven_official":
             return self.config.strategies.official_signal_live_enabled
+        if strategy_name == "paired_binary_arb":
+            return self.config.strategies.paired_binary_live_enabled
         if strategy_name == "correlation_dislocation":
             return self.config.strategies.correlation_live_enabled
         if strategy_name == "resolution_window":
@@ -865,7 +1554,12 @@ class StrategyEngine:
         total_exposure: float,
         active_market_exposure: dict[str, float],
         active_wallet_exposure: dict[str, float],
+        entries_last_hour_override: int,
         age_seconds: float = 0.0,
+        thesis_type: str = "directional",
+        bundle_id: str = "",
+        bundle_role: str = "",
+        paired_token_id: str = "",
     ) -> TradeDecision:
         wallet = self._strategy_wallet(strategy_name)
         wallet.dominant_category = category
@@ -898,6 +1592,11 @@ class StrategyEngine:
             decision.context.update(
                 {
                     "source_quality": SourceQuality.REAL_PUBLIC_DATA.value,
+                    "selection_thesis": strategy_name,
+                    "thesis_type": thesis_type,
+                    "bundle_id": bundle_id,
+                    "bundle_role": bundle_role,
+                    "paired_token_id": paired_token_id,
                     "trust_level": classify_trust_level(
                         source_quality=SourceQuality.REAL_PUBLIC_DATA.value,
                         discovery_state="SUCCESS",
@@ -942,6 +1641,7 @@ class StrategyEngine:
             decision.strategy_name = strategy_name
             decision.context.update(extra_context)
             decision.context["market_error"] = str(exc)
+            decision.context["selection_thesis"] = strategy_name
             self._write_decision_trace(detection, decision, False, [], "SUCCESS", "SUCCESS", SourceQuality.REAL_PUBLIC_DATA)
             self._log_strategy_signal(
                 strategy_name=strategy_name,
@@ -954,9 +1654,20 @@ class StrategyEngine:
             )
             return decision
 
-        fill = estimate_fill(orderbook, scaled_notional, self.config.risk.max_slippage_pct)
+        fill = self._estimate_resting_fill(
+            detection=detection,
+            orderbook=orderbook,
+            target_notional=scaled_notional,
+            entry_style=EntryStyle.PASSIVE_LIMIT,
+        )
         best_ask = orderbook.asks[0].price if orderbook.asks else source_price
-        drift_pct = abs(fill.executable_price - best_ask) / max(best_ask, 1e-6)
+        drift_pct = abs(fill.executable_price - source_price) / max(source_price, 1e-6)
+        stale_signal_limit = self._stale_signal_threshold_seconds(
+            strategy_name=strategy_name,
+            entry_style=EntryStyle.PASSIVE_LIMIT,
+            category=category,
+            source_quality=SourceQuality.REAL_PUBLIC_DATA,
+        )
         risk = self.risk.evaluate(
             detection=detection,
             wallet=wallet,
@@ -971,7 +1682,13 @@ class StrategyEngine:
             entry_style_allowed=True,
             category=category,
             market_id=market_id,
-            has_conflicting_position=self._has_market_position(stored_positions, market_id),
+            has_conflicting_position=self._has_conflicting_market_position(
+                stored_positions,
+                market_id=market_id,
+                token_id=token_id,
+                thesis_type=thesis_type,
+                bundle_id=bundle_id,
+            ),
             data_age_seconds=(datetime.now(timezone.utc) - orderbook.timestamp).total_seconds(),
             entry_drift_pct=drift_pct,
             live_ready=bool(self.state.read().get("live_readiness_last_result", {}).get("ready", True)),
@@ -985,8 +1702,37 @@ class StrategyEngine:
             allowance_sufficient=bool(self.state.read().get("allowance_sufficient", True)),
             tradable=bool(tradability.get("tradable")) and bool(tradability.get("orderbook_enabled")),
             bankroll_override=self._paper_bankroll() if self.config.mode.value != "LIVE" else None,
+            entries_last_hour_override=entries_last_hour_override,
+            stale_signal_seconds_override=stale_signal_limit,
         )
+        live_fillability: dict[str, object] | None = None
+        if self.config.mode.value == "LIVE" and risk.reason_code in {"OK", "ENTRY_DRIFT", "WIDE_SPREAD", "FILLABILITY", "SLIPPAGE"}:
+            category_fill_success, overall_fill_success = self._recent_live_fill_success()
+            live_fillability = self._live_fillability_assessment(
+                category=category,
+                entry_style=EntryStyle.PASSIVE_LIMIT,
+                detection=detection,
+                orderbook=orderbook,
+                fill=fill,
+                tradability=tradability,
+                target_notional=scaled_notional,
+                drift_pct=drift_pct,
+                stale_signal_limit_seconds=stale_signal_limit,
+                category_fill_success=category_fill_success,
+                overall_fill_success=overall_fill_success,
+            )
+            if not bool(live_fillability.get("passed")):
+                risk = risk.model_copy(
+                    update={
+                        "allowed": False,
+                        "reason_code": str(live_fillability.get("reason_code") or "LIVE_FILLABILITY_SCORE"),
+                        "human_readable_reason": str(live_fillability.get("reason") or "Live fillability score below threshold."),
+                        "context": {**risk.context, **live_fillability},
+                    }
+                )
         action = DecisionAction.PAPER_COPY if risk.allowed and self.config.mode.value != "LIVE" else DecisionAction.SKIP
+        if risk.allowed and self.config.mode.value == "LIVE":
+            action = DecisionAction.LIVE_COPY
         decision = TradeDecision(
             strategy_name=strategy_name,
             allowed=risk.allowed,
@@ -1004,12 +1750,21 @@ class StrategyEngine:
             executable_price=fill.executable_price or best_ask,
             cluster_confirmed=False,
             hedge_suspicion_score=wallet.hedge_suspicion_score,
+            thesis_type=thesis_type,
+            bundle_id=bundle_id,
+            bundle_role=bundle_role,
+            paired_token_id=paired_token_id,
             context={
                 "fill": fill.model_dump(),
                 "risk_context": risk.context,
                 "market_meta": market_meta,
                 "tradability": tradability,
                 "source_quality": SourceQuality.REAL_PUBLIC_DATA.value,
+                "selection_thesis": strategy_name,
+                "thesis_type": thesis_type,
+                "bundle_id": bundle_id,
+                "bundle_role": bundle_role,
+                "paired_token_id": paired_token_id,
                 "trust_level": classify_trust_level(
                     source_quality=SourceQuality.REAL_PUBLIC_DATA.value,
                     discovery_state="SUCCESS",
@@ -1020,6 +1775,10 @@ class StrategyEngine:
                 "counts_as_trustworthy_approval": False,
                 "confidence_score": confidence_score,
                 "fair_price": fair_price,
+                "live_fillability_score": None if live_fillability is None else live_fillability.get("score"),
+                "live_fillability": live_fillability or {},
+                "stale_signal_limit_seconds": stale_signal_limit,
+                "wallet_global_score": wallet.global_score,
                 **extra_context,
             },
         )
@@ -1058,6 +1817,7 @@ class StrategyEngine:
             )
             if relaxed is not None:
                 decision = relaxed
+        decision.context["selection_score"] = self._decision_rank(decision, wallet, 0.0)
         self._write_decision_trace(detection, decision, False, [], "SUCCESS", "SUCCESS", SourceQuality.REAL_PUBLIC_DATA)
         self._log_strategy_signal(
             strategy_name=strategy_name,
@@ -1081,6 +1841,7 @@ class StrategyEngine:
         if not self.config.strategies.enable_event_driven_official:
             return []
         now = datetime.now(timezone.utc)
+        entries_last_hour = self._actual_entries_last_hour(self.positions.load(), now)
         rows = self.official_signals.load()
         decisions: list[TradeDecision] = []
         market_rows = list(self.market_data.market_cache.values())
@@ -1125,6 +1886,10 @@ class StrategyEngine:
                 continue
             resolved_market, mapping_reason = resolve_official_signal_market(row, market_rows)
             signal_id = str(row.get("event_id") or stable_event_key("official", row.get("title"), row.get("market_slug"), published_at.isoformat()))
+            if resolved_market is None and mapping_reason in {"NO_MARKET_MATCH", "MISSING_MAPPING_HINTS", "MISSING_MARKET_MATCH"}:
+                resolved_market, mapping_reason = await self._direct_resolve_official_signal_market(row)
+            elif resolved_market is None and mapping_reason.lower() in {"no_market_match", "missing_mapping_hints", "missing_market_match"}:
+                resolved_market, mapping_reason = await self._direct_resolve_official_signal_market(row)
             if resolved_market is None:
                 self._log_strategy_signal(
                     strategy_name="event_driven_official",
@@ -1170,39 +1935,40 @@ class StrategyEngine:
                     },
                 )
                 continue
-            decisions.append(
-                await self._build_supplemental_decision(
-                    strategy_name="event_driven_official",
-                    signal_id=signal_id,
-                    market_id=market_id,
-                    token_id=token_id,
-                    category=str(row.get("category") or resolved_market.category or "unknown"),
-                    market_title=str(row.get("title") or row.get("market_title") or resolved_market.title),
-                    source_price=source_price,
-                    fair_price=fair_price,
-                    scaled_notional=scaled_notional,
-                    reason=str(row.get("rationale") or "Official event signal mapped to market."),
-                    confidence_score=confidence_score,
-                    extra_context={
-                        "strategy_rationale": str(row.get("rationale") or "Official event signal mapped to market."),
-                        "source_name": str(row.get("source_name") or ""),
-                        "source_url": str(row.get("source_url") or ""),
-                        "published_at": published_at.isoformat(),
-                        "source_reliability": source_reliability,
-                        "edge_pct": round(fair_price - source_price, 6),
-                        "mapping_reason": mapping_reason,
-                        "mapped_market_title": resolved_market.title,
-                        "mapped_market_slug": resolved_market.slug,
-                        "required_conditions": row.get("required_conditions", []),
-                        "disqualifiers": row.get("disqualifiers", []),
-                    },
-                    stored_positions=stored_positions,
-                    total_exposure=total_exposure,
-                    active_market_exposure=active_market_exposure,
-                    active_wallet_exposure=active_wallet_exposure,
-                    age_seconds=age_seconds,
-                )
+            decision = await self._build_supplemental_decision(
+                strategy_name="event_driven_official",
+                signal_id=signal_id,
+                market_id=market_id,
+                token_id=token_id,
+                category=str(row.get("category") or resolved_market.category or "unknown"),
+                market_title=str(row.get("title") or row.get("market_title") or resolved_market.title),
+                source_price=source_price,
+                fair_price=fair_price,
+                scaled_notional=scaled_notional,
+                reason=str(row.get("rationale") or "Official event signal mapped to market."),
+                confidence_score=confidence_score,
+                extra_context={
+                    "strategy_rationale": str(row.get("rationale") or "Official event signal mapped to market."),
+                    "source_name": str(row.get("source_name") or ""),
+                    "source_url": str(row.get("source_url") or ""),
+                    "published_at": published_at.isoformat(),
+                    "source_reliability": source_reliability,
+                    "edge_pct": round(fair_price - source_price, 6),
+                    "mapping_reason": mapping_reason,
+                    "mapped_market_title": resolved_market.title,
+                    "mapped_market_slug": resolved_market.slug,
+                    "required_conditions": row.get("required_conditions", []),
+                    "disqualifiers": row.get("disqualifiers", []),
+                },
+                stored_positions=stored_positions,
+                total_exposure=total_exposure,
+                active_market_exposure=active_market_exposure,
+                active_wallet_exposure=active_wallet_exposure,
+                entries_last_hour_override=entries_last_hour,
+                age_seconds=age_seconds,
+                thesis_type="event_catalyst",
             )
+            decisions.append(decision)
             emitted += 1
         if emitted == 0:
             self._log_strategy_signal(
@@ -1214,6 +1980,153 @@ class StrategyEngine:
                 reason_code="NO_ELIGIBLE_OFFICIAL_SIGNALS",
                 extra={"cycle_ts": now.isoformat(), "loaded_signal_count": len(rows)},
             )
+        return decisions
+
+    async def _generate_paired_binary_arb_decisions(
+        self,
+        *,
+        stored_positions: list[dict],
+        total_exposure: float,
+        active_market_exposure: dict[str, float],
+        active_wallet_exposure: dict[str, float],
+    ) -> list[TradeDecision]:
+        if not self.config.strategies.enable_paired_binary_arb:
+            return []
+        now = datetime.now(timezone.utc)
+        entries_last_hour = self._actual_entries_last_hour(self.positions.load(), now)
+        grouped: dict[str, list[MarketInfo]] = {}
+        for market in self.market_data.token_cache.values():
+            if not market.active or market.closed:
+                continue
+            grouped.setdefault(market.market_id, []).append(market)
+
+        best_candidate: dict[str, object] | None = None
+        for market_id, markets in grouped.items():
+            if len(markets) != 2:
+                continue
+            outcome_map = {self._binary_outcome_side(market.title): market for market in markets}
+            yes_market = outcome_map.get("YES")
+            no_market = outcome_map.get("NO")
+            if yes_market is None or no_market is None:
+                continue
+            try:
+                yes_orderbook = await self.market_data.fetch_orderbook(yes_market.token_id)
+                no_orderbook = await self.market_data.fetch_orderbook(no_market.token_id)
+            except Exception:
+                continue
+            if not yes_orderbook.asks or not no_orderbook.asks:
+                continue
+            yes_ask = float(yes_orderbook.asks[0].price or 0.0)
+            no_ask = float(no_orderbook.asks[0].price or 0.0)
+            if yes_ask <= 0 or no_ask <= 0:
+                continue
+            min_leg = float(self.config.strategies.paired_binary_min_leg_price)
+            max_leg = float(self.config.strategies.paired_binary_max_leg_price)
+            if not (min_leg <= yes_ask <= max_leg and min_leg <= no_ask <= max_leg):
+                continue
+            category = str(yes_market.category or no_market.category or "unknown")
+            if category == "sports":
+                continue
+            yes_depth = yes_ask * float(yes_orderbook.asks[0].size or 0.0)
+            no_depth = no_ask * float(no_orderbook.asks[0].size or 0.0)
+            min_depth = min(yes_depth, no_depth)
+            if min_depth < max(self.config.risk.min_orderbook_depth_usd * 0.5, 10.0):
+                continue
+            bundle_sum_ask = yes_ask + no_ask
+            locked_edge_pct = round(1.0 - bundle_sum_ask, 6)
+            if locked_edge_pct < float(self.config.strategies.paired_binary_min_edge_pct):
+                continue
+            candidate = {
+                "market_id": market_id,
+                "yes_market": yes_market,
+                "no_market": no_market,
+                "yes_ask": yes_ask,
+                "no_ask": no_ask,
+                "bundle_sum_ask": round(bundle_sum_ask, 6),
+                "locked_edge_pct": locked_edge_pct,
+                "min_depth": round(min_depth, 6),
+                "category": category,
+                "score": round(locked_edge_pct * 0.75 + clamp(min_depth / 50.0, 0.0, 1.0) * 0.25, 6),
+            }
+            if best_candidate is None or float(candidate["score"]) > float(best_candidate["score"]):
+                best_candidate = candidate
+
+        if best_candidate is None:
+            self._log_strategy_signal(
+                strategy_name="paired_binary_arb",
+                signal_id=stable_event_key("paired_binary_arb", "cycle-empty", now.isoformat()),
+                market_id="",
+                token_id="",
+                final_action=DecisionAction.SKIP.value,
+                reason_code="NO_PAIRED_BINARY_ARBS",
+                extra={"cycle_ts": now.isoformat()},
+            )
+            return []
+
+        yes_market = best_candidate["yes_market"]
+        no_market = best_candidate["no_market"]
+        yes_market = yes_market if isinstance(yes_market, MarketInfo) else None
+        no_market = no_market if isinstance(no_market, MarketInfo) else None
+        if yes_market is None or no_market is None:
+            return []
+
+        pair_title = yes_market.title.rsplit(" [", 1)[0]
+        bundle_id = stable_event_key("paired_binary_arb", best_candidate["market_id"], now.isoformat())
+        half_trade_budget = max(self._max_notional_for_mode() / 2.0, 1.0)
+        per_leg_notional = round(min(half_trade_budget, float(best_candidate["min_depth"]) * 0.5), 4)
+        confidence_score = round(
+            clamp(
+                float(best_candidate["locked_edge_pct"]) / max(float(self.config.strategies.paired_binary_min_edge_pct) * 2.0, 0.01),
+                0.0,
+                1.0,
+            ),
+            4,
+        )
+        common_context = {
+            "strategy_rationale": f"Paired binary arbitrage detected with combined ask {float(best_candidate['bundle_sum_ask']):.3f}.",
+            "paired_market_title": pair_title,
+            "bundle_sum_ask": float(best_candidate["bundle_sum_ask"]),
+            "bundle_locked_edge_pct": float(best_candidate["locked_edge_pct"]),
+            "paired_leg_prices": {
+                yes_market.token_id: float(best_candidate["yes_ask"]),
+                no_market.token_id: float(best_candidate["no_ask"]),
+            },
+            "paired_min_depth_usd": float(best_candidate["min_depth"]),
+        }
+        decisions: list[TradeDecision] = []
+        for market, role, paired_market, source_price in (
+            (yes_market, "paired_yes", no_market, float(best_candidate["yes_ask"])),
+            (no_market, "paired_no", yes_market, float(best_candidate["no_ask"])),
+        ):
+            decision = await self._build_supplemental_decision(
+                strategy_name="paired_binary_arb",
+                signal_id=stable_event_key(bundle_id, market.token_id, role),
+                market_id=market.market_id,
+                token_id=market.token_id,
+                category=str(best_candidate["category"]),
+                market_title=market.title,
+                source_price=source_price,
+                fair_price=min(0.99, max(source_price + float(best_candidate["locked_edge_pct"]), source_price)),
+                scaled_notional=per_leg_notional,
+                reason="Paired yes/no asks imply a positive locked edge after conservative buffers.",
+                confidence_score=confidence_score,
+                extra_context={
+                    **common_context,
+                    "paired_leg_role": role,
+                    "paired_token_id": paired_market.token_id,
+                },
+                stored_positions=stored_positions,
+                total_exposure=total_exposure,
+                active_market_exposure=active_market_exposure,
+                active_wallet_exposure=active_wallet_exposure,
+                entries_last_hour_override=entries_last_hour,
+                age_seconds=0.0,
+                thesis_type="paired_arb",
+                bundle_id=bundle_id,
+                bundle_role=role,
+                paired_token_id=paired_market.token_id,
+            )
+            decisions.append(decision)
         return decisions
 
     async def _generate_correlation_dislocation_decisions(
@@ -1232,6 +2145,7 @@ class StrategyEngine:
         )
         decisions: list[TradeDecision] = []
         cycle_ts = datetime.now(timezone.utc)
+        entries_last_hour = self._actual_entries_last_hour(self.positions.load(), cycle_ts)
         if not groups:
             self._log_strategy_signal(
                 strategy_name="correlation_dislocation",
@@ -1292,36 +2206,36 @@ class StrategyEngine:
             later_mid = mid_prices[later.market_id]
             fair_price = earlier_mid
             source_price = later_mid
-            decisions.append(
-                await self._build_supplemental_decision(
-                    strategy_name="correlation_dislocation",
-                    signal_id=stable_event_key("correlation", earlier.market_id, later.market_id),
-                    market_id=later.market_id,
-                    token_id=later.token_id,
-                    category=later.category,
-                    market_title=later.title,
-                    source_price=source_price,
-                    fair_price=fair_price,
-                    scaled_notional=self._max_notional_for_mode(),
-                    reason="Later-dated related market is priced materially below the earlier market in the same relationship group.",
-                    confidence_score=round(min(confidence, 1.0), 4),
-                    extra_context={
-                        "relationship_group": [market.market_id for market in group],
-                        "reference_market_id": earlier.market_id,
-                        "reference_market_title": earlier.title,
-                        "reference_mid_price": earlier_mid,
-                        "target_mid_price": later_mid,
-                        "price_gap_pct": round(earlier_mid - later_mid, 6),
-                        "relative_gap_pct": round(confidence, 6),
-                        "strategy_rationale": "Later-dated related market is cheaper than the earlier-dated market beyond the configured dislocation threshold.",
-                    },
-                    stored_positions=stored_positions,
-                    total_exposure=total_exposure,
-                    active_market_exposure=active_market_exposure,
-                    active_wallet_exposure=active_wallet_exposure,
-                    age_seconds=0.0,
-                )
+            decision = await self._build_supplemental_decision(
+                strategy_name="correlation_dislocation",
+                signal_id=stable_event_key("correlation", earlier.market_id, later.market_id),
+                market_id=later.market_id,
+                token_id=later.token_id,
+                category=later.category,
+                market_title=later.title,
+                source_price=source_price,
+                fair_price=fair_price,
+                scaled_notional=self._max_notional_for_mode(),
+                reason="Later-dated related market is priced materially below the earlier market in the same relationship group.",
+                confidence_score=round(min(confidence, 1.0), 4),
+                extra_context={
+                    "relationship_group": [market.market_id for market in group],
+                    "reference_market_id": earlier.market_id,
+                    "reference_market_title": earlier.title,
+                    "reference_mid_price": earlier_mid,
+                    "target_mid_price": later_mid,
+                    "price_gap_pct": round(earlier_mid - later_mid, 6),
+                    "relative_gap_pct": round(confidence, 6),
+                    "strategy_rationale": "Later-dated related market is cheaper than the earlier-dated market beyond the configured dislocation threshold.",
+                },
+                stored_positions=stored_positions,
+                total_exposure=total_exposure,
+                active_market_exposure=active_market_exposure,
+                active_wallet_exposure=active_wallet_exposure,
+                entries_last_hour_override=entries_last_hour,
+                age_seconds=0.0,
             )
+            decisions.append(decision)
             emitted += 1
         if (
             emitted == 0
@@ -1339,37 +2253,37 @@ class StrategyEngine:
                 0.0,
                 0.92,
             )
-            decisions.append(
-                await self._build_supplemental_decision(
-                    strategy_name="correlation_dislocation",
-                    signal_id=stable_event_key("correlation-near-miss", earlier.market_id, later.market_id),
-                    market_id=later.market_id,
-                    token_id=later.token_id,
-                    category=later.category,
-                    market_title=later.title,
-                    source_price=later_mid,
-                    fair_price=earlier_mid,
-                    scaled_notional=self._max_notional_for_mode(),
-                    reason="Later-dated related market is only slightly below the dislocation threshold but still merits paper evaluation.",
-                    confidence_score=round(confidence, 4),
-                    extra_context={
-                        "relationship_group": relationship_group,
-                        "reference_market_id": earlier.market_id,
-                        "reference_market_title": earlier.title,
-                        "reference_mid_price": earlier_mid,
-                        "target_mid_price": later_mid,
-                        "price_gap_pct": round(raw_gap, 6),
-                        "near_miss_gap_ratio": round(gap_ratio, 6),
-                        "strategy_rationale": "Paper-only near-miss dislocation candidate promoted for evaluation after grouping succeeded but the gap landed just below the strict threshold.",
-                        "strategy_near_miss": True,
-                    },
-                    stored_positions=stored_positions,
-                    total_exposure=total_exposure,
-                    active_market_exposure=active_market_exposure,
-                    active_wallet_exposure=active_wallet_exposure,
-                    age_seconds=0.0,
-                )
+            decision = await self._build_supplemental_decision(
+                strategy_name="correlation_dislocation",
+                signal_id=stable_event_key("correlation-near-miss", earlier.market_id, later.market_id),
+                market_id=later.market_id,
+                token_id=later.token_id,
+                category=later.category,
+                market_title=later.title,
+                source_price=later_mid,
+                fair_price=earlier_mid,
+                scaled_notional=self._max_notional_for_mode(),
+                reason="Later-dated related market is only slightly below the dislocation threshold but still merits paper evaluation.",
+                confidence_score=round(confidence, 4),
+                extra_context={
+                    "relationship_group": relationship_group,
+                    "reference_market_id": earlier.market_id,
+                    "reference_market_title": earlier.title,
+                    "reference_mid_price": earlier_mid,
+                    "target_mid_price": later_mid,
+                    "price_gap_pct": round(raw_gap, 6),
+                    "near_miss_gap_ratio": round(gap_ratio, 6),
+                    "strategy_rationale": "Paper-only near-miss dislocation candidate promoted for evaluation after grouping succeeded but the gap landed just below the strict threshold.",
+                    "strategy_near_miss": True,
+                },
+                stored_positions=stored_positions,
+                total_exposure=total_exposure,
+                active_market_exposure=active_market_exposure,
+                active_wallet_exposure=active_wallet_exposure,
+                entries_last_hour_override=entries_last_hour,
+                age_seconds=0.0,
             )
+            decisions.append(decision)
             emitted += 1
         if emitted == 0:
             extra = {
@@ -1420,6 +2334,7 @@ class StrategyEngine:
         if not self.config.strategies.enable_resolution_window:
             return []
         now = datetime.now(timezone.utc)
+        entries_last_hour = self._actual_entries_last_hour(self.positions.load(), now)
         candidates: list[tuple[float, object]] = []
         for market in self.market_data.market_cache.values():
             if market.closed or not market.active or not market.market_id or not market.token_id:
@@ -1554,31 +2469,31 @@ class StrategyEngine:
                 0.0,
                 0.95,
             )
-            decisions.append(
-                await self._build_supplemental_decision(
-                    strategy_name="resolution_window",
-                    signal_id=stable_event_key("resolution_window", market.market_id, market.token_id),
-                    market_id=market.market_id,
-                    token_id=market.token_id,
-                    category=market.category,
-                    market_title=market.title,
-                    source_price=ask_price,
-                    fair_price=fair_price,
-                    scaled_notional=self._max_notional_for_mode(),
-                    reason="Near-resolution market is still discounted relative to conservative settlement value.",
-                    confidence_score=round(confidence_score, 4),
-                    extra_context={
-                        "hours_to_resolution": round(hours_to_resolution, 3),
-                        "market_liquidity": market.liquidity,
-                        "strategy_rationale": "Near-resolution market still trades below a conservative settlement anchor despite approaching expiry.",
-                    },
-                    stored_positions=stored_positions,
-                    total_exposure=total_exposure,
-                    active_market_exposure=active_market_exposure,
-                    active_wallet_exposure=active_wallet_exposure,
-                    age_seconds=0.0,
-                )
+            decision = await self._build_supplemental_decision(
+                strategy_name="resolution_window",
+                signal_id=stable_event_key("resolution_window", market.market_id, market.token_id),
+                market_id=market.market_id,
+                token_id=market.token_id,
+                category=market.category,
+                market_title=market.title,
+                source_price=ask_price,
+                fair_price=fair_price,
+                scaled_notional=self._max_notional_for_mode(),
+                reason="Near-resolution market is still discounted relative to conservative settlement value.",
+                confidence_score=round(confidence_score, 4),
+                extra_context={
+                    "hours_to_resolution": round(hours_to_resolution, 3),
+                    "market_liquidity": market.liquidity,
+                    "strategy_rationale": "Near-resolution market still trades below a conservative settlement anchor despite approaching expiry.",
+                },
+                stored_positions=stored_positions,
+                total_exposure=total_exposure,
+                active_market_exposure=active_market_exposure,
+                active_wallet_exposure=active_wallet_exposure,
+                entries_last_hour_override=entries_last_hour,
+                age_seconds=0.0,
             )
+            decisions.append(decision)
             emitted += 1
         if (
             emitted == 0
@@ -1596,33 +2511,33 @@ class StrategyEngine:
                 0.0,
                 0.91,
             )
-            decisions.append(
-                await self._build_supplemental_decision(
-                    strategy_name="resolution_window",
-                    signal_id=stable_event_key("resolution-window-near-miss", market.market_id, market.token_id),
-                    market_id=market.market_id,
-                    token_id=market.token_id,
-                    category=market.category,
-                    market_title=market.title,
-                    source_price=ask_price,
-                    fair_price=fair_price,
-                    scaled_notional=self._max_notional_for_mode(),
-                    reason="Near-resolution market narrowly missed a strict filter but is still valuable for paper evaluation.",
-                    confidence_score=round(confidence_score, 4),
-                    extra_context={
-                        "hours_to_resolution": round(hours_to_resolution, 3),
-                        "market_liquidity": market.liquidity,
-                        "strategy_rationale": "Paper-only near-miss resolution candidate promoted for evaluation after discovery succeeded but a strict edge or price-floor rule narrowly rejected it.",
-                        "strategy_near_miss": True,
-                        "near_miss_reason": near_miss_reason,
-                    },
-                    stored_positions=stored_positions,
-                    total_exposure=total_exposure,
-                    active_market_exposure=active_market_exposure,
-                    active_wallet_exposure=active_wallet_exposure,
-                    age_seconds=0.0,
-                )
+            decision = await self._build_supplemental_decision(
+                strategy_name="resolution_window",
+                signal_id=stable_event_key("resolution-window-near-miss", market.market_id, market.token_id),
+                market_id=market.market_id,
+                token_id=market.token_id,
+                category=market.category,
+                market_title=market.title,
+                source_price=ask_price,
+                fair_price=fair_price,
+                scaled_notional=self._max_notional_for_mode(),
+                reason="Near-resolution market narrowly missed a strict filter but is still valuable for paper evaluation.",
+                confidence_score=round(confidence_score, 4),
+                extra_context={
+                    "hours_to_resolution": round(hours_to_resolution, 3),
+                    "market_liquidity": market.liquidity,
+                    "strategy_rationale": "Paper-only near-miss resolution candidate promoted for evaluation after discovery succeeded but a strict edge or price-floor rule narrowly rejected it.",
+                    "strategy_near_miss": True,
+                    "near_miss_reason": near_miss_reason,
+                },
+                stored_positions=stored_positions,
+                total_exposure=total_exposure,
+                active_market_exposure=active_market_exposure,
+                active_wallet_exposure=active_wallet_exposure,
+                entries_last_hour_override=entries_last_hour,
+                age_seconds=0.0,
             )
+            decisions.append(decision)
             emitted += 1
         if emitted == 0:
             extra = {"cycle_ts": cycle_ts.isoformat(), "candidate_count": len(candidates), **diagnostic_counts}

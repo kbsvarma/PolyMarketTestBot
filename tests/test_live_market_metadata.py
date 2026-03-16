@@ -345,6 +345,101 @@ def test_live_allowed_decision_uses_live_wallet_list_not_paper_wallet_list(tmp_p
     assert decisions[0].action.value == "LIVE_COPY"
 
 
+def test_live_unknown_detection_category_uses_market_metadata_category(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.live_smoke.yaml", root / ".env.example")
+    config = config.model_copy(
+        update={
+            "risk": config.risk.model_copy(update={"require_cluster_confirmation_live": False}),
+            "live": config.live.model_copy(update={"only_cluster_confirmed": False}),
+        }
+    )
+    state = AppStateStore(tmp_path / "app_state.json")
+    state.write(
+        {
+            "mode": "LIVE",
+            "system_status": "LIVE_READY",
+            "wallet_discovery_state": DiscoveryState.SUCCESS.value,
+            "wallet_scoring_state": "SUCCESS",
+            "live_readiness_last_result": {"ready": True},
+            "allowance_sufficient": True,
+            "balance_visible": True,
+            "manual_live_enable": True,
+            "manual_resume_required": False,
+            "reconciliation_clean": True,
+            "heartbeat_ok": True,
+            "live_health_state": "HEALTHY",
+        }
+    )
+    engine = StrategyEngine(config, tmp_path, state)
+    detection = _detection().model_copy(
+        update={
+            "category": "unknown",
+            "market_title": "Who will win Best Picture at the Oscars?",
+            "market_slug": "who-will-win-best-picture-at-the-oscars",
+            "price": 0.55,
+            "size": 20.0,
+            "notional": 20.0,
+        }
+    )
+
+    async def _refresh_markets() -> dict[str, object]:
+        return {}
+
+    async def _stream_watchlist(token_ids: list[str]) -> dict[str, dict]:
+        return {}
+
+    async def _fetch_market_metadata(market_id: str, token_id: str = "") -> dict[str, object]:
+        return {
+            "market_id": market_id,
+            "token_id": token_id,
+            "title": "Who will win Best Picture at the Oscars?",
+            "slug": "who-will-win-best-picture-at-the-oscars",
+            "category": "entertainment / pop culture",
+            "active": True,
+            "closed": False,
+        }
+
+    async def _tradability(market_id: str, token_id: str) -> dict[str, object]:
+        return {
+            "market_id": market_id,
+            "token_id": token_id,
+            "tradable": True,
+            "orderbook_enabled": True,
+            "category": "entertainment / pop culture",
+            "title": "Who will win Best Picture at the Oscars?",
+            "liquidity": 1000.0,
+        }
+
+    async def _orderbook(token_id: str):
+        from src.models import OrderbookLevel, OrderbookSnapshot
+
+        return OrderbookSnapshot(
+            token_id=token_id,
+            bids=[OrderbookLevel(price=0.54, size=1000.0)],
+            asks=[OrderbookLevel(price=0.56, size=1000.0)],
+        )
+
+    engine.market_data.refresh_markets = _refresh_markets  # type: ignore[method-assign]
+    engine.market_data.stream_watchlist = _stream_watchlist  # type: ignore[method-assign]
+    engine.market_data.fetch_market_metadata = _fetch_market_metadata  # type: ignore[method-assign]
+    engine.market_data.get_tradability = _tradability  # type: ignore[method-assign]
+    engine.market_data.fetch_orderbook = _orderbook  # type: ignore[method-assign]
+
+    decisions = asyncio.run(
+        engine.process_detections(
+            [detection],
+            ApprovedWallets(research_wallets=[], paper_wallets=[], live_wallets=["0xabc"]),
+            [_wallet()],
+        )
+    )
+
+    assert len(decisions) == 1
+    assert decisions[0].allowed is True
+    assert decisions[0].action.value == "LIVE_COPY"
+    assert decisions[0].category == "entertainment / pop culture"
+
+
 def test_live_metadata_fallback_uses_detection_fields_when_token_is_present(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parent.parent
     config = load_config(root / "config.live_smoke.yaml", root / ".env.example")

@@ -15,9 +15,9 @@ risk:
   max_wallet_exposure_pct: 0.06
   copy_fraction_min: 0.03
   copy_fraction_max: 0.05
-  max_single_live_trade_usd: 3.0
+  max_single_live_trade_usd: 5.0
   daily_stop_loss_pct: 0.05
-  max_new_entries_per_hour: 3
+  max_new_entries_per_hour: 8
   stale_signal_seconds: 180
   stale_market_data_seconds: 15
   max_spread_pct: 0.04
@@ -27,13 +27,15 @@ risk:
   max_hedge_suspicion_score: 0.72
   require_cluster_confirmation_live: false
   heartbeat_timeout_seconds: 30
-  order_timeout_seconds: 20
-  max_reprice_attempts: 1
+  order_timeout_seconds: 60
+  max_reprice_attempts: 2
   allow_categories:
     - politics
     - regulatory / legal
+    - entertainment / pop culture
     - macro / economics
     - geopolitics
+    - crypto price
 cluster:
   enabled: true
   confirmation_window_seconds: 180
@@ -79,30 +81,47 @@ live:
   only_cluster_confirmed: false
   only_low_hedge_suspicion: true
   manual_live_enable: true
-  manual_resume_required: true
+  manual_resume_required: false
   global_kill_switch: false
   emergency_flatten_flag: false
   heartbeat_required: true
   bounded_execution_seconds: 20
   enable_multi_entry_style_live: true
+  minimum_order_size_shares: 5.0
+  minimum_order_notional_usd: 1.0
+  hard_skip_price_floor: 0.03
+  hard_skip_price_ceiling: 0.95
+  preferred_entry_price_min: 0.15
+  preferred_entry_price_max: 0.80
+  minimum_fillability_score: 0.52
+  minimum_signal_quality_score: 0.50
+  passive_signal_ttl_seconds: 900
+  adaptive_profit_arm_pct: 0.07
+  adaptive_profit_min_lock_pct: 0.03
+  trailing_profit_retrace_pct: 0.30
+  strong_winner_profit_pct: 0.30
+  strong_winner_retrace_pct: 0.18
+  paired_arb_time_stop_hours: 168
   selected_categories:
     - politics
     - regulatory / legal
+    - entertainment / pop culture
     - macro / economics
     - geopolitics
 strategies:
   enable_event_driven_official: true
   enable_correlation_dislocation: true
   enable_resolution_window: true
+  enable_paired_binary_arb: true
   strategy_market_page_size: 250
   strategy_market_max_pages_live: 4
   strategy_market_max_pages_research: 2
   official_signal_file: data/official_event_signals.json
   official_signal_max_age_minutes: 240
-  official_signal_min_edge_pct: 0.08
-  official_signal_min_source_reliability: 0.70
-  official_signal_min_confidence: 0.72
-  official_signal_live_enabled: false
+  official_signal_min_edge_pct: 0.06
+  official_signal_min_source_reliability: 0.65
+  official_signal_min_confidence: 0.65
+  official_signal_live_enabled: true
   correlation_min_gap_pct: 0.03
   correlation_min_group_size: 2
   correlation_max_groups: 16
@@ -110,6 +129,10 @@ strategies:
   correlation_live_enabled: false
   supplemental_paper_relaxed_enabled: true
   supplemental_paper_relaxed_min_confidence: 0.72
+  paired_binary_min_edge_pct: 0.03
+  paired_binary_min_leg_price: 0.08
+  paired_binary_max_leg_price: 0.92
+  paired_binary_live_enabled: true
   resolution_window_max_hours: 168
   resolution_window_min_price: 0.65
   resolution_window_min_edge_pct: 0.03

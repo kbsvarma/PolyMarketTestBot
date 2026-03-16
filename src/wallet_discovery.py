@@ -19,7 +19,12 @@ class WalletDiscoveryService:
         self.client = PolymarketClient(config)
 
     async def run_discovery_cycle(self) -> DiscoveryResult:
-        categories = self.config.categories.tracked or ["politics", "crypto price", "macro / economics"]
+        categories = self.config.categories.tracked or [
+            "politics",
+            "crypto price",
+            "entertainment / pop culture",
+            "macro / economics",
+        ]
         diagnostics: dict[str, object] = {
             "started_at": datetime.now(timezone.utc).isoformat(),
             "sources": [],

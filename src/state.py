@@ -48,6 +48,8 @@ class AppStateStore:
         current = read_json(self.path, DEFAULT_STATE.copy())  # type: ignore[return-value]
         merged = DEFAULT_STATE.copy()
         merged.update(current)
+        if not bool(merged.get("paused", False)) and not str(merged.get("pause_reason", "")):
+            merged["manual_resume_required"] = False
         readiness = merged.get("live_readiness_last_result", {}) or {}
         system_status = str(merged.get("system_status", SystemStatus.INIT.value))
         if system_status == SystemStatus.LIVE_READY.value and not readiness.get("ready", False):
@@ -62,6 +64,8 @@ class AppStateStore:
     def update_system_status(self, **kwargs: Any) -> None:
         payload = self.read()
         payload.update(kwargs)
+        if not bool(payload.get("paused", False)) and not str(payload.get("pause_reason", "")):
+            payload["manual_resume_required"] = False
         readiness = payload.get("live_readiness_last_result", {}) or {}
         if payload.get("system_status") == SystemStatus.LIVE_READY.value and (
             not isinstance(readiness, dict) or not readiness or not readiness.get("ready", False)

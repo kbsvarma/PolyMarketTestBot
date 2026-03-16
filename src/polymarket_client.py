@@ -131,6 +131,68 @@ class PolymarketClient:
             return float(value) / 1_000_000.0
         return self._to_float(value)
 
+    def _extract_order_filled_size(self, payload: dict[str, Any]) -> float:
+        raw = payload.get("raw")
+        candidates = [
+            payload.get("filled_size"),
+            payload.get("filled"),
+            payload.get("size_matched"),
+        ]
+        if isinstance(raw, dict):
+            candidates.extend(
+                [
+                    raw.get("filled_size"),
+                    raw.get("filled"),
+                    raw.get("size_matched"),
+                ]
+            )
+        for value in candidates:
+            if value in (None, ""):
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return 0.0
+
+    def _extract_order_average_fill_price(self, payload: dict[str, Any]) -> float:
+        raw = payload.get("raw")
+        candidates = [
+            payload.get("avg_price"),
+            payload.get("average_fill_price"),
+        ]
+        if isinstance(raw, dict):
+            candidates.extend(
+                [
+                    raw.get("avg_price"),
+                    raw.get("average_fill_price"),
+                ]
+            )
+        for value in candidates:
+            if value in (None, ""):
+                continue
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if numeric > 0:
+                return numeric
+
+        if self._extract_order_filled_size(payload) > 0:
+            fallback_candidates = [payload.get("price")]
+            if isinstance(raw, dict):
+                fallback_candidates.append(raw.get("price"))
+            for value in fallback_candidates:
+                if value in (None, ""):
+                    continue
+                try:
+                    numeric = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if numeric > 0:
+                    return numeric
+        return 0.0
+
     def _normalize_positions_payload(self, payload: Any) -> list[dict[str, Any]]:
         if payload is None:
             raise RuntimeError("Empty positions response")
@@ -719,6 +781,7 @@ class PolymarketClient:
             normalized: list[dict[str, Any]] = []
             for item in payload:
                 remaining_size = self._extract_order_remaining_size(item)
+                filled_size = self._extract_order_filled_size(item)
                 normalized.append(
                     {
                         "exchange_order_id": str(item.get("id") or item.get("orderID") or item.get("order_id") or ""),
@@ -728,7 +791,7 @@ class PolymarketClient:
                         "token_id": str(item.get("token_id") or item.get("asset_id") or item.get("tokenId") or ""),
                         "side": str(item.get("side") or "BUY"),
                         "size": float(item.get("size") or item.get("original_size") or item.get("shares") or 0.0),
-                        "filled_size": float(item.get("filled_size") or item.get("filled") or 0.0),
+                        "filled_size": filled_size,
                         "remaining_size": remaining_size,
                         "price": float(item.get("price") or 0.0),
                         "raw": item,
@@ -800,8 +863,8 @@ class PolymarketClient:
             return {
                 "exchange_order_id": str(result.get("id") or result.get("orderID") or exchange_order_id),
                 "status": str(result.get("status") or result.get("state") or ""),
-                "filled_size": float(result.get("filled_size") or result.get("filled") or 0.0),
-                "average_fill_price": float(result.get("avg_price") or result.get("average_fill_price") or 0.0),
+                "filled_size": self._extract_order_filled_size(result),
+                "average_fill_price": self._extract_order_average_fill_price(result),
                 "remaining_size": self._extract_order_remaining_size(result),
                 "client_order_id": str(result.get("client_order_id") or result.get("clientOrderId") or ""),
                 "raw": result,
@@ -816,9 +879,12 @@ class PolymarketClient:
             direct = 0.0
         if direct > 0:
             return direct
+        raw = payload.get("raw")
         try:
             original_size = float(payload.get("original_size") or payload.get("size") or payload.get("shares") or 0.0)
-            size_matched = float(payload.get("size_matched") or payload.get("filled_size") or payload.get("filled") or 0.0)
+            if original_size <= 0 and isinstance(raw, dict):
+                original_size = float(raw.get("original_size") or raw.get("size") or raw.get("shares") or 0.0)
+            size_matched = self._extract_order_filled_size(payload)
         except (TypeError, ValueError):
             return 0.0
         if original_size > 0:

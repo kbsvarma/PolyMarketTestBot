@@ -136,3 +136,28 @@ def test_get_open_orders_normalizes_remaining_size_from_original_size() -> None:
 
     assert result[0]["remaining_size"] == 5.76
     assert result[0]["size"] == 5.76
+
+
+def test_get_order_status_uses_size_matched_and_price_for_matched_orders() -> None:
+    class _OrderSdkClient:
+        def __init__(self) -> None:
+            self.builder = type("Builder", (), {"sig_type": 0})()
+
+        def get_order(self, order_id: str) -> dict[str, object]:
+            return {
+                "id": order_id,
+                "status": "MATCHED",
+                "original_size": "5",
+                "size_matched": "5",
+                "price": "0.45",
+            }
+
+    client = PolymarketClient(_live_config())
+    client._sdk_client = _OrderSdkClient()
+
+    result = asyncio.run(client.get_order_status("order-1"))
+
+    assert result["status"] == "MATCHED"
+    assert result["filled_size"] == 5.0
+    assert result["average_fill_price"] == 0.45
+    assert result["remaining_size"] == 0.0

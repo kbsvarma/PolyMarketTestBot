@@ -158,6 +158,7 @@ def mapping_confidence(mapping_reason: str) -> float:
         "token_id": 0.97,
         "market_id": 0.94,
         "market_slug": 0.9,
+        "direct_market_lookup": 0.88,
         "title_match": 0.82,
     }.get(mapping_reason, 0.0)
 

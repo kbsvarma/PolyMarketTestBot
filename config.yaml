@@ -17,7 +17,7 @@ risk:
   copy_fraction_max: 0.05
   max_single_live_trade_usd: 6.0
   daily_stop_loss_pct: 0.05
-  max_new_entries_per_hour: 2
+  max_new_entries_per_hour: 4
   stale_signal_seconds: 90
   stale_market_data_seconds: 15
   max_spread_pct: 0.025
@@ -27,12 +27,15 @@ risk:
   max_hedge_suspicion_score: 0.72
   require_cluster_confirmation_live: true
   heartbeat_timeout_seconds: 30
-  order_timeout_seconds: 20
-  max_reprice_attempts: 1
+  order_timeout_seconds: 60
+  max_reprice_attempts: 2
   allow_categories:
     - politics
     - crypto price
+    - entertainment / pop culture
     - macro / economics
+    - regulatory / legal
+    - geopolitics
 cluster:
   enabled: true
   confirmation_window_seconds: 180
@@ -77,20 +80,38 @@ live:
   only_cluster_confirmed: true
   only_low_hedge_suspicion: true
   manual_live_enable: false
-  manual_resume_required: true
+  manual_resume_required: false
   global_kill_switch: false
   emergency_flatten_flag: false
   heartbeat_required: true
   bounded_execution_seconds: 20
   enable_multi_entry_style_live: false
+  minimum_order_size_shares: 5.0
+  minimum_order_notional_usd: 1.0
+  hard_skip_price_floor: 0.03
+  hard_skip_price_ceiling: 0.95
+  preferred_entry_price_min: 0.15
+  preferred_entry_price_max: 0.80
+  minimum_fillability_score: 0.58
+  minimum_signal_quality_score: 0.52
+  passive_signal_ttl_seconds: 600
+  adaptive_profit_arm_pct: 0.08
+  adaptive_profit_min_lock_pct: 0.03
+  trailing_profit_retrace_pct: 0.35
+  strong_winner_profit_pct: 0.35
+  strong_winner_retrace_pct: 0.20
+  paired_arb_time_stop_hours: 168
   selected_categories:
     - politics
-    - crypto price
+    - entertainment / pop culture
     - macro / economics
+    - regulatory / legal
+    - geopolitics
 strategies:
   enable_event_driven_official: true
   enable_correlation_dislocation: true
   enable_resolution_window: true
+  enable_paired_binary_arb: true
   strategy_market_page_size: 250
   strategy_market_max_pages_live: 4
   strategy_market_max_pages_research: 2
@@ -98,7 +119,7 @@ strategies:
   official_signal_max_age_minutes: 240
   official_signal_min_edge_pct: 0.08
   official_signal_min_source_reliability: 0.70
-  official_signal_min_confidence: 0.72
+  official_signal_min_confidence: 0.68
   official_signal_live_enabled: false
   correlation_min_gap_pct: 0.03
   correlation_min_group_size: 2
@@ -107,6 +128,10 @@ strategies:
   correlation_live_enabled: false
   supplemental_paper_relaxed_enabled: true
   supplemental_paper_relaxed_min_confidence: 0.72
+  paired_binary_min_edge_pct: 0.035
+  paired_binary_min_leg_price: 0.06
+  paired_binary_max_leg_price: 0.94
+  paired_binary_live_enabled: false
   resolution_window_max_hours: 168
   resolution_window_min_price: 0.68
   resolution_window_min_edge_pct: 0.04

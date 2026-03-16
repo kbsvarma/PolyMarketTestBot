@@ -60,3 +60,96 @@ def test_live_risk_blocks_kill_switch() -> None:
     )
     assert not result.allowed
     assert result.reason_code == "KILL_SWITCH"
+
+
+def test_live_risk_allows_degraded_health_when_other_live_checks_pass() -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.live_smoke.yaml", root / ".env.example")
+    detection = DetectionEvent(
+        event_key="k",
+        wallet_address="0xabc",
+        market_title="M",
+        market_slug="m",
+        market_id="m1",
+        token_id="t1",
+        side="BUY",
+        price=0.5,
+        size=10,
+        notional=5,
+        transaction_hash="tx",
+        detection_latency_seconds=5,
+        source_trade_timestamp=datetime.now(timezone.utc),
+        category="politics",
+    )
+    fill = FillEstimate(fillable=True, executable_price=0.51, spread_pct=0.01, slippage_pct=0.0, filled_notional=5, reason="OK")
+    result = RiskManager(config).evaluate(
+        detection,
+        build_wallet(),
+        fill,
+        "LIVE",
+        0,
+        0,
+        0,
+        0,
+        True,
+        True,
+        True,
+        category="politics",
+        market_id="m1",
+        live_ready=True,
+        health_state="DEGRADED",
+        reconciliation_clean=True,
+        heartbeat_ok=True,
+        balance_visible=True,
+        allowance_sufficient=True,
+        tradable=True,
+    )
+    assert result.allowed
+    assert result.reason_code == "OK"
+
+
+def test_live_risk_blocks_category_not_selected_for_live() -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.live_smoke.yaml", root / ".env.example")
+    detection = DetectionEvent(
+        event_key="k",
+        wallet_address="0xabc",
+        market_title="M",
+        market_slug="m",
+        market_id="m1",
+        token_id="t1",
+        side="BUY",
+        price=0.5,
+        size=10,
+        notional=5,
+        transaction_hash="tx",
+        detection_latency_seconds=5,
+        source_trade_timestamp=datetime.now(timezone.utc),
+        category="crypto price",
+    )
+    fill = FillEstimate(fillable=True, executable_price=0.5, spread_pct=0.0, slippage_pct=0.0, filled_notional=5, reason="OK")
+    result = RiskManager(config).evaluate(
+        detection,
+        build_wallet(),
+        fill,
+        "LIVE",
+        0,
+        0,
+        0,
+        0,
+        True,
+        True,
+        True,
+        category="crypto price",
+        market_id="m1",
+        live_ready=True,
+        health_state="HEALTHY",
+        reconciliation_clean=True,
+        heartbeat_ok=True,
+        balance_visible=True,
+        allowance_sufficient=True,
+        tradable=True,
+        entries_last_hour_override=0,
+    )
+    assert not result.allowed
+    assert result.reason_code == "LIVE_CATEGORY_NOT_SELECTED"

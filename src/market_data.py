@@ -89,4 +89,29 @@ class MarketDataService:
         return self.ws.latest_messages
 
     async def get_tradability(self, market_id: str, token_id: str) -> dict[str, object]:
-        return await self.client.get_market_tradability(market_id, token_id)
+        try:
+            return await self.client.get_market_tradability(market_id, token_id)
+        except RuntimeError:
+            if token_id and token_id not in {"unknown-token", "unknown", "None"}:
+                try:
+                    orderbook = await self.fetch_orderbook(token_id)
+                except Exception:
+                    raise
+                has_depth = bool(orderbook.bids or orderbook.asks)
+                market = self.market_cache.get(market_id) or self.token_cache.get(token_id)
+                if market is None:
+                    try:
+                        market = await self.client.fetch_market_lookup(market_id, token_id)
+                    except Exception:
+                        market = None
+                return {
+                    "market_id": market_id,
+                    "token_id": token_id,
+                    "tradable": has_depth,
+                    "orderbook_enabled": has_depth,
+                    "category": getattr(market, "category", "unknown"),
+                    "title": getattr(market, "title", market_id),
+                    "liquidity": float(getattr(market, "liquidity", 0.0) or 0.0),
+                    "derived_from_orderbook": True,
+                }
+            raise

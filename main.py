@@ -261,6 +261,7 @@ async def run() -> None:
     preflight_only = os.getenv("POLYBOT_PREFLIGHT_ONLY", "false").lower() == "true"
 
     state = AppStateStore(root / "data" / "app_state.json")
+    existing_state = state.read()
     if preflight_only:
         state.clear_pause()
     alerts = AlertManager(config, root / "logs")
@@ -271,7 +272,7 @@ async def run() -> None:
         system_status=config.mode.value,
         status=config.mode.value,
         manual_live_enable=config.live.manual_live_enable,
-        manual_resume_required=config.live.manual_resume_required,
+        manual_resume_required=bool(existing_state.get("manual_resume_required", False) and existing_state.get("paused", False)),
         eligibility=eligibility.model_dump(),
     )
 
@@ -406,6 +407,8 @@ async def run() -> None:
     scheduler = AppScheduler(config)
 
     async def cycle() -> list:
+        if config.mode.value == "LIVE":
+            await live_engine.refresh_live_status()
         cycle_started_at = datetime.now(timezone.utc).isoformat()
         state_snapshot = state.read()
         state.update_system_status(

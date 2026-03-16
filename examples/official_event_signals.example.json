@@ -1,32 +1,33 @@
 [
   {
-    "event_id": "fed-calendar-2026-06-10-rate-decision",
-    "title": "Will the Fed cut rates by June 2026?",
-    "market_slug": "will-the-fed-cut-rates-by-june-2026",
+    "event_id": "oscars-2026-best-picture-one-battle",
+    "title": "Will One Battle After Another win Best Picture at the 98th Academy Awards?",
+    "market_slug": "will-one-battle-after-another-win-best-picture-at-the-98th-academy-awards",
     "outcome": "Yes",
-    "category": "macro / economics",
-    "published_at": "2026-06-10T14:00:00Z",
-    "fair_price": 0.68,
-    "source_price": 0.54,
-    "source_reliability": 0.95,
+    "category": "entertainment / pop culture",
+    "published_at": "2026-03-15T23:00:00Z",
+    "fair_price": 0.86,
+    "source_price": 0.78,
+    "source_reliability": 0.84,
     "confidence_score": 0.86,
-    "source_name": "Federal Reserve",
-    "source_url": "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm",
+    "notional_usd": 3.0,
+    "source_name": "Academy Awards",
+    "source_url": "https://www.oscars.org/oscars/ceremonies/2026",
     "market_keywords": [
-      "fed",
-      "cut",
-      "rates",
-      "june",
+      "oscars",
+      "best picture",
+      "one battle after another",
+      "academy awards",
       "2026"
     ],
-    "rationale": "Official FOMC release materially increased the probability of a June rate cut relative to market pricing.",
+    "rationale": "Curated Oscars signal inferred from the official Academy ceremony page and nominee slate for ceremony-night monitoring.",
     "required_conditions": [
-      "Statement language clearly signals easing bias",
-      "Mapped market slug and outcome are unambiguous"
+      "Mapped market slug and outcome are unambiguous",
+      "Book remains inside the live fillability guardrails"
     ],
     "disqualifiers": [
-      "Emergency unscheduled revision changes interpretation",
-      "Polymarket market mapping is ambiguous"
+      "Official winner announcement already resolved the market",
+      "Orderbook is one-sided at 0.99/0.01 extremes"
     ]
   }
 ]

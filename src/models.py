@@ -242,6 +242,10 @@ class TradeDecision(BaseModel):
     executable_price: float
     cluster_confirmed: bool
     hedge_suspicion_score: float
+    thesis_type: str = "directional"
+    bundle_id: str = ""
+    bundle_role: str = ""
+    paired_token_id: str = ""
     context: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -299,6 +303,10 @@ class Position(BaseModel):
     hedge_suspicion_score: float = 0.0
     closed: bool = False
     side: str = "BUY"
+    thesis_type: str = "directional"
+    bundle_id: str = ""
+    bundle_role: str = ""
+    paired_token_id: str = ""
     entry_order_ids: list[str] = Field(default_factory=list)
     entry_price_estimated: float = 0.0
     entry_price_actual: float = 0.0
@@ -315,6 +323,12 @@ class Position(BaseModel):
     exited_size: float = 0.0
     remaining_size: float = 0.0
     exit_order_ids: list[str] = Field(default_factory=list)
+    peak_mark_price: float = 0.0
+    peak_pnl_pct: float = 0.0
+    peak_mark_seen_at: datetime | None = None
+    profit_lock_armed: bool = False
+    trailing_stop_price: float = 0.0
+    partial_profit_taken: bool = False
 
 
 class GeoblockStatus(BaseModel):
@@ -363,6 +377,9 @@ class LiveOrder(BaseModel):
     local_order_id: str
     client_order_id: str
     strategy_name: str = "wallet_follow"
+    wallet_address: str = ""
+    category: str = "unknown"
+    source_price: float = 0.0
     exchange_order_id: str = ""
     market_id: str
     token_id: str
@@ -370,6 +387,10 @@ class LiveOrder(BaseModel):
     intended_price: float
     intended_size: float
     entry_style: EntryStyle
+    thesis_type: str = "directional"
+    bundle_id: str = ""
+    bundle_role: str = ""
+    paired_token_id: str = ""
     created_at: datetime = Field(default_factory=utcnow)
     submitted_at: datetime | None = None
     last_exchange_status: str = ""
@@ -384,6 +405,7 @@ class LiveOrder(BaseModel):
     audit_log_ref: str = ""
     raw_exchange_response_refs: list[str] = Field(default_factory=list)
     repriced_once: bool = False
+    reprice_attempts: int = 0
     timeout_at: datetime | None = None
     is_exit: bool = False
     linked_parent_order_id: str = ""

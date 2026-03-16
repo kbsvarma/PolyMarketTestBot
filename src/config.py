@@ -37,7 +37,7 @@ class RiskConfig(BaseModel):
     copy_fraction_max: float = 0.05
     max_single_live_trade_usd: float = 6.0
     daily_stop_loss_pct: float = 0.05
-    max_new_entries_per_hour: int = 2
+    max_new_entries_per_hour: int = 4
     stale_signal_seconds: int = 90
     stale_market_data_seconds: int = 15
     max_spread_pct: float = 0.025
@@ -48,8 +48,8 @@ class RiskConfig(BaseModel):
     require_cluster_confirmation_live: bool = True
     allow_categories: list[str] = Field(default_factory=list)
     heartbeat_timeout_seconds: int = 30
-    order_timeout_seconds: int = 20
-    max_reprice_attempts: int = 1
+    order_timeout_seconds: int = 60
+    max_reprice_attempts: int = 2
 
 
 class ClusterConfig(BaseModel):
@@ -96,18 +96,34 @@ class LiveConfig(BaseModel):
     only_low_hedge_suspicion: bool = True
     selected_categories: list[str] = Field(default_factory=list)
     manual_live_enable: bool = False
-    manual_resume_required: bool = True
+    manual_resume_required: bool = False
     global_kill_switch: bool = False
     emergency_flatten_flag: bool = False
     heartbeat_required: bool = True
     bounded_execution_seconds: int = 20
     enable_multi_entry_style_live: bool = False
+    minimum_order_size_shares: float = 5.0
+    minimum_order_notional_usd: float = 1.0
+    hard_skip_price_floor: float = 0.03
+    hard_skip_price_ceiling: float = 0.95
+    preferred_entry_price_min: float = 0.15
+    preferred_entry_price_max: float = 0.80
+    minimum_fillability_score: float = 0.58
+    minimum_signal_quality_score: float = 0.52
+    passive_signal_ttl_seconds: int = 600
+    adaptive_profit_arm_pct: float = 0.08
+    adaptive_profit_min_lock_pct: float = 0.03
+    trailing_profit_retrace_pct: float = 0.35
+    strong_winner_profit_pct: float = 0.35
+    strong_winner_retrace_pct: float = 0.20
+    paired_arb_time_stop_hours: int = 168
 
 
 class StrategyConfig(BaseModel):
     enable_event_driven_official: bool = True
     enable_correlation_dislocation: bool = True
     enable_resolution_window: bool = True
+    enable_paired_binary_arb: bool = True
     strategy_market_page_size: int = 250
     strategy_market_max_pages_live: int = 4
     strategy_market_max_pages_research: int = 2
@@ -115,7 +131,7 @@ class StrategyConfig(BaseModel):
     official_signal_max_age_minutes: int = 240
     official_signal_min_edge_pct: float = 0.08
     official_signal_min_source_reliability: float = 0.7
-    official_signal_min_confidence: float = 0.72
+    official_signal_min_confidence: float = 0.68
     official_signal_live_enabled: bool = False
     correlation_min_gap_pct: float = 0.03
     correlation_min_group_size: int = 2
@@ -124,6 +140,10 @@ class StrategyConfig(BaseModel):
     correlation_live_enabled: bool = False
     supplemental_paper_relaxed_enabled: bool = True
     supplemental_paper_relaxed_min_confidence: float = 0.72
+    paired_binary_min_edge_pct: float = 0.035
+    paired_binary_min_leg_price: float = 0.06
+    paired_binary_max_leg_price: float = 0.94
+    paired_binary_live_enabled: bool = False
     resolution_window_max_hours: int = 168
     resolution_window_min_price: float = 0.68
     resolution_window_min_edge_pct: float = 0.04

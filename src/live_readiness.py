@@ -10,6 +10,8 @@ def build_readiness_result(config: AppConfig, state: AppStateStore, health: Syst
     mode_value = config.mode.value if hasattr(config.mode, "value") else str(config.mode)
     min_wallet_buffer = max(float(config.risk.max_single_live_trade_usd), 1.0)
     manual_live_enabled = bool(current.get("manual_live_enable", False) or config.live.manual_live_enable)
+    market_ws_component = next((component for component in health.components if component.name == "market_ws"), None)
+    market_ws_usable = market_ws_component is None or market_ws_component.state != HealthState.UNHEALTHY
     stale_pause_cleared_by_current_truth = (
         current.get("paused", False)
         and str(current.get("pause_reason", "")) == "Live readiness gate failed."
@@ -37,7 +39,11 @@ def build_readiness_result(config: AppConfig, state: AppStateStore, health: Syst
         ),
         ReadinessCheck(name="open_orders_query", passed=bool(client_checks.get("open_orders_visible")), detail=str(client_checks.get("open_orders_detail", ""))),
         ReadinessCheck(name="positions_query", passed=bool(client_checks.get("positions_visible")), detail=str(client_checks.get("positions_detail", ""))),
-        ReadinessCheck(name="market_ws_healthy", passed=health.overall == HealthState.HEALTHY, detail=health.summary),
+        ReadinessCheck(
+            name="market_ws_healthy",
+            passed=market_ws_usable,
+            detail=market_ws_component.detail if market_ws_component is not None else health.summary,
+        ),
         ReadinessCheck(name="rest_health_ok", passed=bool(client_checks.get("rest_ok")), detail=str(client_checks.get("rest_detail", ""))),
         ReadinessCheck(name="reconciliation_clean", passed=bool(client_checks.get("reconciliation_clean")), detail=str(client_checks.get("reconciliation_detail", ""))),
         ReadinessCheck(name="kill_switch_off", passed=not current.get("kill_switch", config.live.global_kill_switch), detail="Kill switch must be off."),

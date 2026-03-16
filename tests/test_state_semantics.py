@@ -66,3 +66,16 @@ def test_state_machine_coerces_legacy_live_status_for_live_ready_transition(tmp_
     machine = SystemStateMachine(store)
     machine.transition(SystemStatus.LIVE_READY, "test")
     assert store.read()["system_status"] == SystemStatus.LIVE_READY.value
+
+
+def test_state_store_clears_stale_manual_resume_when_not_paused(tmp_path: Path) -> None:
+    store = AppStateStore(tmp_path / "app_state.json")
+    store.write(
+        {
+            "paused": False,
+            "pause_reason": "",
+            "manual_resume_required": True,
+        }
+    )
+    payload = store.read()
+    assert payload["manual_resume_required"] is False

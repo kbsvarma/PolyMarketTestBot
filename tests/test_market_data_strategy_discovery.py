@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.config import load_config
@@ -42,6 +43,7 @@ def test_refresh_markets_pages_active_markets_for_strategy_discovery(tmp_path: P
 
 def test_refresh_markets_prioritizes_near_resolution_active_markets(tmp_path: Path) -> None:
     service = _service(tmp_path)
+    now = datetime.now(timezone.utc)
 
     async def _fetch_markets(limit: int = 100, offset: int = 0, active_only: bool = False):
         if offset > 0:
@@ -53,7 +55,7 @@ def test_refresh_markets_prioritizes_near_resolution_active_markets(tmp_path: Pa
                 title="Far",
                 slug="far",
                 category="politics",
-                end_date_iso="2027-12-31T00:00:00Z",
+                end_date_iso=(now + timedelta(days=500)).isoformat(),
                 liquidity=5000.0,
             ),
             MarketInfo(
@@ -62,7 +64,7 @@ def test_refresh_markets_prioritizes_near_resolution_active_markets(tmp_path: Pa
                 title="Near",
                 slug="near",
                 category="politics",
-                end_date_iso="2026-03-16T00:00:00Z",
+                end_date_iso=(now + timedelta(days=1)).isoformat(),
                 liquidity=1000.0,
             ),
         ]

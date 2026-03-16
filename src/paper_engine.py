@@ -22,99 +22,128 @@ class PaperTradingEngine:
         self.market_data = MarketDataService(config, data_dir)
         self.audit_path = data_dir / "paper_audit.jsonl"
 
+    def _entries_last_hour(self, paper_positions: list[Position]) -> int:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        return len(
+            [
+                position
+                for position in paper_positions
+                if (position.entry_time or position.opened_at) >= cutoff
+            ]
+        )
+
     async def handle_decisions(self, decisions: list[TradeDecision]) -> None:
         paper_positions = self.positions.positions_for_mode(Mode.PAPER)
         live_positions = self.positions.positions_for_mode(Mode.LIVE)
         opened_count = 0
         skipped_count = 0
+        entries_last_hour = self._entries_last_hour(paper_positions)
 
         await self._mark_positions_to_market(paper_positions)
         self._apply_exit_logic(paper_positions)
 
         for decision in decisions:
-            if decision.action != DecisionAction.PAPER_COPY or not decision.allowed:
+            effective_decision = decision
+            if decision.action == DecisionAction.PAPER_COPY and decision.allowed and entries_last_hour >= self.config.risk.max_new_entries_per_hour:
+                effective_decision = decision.model_copy(
+                    update={
+                        "allowed": False,
+                        "action": DecisionAction.SKIP,
+                        "reason_code": "ENTRY_RATE_LIMIT",
+                        "human_readable_reason": "Hourly entry limit reached during paper execution.",
+                    }
+                )
+            if effective_decision.action != DecisionAction.PAPER_COPY or not effective_decision.allowed:
                 skipped_count += 1
                 append_jsonl(
                     self.audit_path,
                     {
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "event": "paper_skipped",
-                        "market_id": decision.market_id,
-                        "token_id": decision.token_id,
-                        "strategy_name": decision.strategy_name,
-                        "wallet_address": decision.wallet_address,
-                        "reason_code": decision.reason_code,
-                        "reason": decision.human_readable_reason,
-                        "notional": decision.scaled_notional,
-                        "source_quality": decision.context.get("source_quality", ""),
-                        "trust_level": decision.context.get("trust_level", ""),
-                        "fallback_used": decision.context.get("fallback_used", False),
-                        "counts_as_trustworthy_approval": decision.context.get("counts_as_trustworthy_approval", False),
-                        "discovery_state": decision.context.get("discovery_state", ""),
-                        "scoring_state": decision.context.get("scoring_state", ""),
-                        "style_evaluations": decision.context.get("style_evaluations", []),
+                        "market_id": effective_decision.market_id,
+                        "token_id": effective_decision.token_id,
+                        "strategy_name": effective_decision.strategy_name,
+                        "wallet_address": effective_decision.wallet_address,
+                        "reason_code": effective_decision.reason_code,
+                        "reason": effective_decision.human_readable_reason,
+                        "notional": effective_decision.scaled_notional,
+                        "source_quality": effective_decision.context.get("source_quality", ""),
+                        "trust_level": effective_decision.context.get("trust_level", ""),
+                        "fallback_used": effective_decision.context.get("fallback_used", False),
+                        "counts_as_trustworthy_approval": effective_decision.context.get("counts_as_trustworthy_approval", False),
+                        "discovery_state": effective_decision.context.get("discovery_state", ""),
+                        "scoring_state": effective_decision.context.get("scoring_state", ""),
+                        "style_evaluations": effective_decision.context.get("style_evaluations", []),
                     },
                 )
                 append_csv_row(
                     self.data_dir / "paper_trade_history.csv",
                     {
                         "position_id": "",
-                        "market_id": decision.market_id,
-                        "token_id": decision.token_id,
-                        "wallet_address": decision.wallet_address,
-                        "strategy_name": decision.strategy_name,
-                        "category": decision.category,
-                        "entry_style": decision.entry_style.value,
-                        "entry_price": decision.executable_price,
+                        "market_id": effective_decision.market_id,
+                        "token_id": effective_decision.token_id,
+                        "wallet_address": effective_decision.wallet_address,
+                        "strategy_name": effective_decision.strategy_name,
+                        "category": effective_decision.category,
+                        "entry_style": effective_decision.entry_style.value,
+                        "entry_price": effective_decision.executable_price,
                         "quantity": 0.0,
-                        "notional": decision.scaled_notional,
+                        "notional": effective_decision.scaled_notional,
                         "fees_paid": 0.0,
                         "realized_pnl": 0.0,
                         "unrealized_pnl": 0.0,
-                        "entry_reason": decision.human_readable_reason,
+                        "entry_reason": effective_decision.human_readable_reason,
                         "exit_reason": "",
-                        "cluster_confirmed": decision.cluster_confirmed,
-                        "hedge_suspicion_score": decision.hedge_suspicion_score,
+                        "cluster_confirmed": effective_decision.cluster_confirmed,
+                        "hedge_suspicion_score": effective_decision.hedge_suspicion_score,
                         "opened_at": datetime.now(timezone.utc).isoformat(),
                         "closed": True,
                         "status": "SKIPPED",
-                        "reason_code": decision.reason_code,
+                        "reason_code": effective_decision.reason_code,
                     },
                 )
                 continue
 
-            quantity = decision.scaled_notional / max(decision.executable_price, 1e-6)
-            fee_rate = 0.01 if decision.entry_style.value == "FOLLOW_TAKER" else 0.005
+            quantity = effective_decision.scaled_notional / max(effective_decision.executable_price, 1e-6)
+            fee_rate = 0.01 if effective_decision.entry_style.value == "FOLLOW_TAKER" else 0.005
             position = Position(
-                position_id=stable_event_key(decision.wallet_address, decision.market_id, decision.token_id, decision.executable_price),
+                position_id=stable_event_key(effective_decision.wallet_address, effective_decision.market_id, effective_decision.token_id, effective_decision.executable_price),
                 mode=Mode.PAPER,
-                strategy_name=decision.strategy_name,
-                wallet_address=decision.wallet_address,
-                market_id=decision.market_id,
-                token_id=decision.token_id,
-                category=decision.category,
-                entry_style=decision.entry_style,
-                entry_price=decision.executable_price,
-                current_mark_price=decision.executable_price,
+                strategy_name=effective_decision.strategy_name,
+                wallet_address=effective_decision.wallet_address,
+                market_id=effective_decision.market_id,
+                token_id=effective_decision.token_id,
+                category=effective_decision.category,
+                entry_style=effective_decision.entry_style,
+                entry_price=effective_decision.executable_price,
+                current_mark_price=effective_decision.executable_price,
                 quantity=round(quantity, 6),
-                notional=decision.scaled_notional,
-                fees_paid=round(decision.scaled_notional * fee_rate, 4),
+                notional=effective_decision.scaled_notional,
+                fees_paid=round(effective_decision.scaled_notional * fee_rate, 4),
                 source_trade_timestamp=datetime.now(timezone.utc),
-                entry_reason=decision.human_readable_reason,
-                cluster_confirmed=decision.cluster_confirmed,
-                hedge_suspicion_score=decision.hedge_suspicion_score,
-                source_wallet=decision.wallet_address,
+                entry_reason=effective_decision.human_readable_reason,
+                cluster_confirmed=effective_decision.cluster_confirmed,
+                hedge_suspicion_score=effective_decision.hedge_suspicion_score,
+                source_wallet=effective_decision.wallet_address,
                 entry_time=datetime.now(timezone.utc),
                 entry_size=round(quantity, 6),
                 remaining_size=round(quantity, 6),
-                entry_price_estimated=decision.executable_price,
-                entry_price_actual=decision.executable_price,
+                thesis_type=effective_decision.thesis_type,
+                bundle_id=effective_decision.bundle_id,
+                bundle_role=effective_decision.bundle_role,
+                paired_token_id=effective_decision.paired_token_id,
+                entry_price_estimated=effective_decision.executable_price,
+                entry_price_actual=effective_decision.executable_price,
                 stop_loss_rule="hard_stop",
                 take_profit_rule="take_profit",
                 time_stop_rule="time_stop",
+                peak_mark_price=effective_decision.executable_price,
+                peak_pnl_pct=0.0,
+                peak_mark_seen_at=datetime.now(timezone.utc),
             )
             paper_positions.append(position)
             opened_count += 1
+            entries_last_hour += 1
             append_jsonl(
                 self.audit_path,
                 {
@@ -129,12 +158,12 @@ class PaperTradingEngine:
                     "quantity": position.quantity,
                     "notional": position.notional,
                     "entry_style": position.entry_style.value,
-                    "reason_code": decision.reason_code,
-                    "source_quality": decision.context.get("source_quality", ""),
-                    "trust_level": decision.context.get("trust_level", ""),
-                    "fallback_used": decision.context.get("fallback_used", False),
-                    "counts_as_trustworthy_approval": decision.context.get("counts_as_trustworthy_approval", False),
-                    "style_evaluations": decision.context.get("style_evaluations", []),
+                    "reason_code": effective_decision.reason_code,
+                    "source_quality": effective_decision.context.get("source_quality", ""),
+                    "trust_level": effective_decision.context.get("trust_level", ""),
+                    "fallback_used": effective_decision.context.get("fallback_used", False),
+                    "counts_as_trustworthy_approval": effective_decision.context.get("counts_as_trustworthy_approval", False),
+                    "style_evaluations": effective_decision.context.get("style_evaluations", []),
                 },
             )
             append_csv_row(
@@ -142,7 +171,7 @@ class PaperTradingEngine:
                 {
                     **position.model_dump(mode="json"),
                     "status": "OPENED",
-                    "reason_code": decision.reason_code,
+                    "reason_code": effective_decision.reason_code,
                 },
             )
 
@@ -177,7 +206,17 @@ class PaperTradingEngine:
         for position in paper_positions:
             if position.closed:
                 continue
-            should_exit, reason = evaluate_exit(position, position.current_mark_price)
+            should_exit, reason = evaluate_exit(
+                position,
+                position.current_mark_price,
+                hold_to_resolution=position.thesis_type == "paired_arb",
+                profit_arm_pct=self.config.live.adaptive_profit_arm_pct,
+                min_profit_lock_pct=self.config.live.adaptive_profit_min_lock_pct,
+                trailing_profit_retrace_pct=self.config.live.trailing_profit_retrace_pct,
+                strong_winner_profit_pct=self.config.live.strong_winner_profit_pct,
+                strong_winner_retrace_pct=self.config.live.strong_winner_retrace_pct,
+                paired_arb_time_stop_hours=self.config.live.paired_arb_time_stop_hours,
+            )
             if should_exit:
                 position.closed = True
                 position.exit_reason = reason

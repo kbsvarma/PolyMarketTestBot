@@ -21,7 +21,7 @@ def test_trade_monitor_ignores_redeem_events(tmp_path: Path) -> None:
     detection = monitor._row_to_detection(  # noqa: SLF001
         "0xabc",
         {
-            "timestamp": "2026-03-15T00:00:00Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "market_id": "m1",
             "token_id": "t1",
             "side": "REDEEM",
@@ -39,7 +39,7 @@ def test_trade_monitor_preserves_outcome_in_market_metadata(tmp_path: Path) -> N
     detection = monitor._row_to_detection(  # noqa: SLF001
         "0xabc",
         {
-            "timestamp": "2026-03-15T00:00:00Z",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "market_id": "m1",
             "token_id": "unknown-token",
             "side": "BUY",
@@ -89,3 +89,23 @@ def test_trade_monitor_ignores_expired_market_row(tmp_path: Path) -> None:
     )
 
     assert detection is None
+
+
+def test_trade_monitor_inferrs_oscars_as_entertainment(tmp_path: Path) -> None:
+    monitor = _monitor(tmp_path)
+
+    detection = monitor._row_to_detection(  # noqa: SLF001
+        "0xabc",
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "market_id": "m-oscars",
+            "token_id": "t-oscars",
+            "side": "BUY",
+            "title": "Who will win Best Picture at the Oscars?",
+            "price": 0.62,
+            "size": 10,
+        },
+    )
+
+    assert detection is not None
+    assert detection.category == "entertainment / pop culture"

@@ -110,6 +110,31 @@ class TradeMonitor:
         ).lower()
         if any(keyword in text for keyword in ("btc", "bitcoin", "eth", "ethereum", "sol", "solana", "xrp", "crypto")):
             return "crypto price"
+        if any(
+            keyword in text
+            for keyword in (
+                "oscar",
+                "oscars",
+                "academy award",
+                "academy awards",
+                "best picture",
+                "best actor",
+                "best actress",
+                "best director",
+                "movie",
+                "film",
+                "box office",
+                "golden globe",
+                "golden globes",
+                "grammy",
+                "grammys",
+                "emmy",
+                "emmys",
+                "album of the year",
+                "song of the year",
+            )
+        ):
+            return "entertainment / pop culture"
         if any(keyword in text for keyword in ("election", "candidate", "president", "senate", "supreme court", "biden", "trump")):
             return "politics"
         if any(keyword in text for keyword in ("temperature", "weather", "rain", "snow")):

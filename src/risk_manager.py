@@ -11,6 +11,24 @@ class RiskManager:
         self.config = config
         self.hourly_entries: list[datetime] = []
 
+    def _prune_hourly_entries(self, now: datetime | None = None) -> None:
+        current_time = now or datetime.now(timezone.utc)
+        self.hourly_entries = [
+            timestamp
+            for timestamp in self.hourly_entries
+            if current_time - timestamp <= timedelta(hours=1)
+        ]
+
+    def entries_last_hour(self, now: datetime | None = None) -> int:
+        current_time = now or datetime.now(timezone.utc)
+        self._prune_hourly_entries(current_time)
+        return len(self.hourly_entries)
+
+    def register_entry(self, timestamp: datetime | None = None) -> None:
+        current_time = timestamp or datetime.now(timezone.utc)
+        self._prune_hourly_entries(current_time)
+        self.hourly_entries.append(current_time)
+
     def evaluate(
         self,
         detection: DetectionEvent,
@@ -40,13 +58,20 @@ class RiskManager:
         allowance_sufficient: bool = True,
         tradable: bool = True,
         bankroll_override: float | None = None,
+        entries_last_hour_override: int | None = None,
+        stale_signal_seconds_override: float | None = None,
     ) -> RiskResult:
         bankroll = self.config.bankroll.paper_starting_bankroll if mode != "LIVE" else self.config.bankroll.live_bankroll_reference
         if mode != "LIVE" and bankroll_override and bankroll_override > 0:
             bankroll = bankroll_override
         spread_limit = self.config.risk.max_spread_pct if mode == "LIVE" else max(self.config.risk.max_spread_pct, 0.05)
+        stale_signal_limit = (
+            float(stale_signal_seconds_override)
+            if stale_signal_seconds_override is not None and stale_signal_seconds_override > 0
+            else float(self.config.risk.stale_signal_seconds)
+        )
         now = datetime.now(timezone.utc)
-        self.hourly_entries = [timestamp for timestamp in self.hourly_entries if now - timestamp <= timedelta(hours=1)]
+        entries_last_hour = entries_last_hour_override if entries_last_hour_override is not None else self.entries_last_hour(now)
 
         if mode == "LIVE" and not live_ready:
             return RiskResult(allowed=False, reason_code="LIVE_NOT_READY", human_readable_reason="Live readiness gate is not satisfied.", context={})
@@ -56,7 +81,7 @@ class RiskManager:
             return RiskResult(allowed=False, reason_code="MANUAL_ENABLE_REQUIRED", human_readable_reason="Manual live enable flag is required.", context={})
         if mode == "LIVE" and manual_resume_required:
             return RiskResult(allowed=False, reason_code="MANUAL_RESUME_REQUIRED", human_readable_reason="Manual resume is required after a pause.", context={})
-        if mode == "LIVE" and health_state != HealthState.HEALTHY.value:
+        if mode == "LIVE" and health_state == HealthState.UNHEALTHY.value:
             return RiskResult(allowed=False, reason_code="HEALTH_NOT_HEALTHY", human_readable_reason="Live health is not healthy.", context={"health_state": health_state})
         if mode == "LIVE" and not reconciliation_clean:
             return RiskResult(allowed=False, reason_code="RECONCILIATION_DIRTY", human_readable_reason="Reconciliation is unresolved.", context={})
@@ -76,10 +101,23 @@ class RiskManager:
             return RiskResult(allowed=False, reason_code="MARKET_EXPOSURE", human_readable_reason="Per-market exposure limit exceeded.", context={"market_exposure": market_exposure})
         if wallet_exposure > bankroll * self.config.risk.max_wallet_exposure_pct:
             return RiskResult(allowed=False, reason_code="WALLET_EXPOSURE", human_readable_reason="Per-wallet exposure limit exceeded.", context={"wallet_exposure": wallet_exposure})
-        if len(self.hourly_entries) >= self.config.risk.max_new_entries_per_hour:
-            return RiskResult(allowed=False, reason_code="ENTRY_RATE_LIMIT", human_readable_reason="Hourly entry limit reached.", context={"entries_last_hour": len(self.hourly_entries)})
-        if detection.detection_latency_seconds > self.config.risk.stale_signal_seconds:
-            return RiskResult(allowed=False, reason_code="STALE_SIGNAL", human_readable_reason="Signal is too stale.", context={"latency": detection.detection_latency_seconds})
+        if entries_last_hour >= self.config.risk.max_new_entries_per_hour:
+            return RiskResult(
+                allowed=False,
+                reason_code="ENTRY_RATE_LIMIT",
+                human_readable_reason="Hourly entry limit reached.",
+                context={"entries_last_hour": entries_last_hour},
+            )
+        if detection.detection_latency_seconds > stale_signal_limit:
+            return RiskResult(
+                allowed=False,
+                reason_code="STALE_SIGNAL",
+                human_readable_reason="Signal is too stale.",
+                context={
+                    "latency": detection.detection_latency_seconds,
+                    "stale_signal_limit_seconds": stale_signal_limit,
+                },
+            )
         if detection.depth_available is not None and detection.depth_available < self.config.risk.min_orderbook_depth_usd:
             return RiskResult(allowed=False, reason_code="LOW_LIQUIDITY", human_readable_reason="Orderbook depth below threshold.", context={"depth": detection.depth_available})
         if data_age_seconds > self.config.risk.stale_market_data_seconds:
@@ -95,6 +133,13 @@ class RiskManager:
         selected_category = category or wallet.dominant_category
         if selected_category not in self.config.risk.allow_categories:
             return RiskResult(allowed=False, reason_code="CATEGORY_BLOCKED", human_readable_reason="Category not allowed.", context={"category": selected_category})
+        if mode == "LIVE" and selected_category not in self.config.live.selected_categories:
+            return RiskResult(
+                allowed=False,
+                reason_code="LIVE_CATEGORY_NOT_SELECTED",
+                human_readable_reason="Category is not enabled for live trading.",
+                context={"category": selected_category},
+            )
         if wallet.hedge_suspicion_score > self.config.risk.max_hedge_suspicion_score:
             return RiskResult(allowed=False, reason_code="HEDGE_SUSPECT", human_readable_reason="Hedge suspicion too high.", context={"hedge_suspicion_score": wallet.hedge_suspicion_score})
         if has_conflicting_position:
@@ -105,10 +150,12 @@ class RiskManager:
             return RiskResult(allowed=False, reason_code="INFRA_DEGRADED", human_readable_reason="Infrastructure health degraded.", context={})
         if not entry_style_allowed:
             return RiskResult(allowed=False, reason_code="ENTRY_STYLE_BLOCKED", human_readable_reason="Entry style not approved.", context={})
-        self.hourly_entries.append(now)
         return RiskResult(
             allowed=True,
             reason_code="OK",
             human_readable_reason="Risk checks passed.",
-            context={"action": DecisionAction.PAPER_COPY.value if mode != "LIVE" else DecisionAction.LIVE_COPY.value},
+            context={
+                "action": DecisionAction.PAPER_COPY.value if mode != "LIVE" else DecisionAction.LIVE_COPY.value,
+                "entries_last_hour": entries_last_hour,
+            },
         )
