@@ -1100,9 +1100,9 @@ class LiveTradingEngine:
                 self.audit.record("duplicate_token_skip", {"ts": datetime.now(timezone.utc).isoformat(), "token_id": effective_decision.token_id, "market_id": effective_decision.market_id})
                 continue
             if any(
-                str(p.get("token_id") or "") == str(effective_decision.token_id or "")
-                and str(p.get("side") or "").upper() == str(effective_decision.side or "BUY").upper()
-                and p.get("status") not in ("CLOSED", "RESOLVED")
+                str(p.token_id or "") == str(effective_decision.token_id or "")
+                and str(p.side or "BUY").upper() == str(effective_decision.side or "BUY").upper()
+                and not p.closed
                 for p in live_positions
             ):
                 self.audit.record("duplicate_position_skip", {"ts": datetime.now(timezone.utc).isoformat(), "token_id": effective_decision.token_id, "market_id": effective_decision.market_id})

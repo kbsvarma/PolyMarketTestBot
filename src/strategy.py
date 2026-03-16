@@ -579,6 +579,27 @@ class StrategyEngine:
                     decisions.append(skip)
                     continue
             decision_category = self._effective_detection_category(detection, wallet, market_meta)
+            # Skip ultra-short-duration markets (e.g. "ETH Up or Down - 5 min" type markets).
+            # These expire minutes after a wallet trade is detected, making them untradeable.
+            _market_title_lc = str(market_meta.get("title") or detection.market_title or "").lower()
+            _market_slug_lc = str(market_meta.get("slug") or detection.market_slug or "").lower()
+            _short_duration_kws = ("updown-5m", "updown-1m", "updown-15m", "updown-30m",
+                                   "intraday-price", "up-or-down", "up or down",
+                                   "5-minute", "1-minute", "15-minute", "30-minute",
+                                   "hourly-", "-hourly", "5min", "1min",
+                                   "price-up", "price-down", "price up", "price down")
+            if any(kw in _market_title_lc or kw in _market_slug_lc for kw in _short_duration_kws):
+                skip = self._skip_decision(
+                    detection,
+                    wallet,
+                    min(detection.notional * self._select_copy_fraction(wallet), self._max_notional_for_mode()),
+                    "SHORT_DURATION_MARKET",
+                    f"Signal skipped: ultra-short-duration market not suitable for copy-trading ({detection.market_title!r}).",
+                )
+                skip.context.update({"market_meta": market_meta, "discovery_state": discovery_state})
+                self._write_decision_trace(detection, skip, False, [], discovery_state, scoring_state, decision_source_quality)
+                decisions.append(skip)
+                continue
             resolved_market_id = str(market_meta.get("market_id") or detection.market_id)
             resolved_token_id = str(detection.token_id or "").strip()
             if not resolved_token_id or resolved_token_id == "unknown-token":
