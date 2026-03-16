@@ -233,11 +233,62 @@ class PolymarketClient:
             return [part.strip("[]\" '") for part in text.split(",") if part.strip("[]\" '")]
         return [str(value).strip()]
 
+    @staticmethod
+    def _infer_category_from_title(text: str) -> str:
+        """Infer Polymarket category from market title/question when the API omits it."""
+        t = text.lower()
+        # Sports keywords — checked first to avoid false-positive classification
+        sports_kw = ("nba", "nfl", "mlb", "nhl", "epl", "serie a", "bundesliga", "la liga",
+                     "premier league", "champions league", "world cup", "super bowl", "stanley cup",
+                     "wimbledon", "golf", " ufc", "boxing match", "nascar", "f1 race",
+                     "playoff", "championship game", "finals series",
+                     "basketball", "football game", "baseball game", "hockey game",
+                     " pts ", " rebounds", "touchdowns", "home runs")
+        if any(kw in t for kw in sports_kw):
+            return "sports"
+        crypto_kw = ("bitcoin", " btc ", "btc price", "ethereum", " eth ", "eth price",
+                     " sol ", "solana", " xrp", "dogecoin", "crypto", "blockchain",
+                     "defi ", "nft", " dao ", "airdrop", "token price", "coin price",
+                     "halving", "all-time high", "ath", "market cap crypto")
+        if any(kw in t for kw in crypto_kw):
+            return "crypto price"
+        politics_kw = ("election", "president", "congress", "senate", "house of rep",
+                       "governor", "primary", "ballot", "vote ", "votes ", "voters",
+                       "democrat", "republican", "gop ", "partisan", "impeach",
+                       "trump", "biden", "harris", "desantis", "maga ",
+                       "white house", "oval office", "political party")
+        if any(kw in t for kw in politics_kw):
+            return "politics"
+        geo_kw = ("ukraine", "russia", "nato", "war ", "ceasefire", "invasion",
+                  "china", "taiwan", "north korea", "iran", "israel", "gaza",
+                  "geopolit", "sanction", "military", "troops", "conflict",
+                  "macron", "putin", "zelensky", "xi jinping")
+        if any(kw in t for kw in geo_kw):
+            return "geopolitics"
+        macro_kw = ("gdp", "inflation", "fed ", "federal reserve", "interest rate",
+                    "treasury", "recession", "unemployment", "cpi ", "ppi ",
+                    "dow jones", "s&p 500", "nasdaq", "stock market", "ipo ",
+                    "earnings", "microstrategy", "finance", "economy", "economic")
+        if any(kw in t for kw in macro_kw):
+            return "macro / economics"
+        legal_kw = ("fda ", "sec ", "cftc ", "lawsuit", "court", "indicted",
+                    "convicted", "trial", "regulation", "legal ", "compliance",
+                    "antitrust", "ftc ", "doj ", "verdict")
+        if any(kw in t for kw in legal_kw):
+            return "regulatory / legal"
+        entertainment_kw = ("oscar", "grammy", "emmy", "movie", "film", "album",
+                            "song", "artist", "celebrity", "kardashian", "taylor swift",
+                            "supernova", "pop culture", "box office", "streaming")
+        if any(kw in t for kw in entertainment_kw):
+            return "entertainment / pop culture"
+        return "unknown"
+
     def _market_infos_from_item(self, item: dict[str, Any]) -> list[MarketInfo]:
         market_id = str(item.get("conditionId") or item.get("id") or item.get("slug") or "")
         title = str(item.get("question") or item.get("title") or item.get("description") or "Unknown market")
         slug = str(item.get("slug") or item.get("marketSlug") or "")
-        category = str(item.get("category") or "unknown")
+        raw_category = str(item.get("category") or "").strip()
+        category = raw_category if raw_category and raw_category.lower() != "unknown" else self._infer_category_from_title(title)
         token_ids = self._parse_listish(item.get("clobTokenIds"))
         if not token_ids:
             token_ids = self._parse_listish(item.get("tokenId") or item.get("clobTokenId") or item.get("asset_id"))
