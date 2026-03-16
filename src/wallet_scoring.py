@@ -13,6 +13,33 @@ class WalletScoringService:
         self.config = config
         self.data_dir = data_dir
 
+    def _replay_expectancy_map(self, replay_rows: list[dict[str, object]]) -> dict[str, float]:
+        replay_expectancy: dict[str, float] = {}
+        for row in replay_rows:
+            wallet = str(row["wallet_address"])
+            replay_expectancy[wallet] = max(float(row["expectancy"]), replay_expectancy.get(wallet, float("-inf")))
+        return replay_expectancy
+
+    def _is_strictly_eligible(self, wallet: WalletMetrics, replay_expectancy: dict[str, float]) -> bool:
+        return (
+            wallet.copyability_score >= self.config.wallet_selection.min_copyability_score
+            and wallet.delayed_viability_score >= self.config.wallet_selection.min_delay_viability_score
+            and replay_expectancy.get(wallet.wallet_address, 0.0) >= self.config.backtest.min_wallet_replay_expectancy
+            and wallet.source_quality == SourceQuality.REAL_PUBLIC_DATA
+        )
+
+    def _is_relaxed_live_candidate(self, wallet: WalletMetrics, replay_expectancy: dict[str, float]) -> bool:
+        relaxed_copyability = max(self.config.wallet_selection.min_copyability_score - 0.05, 0.0)
+        relaxed_delay_viability = max(self.config.wallet_selection.min_delay_viability_score - 0.08, 0.0)
+        relaxed_expectancy = max(self.config.backtest.min_wallet_replay_expectancy * 0.75, 0.0)
+        return (
+            wallet.source_quality == SourceQuality.REAL_PUBLIC_DATA
+            and wallet.global_score >= 0.35
+            and wallet.copyability_score >= relaxed_copyability
+            and wallet.delayed_viability_score >= relaxed_delay_viability
+            and replay_expectancy.get(wallet.wallet_address, 0.0) >= relaxed_expectancy
+        )
+
     def score_wallets(self, wallets: list[WalletMetrics]) -> WalletScoringResult:
         if not wallets:
             result = WalletScoringResult(
@@ -48,18 +75,32 @@ class WalletScoringService:
             wallet.hedge_suspicion_score = hedge_suspicion_score(wallet)
             wallet.complexity_penalty = clamp(wallet.hedge_suspicion_score * 0.8 + wallet.market_concentration * 0.2, 0.0, 1.0)
             wallet.copied_performance_score = clamp(wallet.delayed_viability_score * wallet.copyability_score, 0.0, 1.0)
+            # Penalize wallets whose dominant category is not actionable in live mode.
+            # Crypto price wallet-follow is disabled, so crypto-dominant wallets produce zero live signals.
+            live_selected: list[str] = list(getattr(getattr(self.config, "live", None), "selected_categories", None) or [])
+            if live_selected and wallet.dominant_category not in live_selected:
+                category_relevance_adj = -0.20  # Hard penalty: dominant category is blocked
+            elif live_selected and wallet.dominant_category in live_selected:
+                category_relevance_adj = 0.10  # Bonus: wallet trades in an actionable category
+            else:
+                category_relevance_adj = 0.0
             wallet.global_score = round(
-                0.18 * wallet.performance_score
-                + 0.12 * wallet.consistency_score
-                + 0.08 * wallet.sample_size_score
-                + 0.08 * wallet.market_quality_score
-                + 0.18 * wallet.copyability_score
-                + 0.14 * wallet.delayed_viability_score
-                + 0.10 * wallet.category_strength_score
-                + 0.10 * wallet.low_velocity_score
-                - 0.10 * wallet.hedge_suspicion_score
-                - 0.05 * wallet.complexity_penalty
-                + 0.07 * wallet.copied_performance_score,
+                clamp(
+                    0.18 * wallet.performance_score
+                    + 0.12 * wallet.consistency_score
+                    + 0.08 * wallet.sample_size_score
+                    + 0.08 * wallet.market_quality_score
+                    + 0.18 * wallet.copyability_score
+                    + 0.14 * wallet.delayed_viability_score
+                    + 0.10 * wallet.category_strength_score
+                    + 0.10 * wallet.low_velocity_score
+                    - 0.10 * wallet.hedge_suspicion_score
+                    - 0.05 * wallet.complexity_penalty
+                    + 0.07 * wallet.copied_performance_score
+                    + category_relevance_adj,
+                    0.0,
+                    1.0,
+                ),
                 4,
             )
             scored_wallets.append(wallet)
@@ -97,19 +138,17 @@ class WalletScoringService:
         return result
 
     def select_wallets(self, scoring: WalletScoringResult, replay_rows: list[dict[str, object]]) -> ApprovedWallets:
-        replay_expectancy: dict[str, float] = {}
-        for row in replay_rows:
-            wallet = str(row["wallet_address"])
-            replay_expectancy[wallet] = max(float(row["expectancy"]), replay_expectancy.get(wallet, float("-inf")))
-
-        eligible = [
-            wallet
-            for wallet in scoring.scored_wallets
-            if wallet.copyability_score >= self.config.wallet_selection.min_copyability_score
-            and wallet.delayed_viability_score >= self.config.wallet_selection.min_delay_viability_score
-            and replay_expectancy.get(wallet.wallet_address, 0.0) >= self.config.backtest.min_wallet_replay_expectancy
-            and wallet.source_quality == SourceQuality.REAL_PUBLIC_DATA
-        ]
+        replay_expectancy = self._replay_expectancy_map(replay_rows)
+        eligible = [wallet for wallet in scoring.scored_wallets if self._is_strictly_eligible(wallet, replay_expectancy)]
+        if self.config.mode.value == "LIVE" and len(eligible) < self.config.wallet_selection.approved_paper_wallets:
+            selected_addresses = {wallet.wallet_address for wallet in eligible}
+            near_pass = [
+                wallet
+                for wallet in scoring.scored_wallets
+                if wallet.wallet_address not in selected_addresses
+                and self._is_relaxed_live_candidate(wallet, replay_expectancy)
+            ]
+            eligible.extend(near_pass)
         research = [wallet.wallet_address for wallet in scoring.scored_wallets[: self.config.wallet_selection.top_research_wallets]]
         paper = [wallet.wallet_address for wallet in eligible[: self.config.wallet_selection.approved_paper_wallets]]
         live_wallet_count = self.config.env.operator_live_wallet_count

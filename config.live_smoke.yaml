@@ -25,7 +25,7 @@ risk:
   max_slippage_pct: 0.03
   min_orderbook_depth_usd: 25.0
   max_hedge_suspicion_score: 0.72
-  require_cluster_confirmation_live: false
+  require_cluster_confirmation_live: true  # Require ≥2 wallets to agree before live entry
   heartbeat_timeout_seconds: 30
   order_timeout_seconds: 60
   max_reprice_attempts: 2
@@ -57,9 +57,9 @@ backtest:
   min_wallet_replay_expectancy: 0.01
   min_wallet_copyability_score: 0.55
 wallet_selection:
-  top_research_wallets: 5
-  approved_paper_wallets: 5
-  approved_live_wallets: 5
+  top_research_wallets: 10
+  approved_paper_wallets: 10
+  approved_live_wallets: 10
   min_trade_count: 12
   min_copyability_score: 0.55
   min_delay_viability_score: 0.50
@@ -94,7 +94,7 @@ live:
   preferred_entry_price_min: 0.15
   preferred_entry_price_max: 0.80
   minimum_fillability_score: 0.52
-  minimum_signal_quality_score: 0.50
+  minimum_signal_quality_score: 0.65  # Raised from 0.50 — only high-quality signals live
   passive_signal_ttl_seconds: 900
   adaptive_profit_arm_pct: 0.07
   adaptive_profit_min_lock_pct: 0.03
@@ -105,9 +105,10 @@ live:
   selected_categories:
     - politics
     - regulatory / legal
-    - entertainment / pop culture
     - macro / economics
     - geopolitics
+    - crypto price
+    # entertainment / pop culture removed: Oscar signals caused losses
 strategies:
   enable_event_driven_official: true
   enable_correlation_dislocation: true
@@ -121,7 +122,7 @@ strategies:
   official_signal_min_edge_pct: 0.06
   official_signal_min_source_reliability: 0.65
   official_signal_min_confidence: 0.65
-  official_signal_live_enabled: true
+  official_signal_live_enabled: false  # Disabled: Oscars signals were wrong, no fresh signals loaded
   correlation_min_gap_pct: 0.03
   correlation_min_group_size: 2
   correlation_max_groups: 16
@@ -130,8 +131,12 @@ strategies:
   supplemental_paper_relaxed_enabled: true
   supplemental_paper_relaxed_min_confidence: 0.72
   paired_binary_min_edge_pct: 0.03
+  paired_binary_min_net_edge_pct: 0.012
   paired_binary_min_leg_price: 0.08
   paired_binary_max_leg_price: 0.92
+  paired_binary_slippage_buffer_pct: 0.003
+  paired_binary_max_candidates_per_cycle: 2
+  paired_binary_max_best_level_fraction: 0.15
   paired_binary_live_enabled: true
   resolution_window_max_hours: 168
   resolution_window_min_price: 0.65
@@ -140,9 +145,35 @@ strategies:
   resolution_window_near_miss_price_buffer: 0.05
   resolution_window_target_fair_price: 0.94
   resolution_window_min_liquidity: 100.0
-  resolution_window_live_enabled: true
+  resolution_window_live_enabled: false  # Disabled until wallet signals are validated
 endpoints:
   gamma_base_url: https://gamma-api.polymarket.com
   clob_base_url: https://clob.polymarket.com
   data_base_url: https://data-api.polymarket.com
   user_agent: polymarket-wallet-follow-bot/0.2
+rtds:
+  enabled: true
+  url: wss://data-stream.binance.vision/ws/btcusdt@aggTrade
+  ping_interval_seconds: 5.0
+  staleness_max_seconds: 1.5
+  clob_staleness_max_seconds: 0.8
+fees:
+  min_edge_after_fees_taker: 0.020
+  min_edge_after_fees_maker: 0.010
+  enable_global_fee_gate: true
+lag_signal:
+  enabled: true
+  live_enabled: false
+  min_price_divergence_pct: 0.003
+  min_spot_move_pct: 0.003
+  min_lag_ms: 50.0
+  min_net_edge_taker: 0.020
+  min_net_edge_maker: 0.010
+  min_time_remaining_seconds: 30.0
+  max_candidates_per_cycle: 2
+completion_tracker:
+  enabled: true
+  entry_threshold: 0.70
+  abort_threshold: 0.40
+  deadline_fraction: 0.60
+  tick_interval_seconds: 5.0

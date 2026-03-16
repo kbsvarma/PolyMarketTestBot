@@ -332,6 +332,7 @@ def test_live_allowed_decision_uses_live_wallet_list_not_paper_wallet_list(tmp_p
     engine.market_data.get_tradability = _tradability  # type: ignore[method-assign]
     engine.market_data.fetch_orderbook = _orderbook  # type: ignore[method-assign]
 
+    # Use original detection with price=0.5 — politics category has fee=0 so fee gate doesn't apply
     decisions = asyncio.run(
         engine.process_detections(
             [_detection()],
@@ -375,8 +376,8 @@ def test_live_unknown_detection_category_uses_market_metadata_category(tmp_path:
     detection = _detection().model_copy(
         update={
             "category": "unknown",
-            "market_title": "Who will win Best Picture at the Oscars?",
-            "market_slug": "who-will-win-best-picture-at-the-oscars",
+            "market_title": "Will the Senate pass the budget bill?",
+            "market_slug": "will-the-senate-pass-the-budget-bill",
             "price": 0.55,
             "size": 20.0,
             "notional": 20.0,
@@ -393,9 +394,9 @@ def test_live_unknown_detection_category_uses_market_metadata_category(tmp_path:
         return {
             "market_id": market_id,
             "token_id": token_id,
-            "title": "Who will win Best Picture at the Oscars?",
-            "slug": "who-will-win-best-picture-at-the-oscars",
-            "category": "entertainment / pop culture",
+            "title": "Will the Senate pass the budget bill?",
+            "slug": "will-the-senate-pass-the-budget-bill",
+            "category": "politics",
             "active": True,
             "closed": False,
         }
@@ -406,8 +407,8 @@ def test_live_unknown_detection_category_uses_market_metadata_category(tmp_path:
             "token_id": token_id,
             "tradable": True,
             "orderbook_enabled": True,
-            "category": "entertainment / pop culture",
-            "title": "Who will win Best Picture at the Oscars?",
+            "category": "politics",
+            "title": "Will the Senate pass the budget bill?",
             "liquidity": 1000.0,
         }
 
@@ -437,7 +438,7 @@ def test_live_unknown_detection_category_uses_market_metadata_category(tmp_path:
     assert len(decisions) == 1
     assert decisions[0].allowed is True
     assert decisions[0].action.value == "LIVE_COPY"
-    assert decisions[0].category == "entertainment / pop culture"
+    assert decisions[0].category == "politics"
 
 
 def test_live_metadata_fallback_uses_detection_fields_when_token_is_present(tmp_path: Path) -> None:

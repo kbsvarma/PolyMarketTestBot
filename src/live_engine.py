@@ -1090,6 +1090,23 @@ class LiveTradingEngine:
                 continue
             if any(order.local_decision_id == effective_decision.local_decision_id and not order.terminal_state for order in live_orders):
                 continue
+            # Prevent duplicate entries: skip if an open order or live position already exists for this token.
+            if any(
+                str(order.token_id or "") == str(effective_decision.token_id or "")
+                and str(order.side or "").upper() == str(effective_decision.side or "BUY").upper()
+                and not order.terminal_state
+                for order in live_orders
+            ):
+                self.audit.record("duplicate_token_skip", {"ts": datetime.now(timezone.utc).isoformat(), "token_id": effective_decision.token_id, "market_id": effective_decision.market_id})
+                continue
+            if any(
+                str(p.get("token_id") or "") == str(effective_decision.token_id or "")
+                and str(p.get("side") or "").upper() == str(effective_decision.side or "BUY").upper()
+                and p.get("status") not in ("CLOSED", "RESOLVED")
+                for p in live_positions
+            ):
+                self.audit.record("duplicate_position_skip", {"ts": datetime.now(timezone.utc).isoformat(), "token_id": effective_decision.token_id, "market_id": effective_decision.market_id})
+                continue
             if entries_last_hour >= self.config.risk.max_new_entries_per_hour:
                 self.audit.record(
                     "entry_rate_limit_block",
@@ -1112,20 +1129,32 @@ class LiveTradingEngine:
                 )
                 continue
 
-            try:
-                tradability = await self.market_data.get_tradability(effective_decision.market_id, effective_decision.token_id)
-            except Exception as exc:
-                self.audit.record(
-                    "tradability_lookup_error",
-                    {
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "decision_id": effective_decision.local_decision_id,
-                        "market_id": effective_decision.market_id,
-                        "token_id": effective_decision.token_id,
-                        "error": str(exc),
-                    },
-                )
-                continue
+            cached_tradability = effective_decision.context.get("tradability")
+            cached_tradability_valid = (
+                isinstance(cached_tradability, dict)
+                and str(cached_tradability.get("market_id") or effective_decision.market_id) == effective_decision.market_id
+                and str(cached_tradability.get("token_id") or effective_decision.token_id) == effective_decision.token_id
+                and "tradable" in cached_tradability
+                and "orderbook_enabled" in cached_tradability
+            )
+            if cached_tradability_valid:
+                tradability = dict(cached_tradability)
+            else:
+                try:
+                    tradability = await self.market_data.get_tradability(effective_decision.market_id, effective_decision.token_id)
+                except Exception as exc:
+                    self.audit.record(
+                        "tradability_lookup_error",
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "decision_id": effective_decision.local_decision_id,
+                            "market_id": effective_decision.market_id,
+                            "token_id": effective_decision.token_id,
+                            "error": str(exc),
+                            "used_cached_tradability": False,
+                        },
+                    )
+                    continue
             self.state.update_system_status(watched_market_tradability_cache={effective_decision.market_id: tradability})
             if not (tradability.get("tradable") and tradability.get("orderbook_enabled")):
                 self.audit.record(

@@ -20,6 +20,7 @@ from src.models import (
 )
 from src.state import AppStateStore
 from src.strategy import StrategyEngine
+from src.live_orders import LiveOrderStore
 
 
 def _paper_engine(tmp_path: Path) -> StrategyEngine:
@@ -208,19 +209,19 @@ def test_paired_binary_arb_generates_two_live_bundle_decisions(tmp_path: Path) -
     engine = _live_engine(tmp_path)
     engine.config.strategies.paired_binary_live_enabled = True
     yes_market = MarketInfo(
-        market_id="oscars-m1",
+        market_id="paired-m1",
         token_id="yes-token",
-        title="Will Anora win Best Picture at the 98th Academy Awards? [Yes]",
-        slug="will-anora-win-best-picture-at-the-98th-academy-awards",
-        category="entertainment / pop culture",
+        title="Will the bill pass the Senate this quarter? [Yes]",
+        slug="will-the-bill-pass-the-senate-this-quarter",
+        category="politics",
         end_date_iso="2026-03-16T06:00:00Z",
     )
     no_market = MarketInfo(
-        market_id="oscars-m1",
+        market_id="paired-m1",
         token_id="no-token",
-        title="Will Anora win Best Picture at the 98th Academy Awards? [No]",
-        slug="will-anora-win-best-picture-at-the-98th-academy-awards",
-        category="entertainment / pop culture",
+        title="Will the bill pass the Senate this quarter? [No]",
+        slug="will-the-bill-pass-the-senate-this-quarter",
+        category="politics",
         end_date_iso="2026-03-16T06:00:00Z",
     )
     engine.market_data.token_cache = {
@@ -256,6 +257,334 @@ def test_paired_binary_arb_generates_two_live_bundle_decisions(tmp_path: Path) -
     assert all(decision.thesis_type == "paired_arb" for decision in paired)
     assert len({decision.bundle_id for decision in paired}) == 1
     assert {decision.bundle_role for decision in paired} == {"paired_yes", "paired_no"}
+
+
+def test_paired_binary_arb_sizes_both_legs_to_same_share_count(tmp_path: Path) -> None:
+    engine = _live_engine(tmp_path)
+    engine.config.strategies.paired_binary_live_enabled = True
+    yes_market = MarketInfo(
+        market_id="paired-size-m1",
+        token_id="yes-token",
+        title="Will the reform pass this quarter? [Yes]",
+        slug="will-the-reform-pass-this-quarter",
+        category="politics",
+        end_date_iso="2026-06-30T00:00:00Z",
+    )
+    no_market = MarketInfo(
+        market_id="paired-size-m1",
+        token_id="no-token",
+        title="Will the reform pass this quarter? [No]",
+        slug="will-the-reform-pass-this-quarter",
+        category="politics",
+        end_date_iso="2026-06-30T00:00:00Z",
+    )
+    engine.market_data.token_cache = {
+        yes_market.token_id: yes_market,
+        no_market.token_id: no_market,
+    }
+    engine.market_data.market_cache = {yes_market.market_id: yes_market}
+
+    async def _refresh_markets():
+        return engine.market_data.market_cache
+
+    async def _fetch_market_metadata(market_id: str, token_id: str = ""):
+        return engine.market_data.token_cache[token_id].model_dump()
+
+    async def _tradability(_market_id: str, _token_id: str):
+        return {"tradable": True, "orderbook_enabled": True}
+
+    async def _orderbook(token_id: str):
+        if token_id == "yes-token":
+            return _snapshot(token_id, 0.39, 0.40)
+        return _snapshot(token_id, 0.49, 0.50)
+
+    engine.market_data.refresh_markets = _refresh_markets  # type: ignore[method-assign]
+    engine.market_data.fetch_market_metadata = _fetch_market_metadata  # type: ignore[method-assign]
+    engine.market_data.get_tradability = _tradability  # type: ignore[method-assign]
+    engine.market_data.fetch_orderbook = _orderbook  # type: ignore[method-assign]
+
+    decisions = asyncio.run(engine.process_detections([], ApprovedWallets(research_wallets=[], paper_wallets=[], live_wallets=[]), []))
+
+    paired = [decision for decision in decisions if decision.strategy_name == "paired_binary_arb"]
+    assert len(paired) == 2
+    order_store = LiveOrderStore(tmp_path / "live_orders.json")
+    orders = [order_store.create_from_decision(decision) for decision in paired]
+    shares = [order.intended_size for order in orders]
+    assert shares[0] == shares[1]
+    assert shares[0] >= engine.config.live.minimum_order_size_shares
+
+
+def test_paired_binary_arb_skips_crypto_candidate_when_fees_destroy_net_edge(tmp_path: Path) -> None:
+    engine = _paper_engine(tmp_path)
+    engine.config.strategies.paired_binary_min_edge_pct = 0.01
+    engine.config.strategies.paired_binary_min_net_edge_pct = 0.01
+    yes_market = MarketInfo(
+        market_id="crypto-pair-m1",
+        token_id="yes-token",
+        title="Will BTC be up in 5 minutes? [Yes]",
+        slug="btc-updown-5m",
+        category="crypto price",
+        end_date_iso="2026-03-16T05:00:00Z",
+    )
+    no_market = MarketInfo(
+        market_id="crypto-pair-m1",
+        token_id="no-token",
+        title="Will BTC be up in 5 minutes? [No]",
+        slug="btc-updown-5m",
+        category="crypto price",
+        end_date_iso="2026-03-16T05:00:00Z",
+    )
+    engine.market_data.token_cache = {
+        yes_market.token_id: yes_market,
+        no_market.token_id: no_market,
+    }
+    engine.market_data.market_cache = {yes_market.market_id: yes_market}
+
+    async def _refresh_markets():
+        return engine.market_data.market_cache
+
+    async def _fetch_market_metadata(market_id: str, token_id: str = ""):
+        return engine.market_data.token_cache[token_id].model_dump()
+
+    async def _tradability(_market_id: str, _token_id: str):
+        return {"tradable": True, "orderbook_enabled": True}
+
+    async def _orderbook(token_id: str):
+        if token_id == "yes-token":
+            return _snapshot(token_id, 0.48, 0.49)
+        return _snapshot(token_id, 0.49, 0.50)
+
+    engine.market_data.refresh_markets = _refresh_markets  # type: ignore[method-assign]
+    engine.market_data.fetch_market_metadata = _fetch_market_metadata  # type: ignore[method-assign]
+    engine.market_data.get_tradability = _tradability  # type: ignore[method-assign]
+    engine.market_data.fetch_orderbook = _orderbook  # type: ignore[method-assign]
+
+    decisions = asyncio.run(engine.process_detections([], ApprovedWallets(research_wallets=[], paper_wallets=[], live_wallets=[]), []))
+
+    assert not any(decision.strategy_name == "paired_binary_arb" for decision in decisions)
+
+
+def test_paired_binary_arb_can_emit_multiple_live_bundles_per_cycle(tmp_path: Path) -> None:
+    engine = _live_engine(tmp_path)
+    engine.config.strategies.paired_binary_live_enabled = True
+    engine.config.strategies.paired_binary_max_candidates_per_cycle = 2
+    markets = [
+        MarketInfo(
+            market_id="m1",
+            token_id="m1-yes",
+            title="Will policy A pass? [Yes]",
+            slug="will-policy-a-pass",
+            category="politics",
+        ),
+        MarketInfo(
+            market_id="m1",
+            token_id="m1-no",
+            title="Will policy A pass? [No]",
+            slug="will-policy-a-pass",
+            category="politics",
+        ),
+        MarketInfo(
+            market_id="m2",
+            token_id="m2-yes",
+            title="Will the central bank raise rates? [Yes]",
+            slug="will-the-central-bank-raise-rates",
+            category="macro / economics",
+        ),
+        MarketInfo(
+            market_id="m2",
+            token_id="m2-no",
+            title="Will the central bank raise rates? [No]",
+            slug="will-the-central-bank-raise-rates",
+            category="macro / economics",
+        ),
+    ]
+    engine.market_data.token_cache = {market.token_id: market for market in markets}
+    engine.market_data.market_cache = {"m1": markets[0], "m2": markets[2]}
+
+    async def _refresh_markets():
+        return engine.market_data.market_cache
+
+    async def _fetch_market_metadata(market_id: str, token_id: str = ""):
+        return engine.market_data.token_cache[token_id].model_dump()
+
+    async def _tradability(_market_id: str, _token_id: str):
+        return {"tradable": True, "orderbook_enabled": True}
+
+    async def _orderbook(token_id: str):
+        if token_id == "m1-yes":
+            return _snapshot(token_id, 0.43, 0.44)
+        if token_id == "m1-no":
+            return _snapshot(token_id, 0.45, 0.46)
+        if token_id == "m2-yes":
+            return _snapshot(token_id, 0.41, 0.42)
+        return _snapshot(token_id, 0.43, 0.44)
+
+    engine.market_data.refresh_markets = _refresh_markets  # type: ignore[method-assign]
+    engine.market_data.fetch_market_metadata = _fetch_market_metadata  # type: ignore[method-assign]
+    engine.market_data.get_tradability = _tradability  # type: ignore[method-assign]
+    engine.market_data.fetch_orderbook = _orderbook  # type: ignore[method-assign]
+
+    decisions = asyncio.run(engine.process_detections([], ApprovedWallets(research_wallets=[], paper_wallets=[], live_wallets=[]), []))
+
+    paired = [decision for decision in decisions if decision.strategy_name == "paired_binary_arb"]
+    assert len(paired) == 4
+    assert len({decision.bundle_id for decision in paired}) == 2
+
+
+def test_process_detections_skips_timed_out_supplemental_strategy(tmp_path: Path) -> None:
+    engine = _live_engine(tmp_path)
+    engine._stage_timeout_seconds = lambda **_: 0.1  # type: ignore[method-assign]
+
+    async def _refresh_markets():
+        return {}
+
+    async def _stream_watchlist(_token_ids: list[str]):
+        return {}
+
+    async def _slow_paired(**_: object):
+        await asyncio.sleep(0.2)
+        return []
+
+    engine.market_data.refresh_markets = _refresh_markets  # type: ignore[method-assign]
+    engine.market_data.stream_watchlist = _stream_watchlist  # type: ignore[method-assign]
+    engine._generate_paired_binary_arb_decisions = _slow_paired  # type: ignore[method-assign]
+
+    decisions = asyncio.run(
+        engine.process_detections(
+            [],
+            ApprovedWallets(research_wallets=[], paper_wallets=[], live_wallets=[]),
+            [],
+        )
+    )
+
+    assert decisions == []
+    signal_log = (tmp_path / "strategy_signal_log.jsonl").read_text(encoding="utf-8")
+    assert "paired_binary_arb" in signal_log
+    assert "STAGE_TIMEOUT" in signal_log
+
+
+def test_process_detections_limits_backlog_and_logs_reason(tmp_path: Path) -> None:
+    engine = _live_engine(tmp_path)
+    engine._max_wallet_follow_detections_per_cycle = lambda: 2  # type: ignore[method-assign]
+
+    async def _refresh_markets():
+        return {}
+
+    async def _stream_watchlist(_token_ids: list[str]):
+        return {}
+
+    async def _fetch_market_metadata(market_id: str, token_id: str = "", *args: object):
+        return {"market_id": market_id, "token_id": token_id, "title": market_id, "category": "politics", "active": True}
+
+    async def _tradability(_market_id: str, _token_id: str):
+        return {"tradable": True, "orderbook_enabled": True}
+
+    async def _orderbook(token_id: str):
+        return _snapshot(token_id, 0.54, 0.55)
+
+    async def _no_supplementals(**_: object):
+        return []
+
+    engine.market_data.refresh_markets = _refresh_markets  # type: ignore[method-assign]
+    engine.market_data.stream_watchlist = _stream_watchlist  # type: ignore[method-assign]
+    engine.market_data.fetch_market_metadata = _fetch_market_metadata  # type: ignore[method-assign]
+    engine.market_data.get_tradability = _tradability  # type: ignore[method-assign]
+    engine.market_data.fetch_orderbook = _orderbook  # type: ignore[method-assign]
+    engine._generate_event_driven_official_decisions = _no_supplementals  # type: ignore[method-assign]
+    engine._generate_correlation_dislocation_decisions = _no_supplementals  # type: ignore[method-assign]
+    engine._generate_resolution_window_decisions = _no_supplementals  # type: ignore[method-assign]
+    engine._generate_paired_binary_arb_decisions = _no_supplementals  # type: ignore[method-assign]
+
+    detections = []
+    for idx in range(5):
+        detection = _detection()
+        detection.event_key = f"evt-{idx}"
+        detection.market_id = f"m{idx}"
+        detection.market_slug = f"market-{idx}"
+        detection.market_title = f"Market {idx}"
+        detection.token_id = f"t{idx}"
+        detection.transaction_hash = f"tx-{idx}"
+        detections.append(detection)
+
+    decisions = asyncio.run(
+        engine.process_detections(
+            detections,
+            ApprovedWallets(research_wallets=["0xabc"], paper_wallets=["0xabc"], live_wallets=["0xabc"]),
+            [_wallet()],
+        )
+    )
+
+    assert len(decisions) == 2
+    signal_log = (tmp_path / "strategy_signal_log.jsonl").read_text(encoding="utf-8")
+    assert "DETECTION_BACKLOG_LIMIT" in signal_log
+
+
+def test_process_detections_prioritizes_live_selected_categories(tmp_path: Path) -> None:
+    engine = _live_engine(tmp_path)
+    engine._max_wallet_follow_detections_per_cycle = lambda: 1  # type: ignore[method-assign]
+
+    async def _refresh_markets():
+        return {}
+
+    async def _stream_watchlist(_token_ids: list[str]):
+        return {}
+
+    async def _fetch_market_metadata(market_id: str, token_id: str = "", *args: object):
+        category = "politics" if market_id == "m-politics" else "entertainment / pop culture"
+        return {"market_id": market_id, "token_id": token_id, "title": market_id, "category": category, "active": True}
+
+    async def _tradability(_market_id: str, _token_id: str):
+        return {"tradable": True, "orderbook_enabled": True}
+
+    async def _orderbook(token_id: str):
+        if token_id == "t-politics":
+            return _snapshot(token_id, 0.59, 0.60)
+        return _snapshot(token_id, 0.49, 0.50)
+
+    async def _no_supplementals(**_: object):
+        return []
+
+    engine.market_data.refresh_markets = _refresh_markets  # type: ignore[method-assign]
+    engine.market_data.stream_watchlist = _stream_watchlist  # type: ignore[method-assign]
+    engine.market_data.fetch_market_metadata = _fetch_market_metadata  # type: ignore[method-assign]
+    engine.market_data.get_tradability = _tradability  # type: ignore[method-assign]
+    engine.market_data.fetch_orderbook = _orderbook  # type: ignore[method-assign]
+    engine._generate_event_driven_official_decisions = _no_supplementals  # type: ignore[method-assign]
+    engine._generate_correlation_dislocation_decisions = _no_supplementals  # type: ignore[method-assign]
+    engine._generate_resolution_window_decisions = _no_supplementals  # type: ignore[method-assign]
+    engine._generate_paired_binary_arb_decisions = _no_supplementals  # type: ignore[method-assign]
+
+    # entertainment is not in selected_categories — should be deprioritized
+    entertainment = _detection(price=0.50, category="entertainment / pop culture")
+    entertainment.event_key = "evt-entertainment"
+    entertainment.market_id = "m-entertainment"
+    entertainment.market_slug = "m-entertainment"
+    entertainment.market_title = "Entertainment"
+    entertainment.token_id = "t-entertainment"
+    entertainment.transaction_hash = "tx-entertainment"
+    entertainment.local_detection_timestamp = datetime.now(timezone.utc)
+    entertainment.source_trade_timestamp = entertainment.local_detection_timestamp
+
+    politics = _detection(price=0.60, category="politics")
+    politics.event_key = "evt-politics"
+    politics.market_id = "m-politics"
+    politics.market_slug = "m-politics"
+    politics.market_title = "Politics"
+    politics.token_id = "t-politics"
+    politics.transaction_hash = "tx-politics"
+    politics.local_detection_timestamp = datetime.now(timezone.utc) - timedelta(seconds=30)
+    politics.source_trade_timestamp = politics.local_detection_timestamp
+
+    decisions = asyncio.run(
+        engine.process_detections(
+            [entertainment, politics],
+            ApprovedWallets(research_wallets=["0xabc"], paper_wallets=["0xabc"], live_wallets=["0xabc"]),
+            [_wallet()],
+        )
+    )
+
+    assert len(decisions) == 1
+    assert decisions[0].market_id == "m-politics"
 
 
 def test_event_driven_official_stays_live_disabled_by_default(tmp_path: Path) -> None:
@@ -296,6 +625,7 @@ def test_event_driven_official_stays_live_disabled_by_default(tmp_path: Path) ->
 def test_event_driven_official_can_generate_live_signal_when_enabled(tmp_path: Path) -> None:
     engine = _live_engine(tmp_path)
     engine.config.strategies.official_signal_live_enabled = True
+    engine.config.live.selected_categories = [*engine.config.live.selected_categories, "entertainment / pop culture"]
     signal_path = tmp_path / "official_event_signals.json"
     signal_path.write_text(
         json.dumps(
@@ -358,6 +688,7 @@ def test_event_driven_official_can_generate_live_signal_when_enabled(tmp_path: P
 def test_event_driven_official_live_smoke_accepts_near_threshold_oscars_signal(tmp_path: Path) -> None:
     engine = _live_engine(tmp_path)
     engine.config.strategies.official_signal_live_enabled = True
+    engine.config.live.selected_categories = [*engine.config.live.selected_categories, "entertainment / pop culture"]
     signal_path = tmp_path / "official_event_signals.json"
     signal_path.write_text(
         json.dumps(
@@ -532,6 +863,8 @@ def test_live_wallet_follow_hard_skips_extreme_price_books(tmp_path: Path) -> No
     engine = _live_engine(tmp_path)
     engine.config.live.enable_multi_entry_style_live = False
     engine.config.entry_styles.preferred_live_entry_style = EntryStyle.FOLLOW_TAKER
+    engine.config.risk.require_cluster_confirmation_live = False
+    engine.config.live.selected_categories = [*engine.config.live.selected_categories, "entertainment / pop culture"]
     detection = _detection(price=0.65, category="entertainment / pop culture").model_copy(
         update={
             "market_id": "m-oscars",
@@ -589,6 +922,27 @@ def test_live_wallet_follow_hard_skips_extreme_price_books(tmp_path: Path) -> No
     assert decisions[0].reason_code == "EXTREME_PRICE_BOOK"
 
 
+def test_live_wallet_follow_crypto_allowed_when_category_enabled(tmp_path: Path) -> None:
+    # Crypto wallet follow is now enabled — when "crypto price" is in selected_categories,
+    # the signal should pass the category gate (may still be blocked by cluster or other guards).
+    engine = _live_engine(tmp_path)
+    engine.config.live.selected_categories = [*engine.config.live.selected_categories, "crypto price"]
+    engine.config.risk.require_cluster_confirmation_live = False
+    detection = _detection(price=0.52, category="crypto price")
+
+    decisions = asyncio.run(
+        engine.process_detections(
+            [detection],
+            ApprovedWallets(research_wallets=["0xabc"], paper_wallets=["0xabc"], live_wallets=["0xabc"]),
+            [_wallet()],
+        )
+    )
+
+    assert len(decisions) == 1
+    # Should no longer be blocked by CRYPTO_WALLET_FOLLOW_DISABLED
+    assert decisions[0].reason_code != "CRYPTO_WALLET_FOLLOW_DISABLED"
+
+
 def test_live_entry_style_gate_can_allow_multiple_styles_when_enabled(tmp_path: Path) -> None:
     engine = _live_engine(tmp_path)
 
@@ -633,6 +987,7 @@ def test_live_passive_limit_uses_resting_price_not_taker_ask(tmp_path: Path) -> 
 
 def test_live_wallet_follow_can_use_passive_entry_for_trusted_stale_signal(tmp_path: Path) -> None:
     engine = _live_engine(tmp_path)
+    engine.config.risk.require_cluster_confirmation_live = False
     detection = _detection(price=0.52, category="politics").model_copy(
         update={
             "detection_latency_seconds": 400,
@@ -694,6 +1049,7 @@ def test_live_wallet_follow_can_use_passive_entry_for_trusted_stale_signal(tmp_p
 def test_live_style_comparison_does_not_consume_entry_rate_limit_before_final_choice(tmp_path: Path) -> None:
     engine = _live_engine(tmp_path)
     engine.config.risk.max_new_entries_per_hour = 1
+    engine.config.risk.require_cluster_confirmation_live = False
     detection = _detection(price=0.523, category="politics").model_copy(update={"size": 200, "notional": 104.6})
 
     async def _refresh_markets():
@@ -864,6 +1220,7 @@ def test_event_driven_official_can_map_market_from_title_and_outcome(tmp_path: P
 def test_event_driven_official_can_use_direct_market_lookup_when_cache_misses(tmp_path: Path) -> None:
     engine = _live_engine(tmp_path)
     engine.config.strategies.official_signal_live_enabled = True
+    engine.config.live.selected_categories = [*engine.config.live.selected_categories, "entertainment / pop culture"]
     signal_path = tmp_path / "official_event_signals.json"
     signal_path.write_text(
         json.dumps(

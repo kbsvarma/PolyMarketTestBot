@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 
 from src.config import AppConfig
+from src.logger import logger
 from src.models import DiscoveryResult, DiscoveryState, SourceQuality, ValidationMode, WalletMetrics
 from src.polymarket_client import PolymarketClient
 from src.source_quality import quality_from_discovery_state, quality_rank
@@ -17,6 +19,24 @@ class WalletDiscoveryService:
         self.config = config
         self.data_dir = data_dir
         self.client = PolymarketClient(config)
+
+    def _source_timeout_seconds(self, name: str) -> float:
+        base = float(self.config.live.bounded_execution_seconds or 20)
+        timeout = min(max(base * 0.4, 3.0), 10.0)
+        if name.startswith("wallet_activity:"):
+            return min(timeout, 5.0)
+        if name in {"market_holders", "recent_activity"}:
+            return min(max(base * 0.5, 4.0), 8.0)
+        return timeout
+
+    def _candidate_activity_limit(self) -> int:
+        configured = max(
+            self.config.wallet_selection.top_research_wallets,
+            self.config.wallet_selection.approved_paper_wallets,
+            self.config.wallet_selection.approved_live_wallets,
+            3,
+        )
+        return min(max(configured * 4, 12), 24)
 
     async def run_discovery_cycle(self) -> DiscoveryResult:
         categories = self.config.categories.tracked or [
@@ -100,16 +120,25 @@ class WalletDiscoveryService:
             "activity_rows": len(activity_rows),
             "candidate_wallets": len(candidate_rows),
         }
+        candidate_limit = self._candidate_activity_limit()
+        activity_candidates = candidate_rows[:candidate_limit]
+        diagnostics["counts"]["candidate_wallets_evaluated"] = len(activity_candidates)
+        diagnostics["counts"]["candidate_wallets_skipped_due_to_limit"] = max(len(candidate_rows) - len(activity_candidates), 0)
 
         filtered_wallets: list[dict[str, object]] = []
         rejected_wallets: list[dict[str, object]] = []
         wallets: list[WalletMetrics] = []
-        for candidate in candidate_rows:
+        activity_results = await asyncio.gather(
+            *[
+                self._safe_source(
+                    f"wallet_activity:{str(candidate.get('wallet_address') or '')}",
+                    self.client.fetch_wallet_activity(str(candidate.get("wallet_address") or ""), limit=80),
+                )
+                for candidate in activity_candidates
+            ]
+        )
+        for candidate, (activities, activity_fetch_error) in zip(activity_candidates, activity_results):
             wallet_address = str(candidate.get("wallet_address") or "")
-            activities, activity_fetch_error = await self._safe_source(
-                f"wallet_activity:{wallet_address}",
-                self.client.fetch_wallet_activity(wallet_address, limit=80),
-            )
             if activity_fetch_error:
                 rejected_wallets.append({"wallet_address": wallet_address, "reason_code": "FETCH_FAILED", "reason": activity_fetch_error})
                 continue
@@ -189,13 +218,17 @@ class WalletDiscoveryService:
 
     async def _safe_source(self, name: str, awaitable) -> tuple[list, str]:
         try:
-            rows = await awaitable
+            rows = await asyncio.wait_for(awaitable, timeout=self._source_timeout_seconds(name))
             if rows is None:
                 return [], f"{name} returned null payload."
             if not isinstance(rows, list):
                 return [], f"{name} returned malformed payload type {type(rows).__name__}."
             return rows, ""
+        except asyncio.TimeoutError:
+            logger.warning("Wallet discovery source timed out source={} timeout_seconds={}", name, self._source_timeout_seconds(name))
+            return [], f"{name} timed out."
         except Exception as exc:
+            logger.warning("Wallet discovery source failed source={} error={}", name, exc)
             return [], str(exc)
 
     async def _discover_from_market_holders(self, markets: list[object]) -> list[dict[str, object]]:
@@ -204,6 +237,12 @@ class WalletDiscoveryService:
             for market in markets
             if getattr(market, "active", False) and not getattr(market, "closed", False)
         ]
+        # Prefer markets in live-selected categories to find wallets that trade what the bot can actually follow.
+        live_selected: list[str] = list(getattr(getattr(self.config, "live", None), "selected_categories", None) or [])
+        if live_selected:
+            preferred = [m for m in active_markets if getattr(m, "category", "") in live_selected]
+            if preferred:
+                active_markets = preferred
         active_markets.sort(key=lambda market: float(getattr(market, "liquidity", 0.0) or 0.0), reverse=True)
         market_ids = [str(getattr(market, "market_id", "")) for market in active_markets[:10] if getattr(market, "market_id", "")]
         holders = await self.client.fetch_top_holders(market_ids, per_market_limit=12)

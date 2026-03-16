@@ -125,7 +125,7 @@ def test_live_risk_blocks_category_not_selected_for_live() -> None:
         transaction_hash="tx",
         detection_latency_seconds=5,
         source_trade_timestamp=datetime.now(timezone.utc),
-        category="crypto price",
+        category="entertainment / pop culture",
     )
     fill = FillEstimate(fillable=True, executable_price=0.5, spread_pct=0.0, slippage_pct=0.0, filled_notional=5, reason="OK")
     result = RiskManager(config).evaluate(
@@ -140,7 +140,7 @@ def test_live_risk_blocks_category_not_selected_for_live() -> None:
         True,
         True,
         True,
-        category="crypto price",
+        category="entertainment / pop culture",
         market_id="m1",
         live_ready=True,
         health_state="HEALTHY",

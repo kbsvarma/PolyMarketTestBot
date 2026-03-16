@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
 from src.clustering import cluster_detections
 from src.config import AppConfig
 from src.external_signals import OfficialSignalStore, mapping_confidence, parse_signal_timestamp, resolve_official_signal_market
+from src.lag_signal import LagSignalConfig as _LagSignalCfg, evaluate_lag_signal
 from src.live_orders import LiveOrderStore
 from src.market_data import MarketDataService
 from src.market_relationships import build_relationship_groups, find_best_dislocation_pair
@@ -14,9 +16,11 @@ from src.orderbook import estimate_fill
 from src.paper_quality import classify_trust_level, counts_as_trustworthy_approval
 from src.positions import PositionStore
 from src.risk_manager import RiskManager
+from src.rtds_client import get_rtds_client
 from src.state import AppStateStore
 from src.source_quality import quality_rank
 from src.utils import append_jsonl, clamp, stable_event_key
+from src.logger import logger
 
 
 class StrategyEngine:
@@ -31,9 +35,77 @@ class StrategyEngine:
         self.trace_path = data_dir / "paper_decision_trace.jsonl"
         self.signal_log_path = data_dir / "strategy_signal_log.jsonl"
         self.official_signals = OfficialSignalStore(data_dir / Path(config.strategies.official_signal_file).name)
+        # Lag signal: track first-seen Chainlink price per market_id as reference "start price"
+        self._lag_start_prices: dict[str, float] = {}
 
     def _wallet_map(self, wallets: list[WalletMetrics]) -> dict[str, WalletMetrics]:
         return {wallet.wallet_address: wallet for wallet in wallets}
+
+    def _stage_timeout_seconds(self, *, multiplier: float = 1.0, minimum: float = 5.0, maximum: float | None = None) -> float:
+        base = float(self.config.live.bounded_execution_seconds or 20)
+        if self.config.mode.value != "LIVE":
+            base = max(base * 1.5, float(self.config.risk.stale_signal_seconds or 90))
+        timeout_seconds = max(minimum, base * multiplier)
+        if maximum is not None:
+            timeout_seconds = min(timeout_seconds, maximum)
+        return round(timeout_seconds, 3)
+
+    def _max_wallet_follow_detections_per_cycle(self) -> int:
+        if self.config.mode.value == "LIVE":
+            live_wallet_count = max(int(self.config.env.operator_live_wallet_count or self.config.wallet_selection.approved_live_wallets), 1)
+            return min(max(live_wallet_count * 2, 6), 12)
+        paper_wallet_count = max(self.config.wallet_selection.approved_paper_wallets, 3)
+        return min(max(paper_wallet_count * 6, 18), 48)
+
+    def _watchlist_token_limit(self, max_detections: int) -> int:
+        if self.config.mode.value == "LIVE":
+            return min(max(max_detections, 4), 8)
+        return min(max(max_detections * 2, 8), 24)
+
+    async def _await_stage_timeout(
+        self,
+        *,
+        stage_name: str,
+        coro: object,
+        timeout_seconds: float,
+    ) -> object:
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout_seconds)  # type: ignore[arg-type]
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"{stage_name} timed out after {timeout_seconds:.1f}s") from exc
+
+    async def _run_supplemental_strategy(
+        self,
+        *,
+        strategy_name: str,
+        coro: object,
+        cycle_ts: datetime,
+    ) -> list[TradeDecision]:
+        if self.config.mode.value == "LIVE":
+            if strategy_name == "paired_binary_arb":
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.5, minimum=4.0, maximum=12.0)
+            else:
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.4, minimum=3.0, maximum=8.0)
+        else:
+            timeout_seconds = self._stage_timeout_seconds(multiplier=0.75, minimum=5.0, maximum=15.0)
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout_seconds)  # type: ignore[arg-type]
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Supplemental strategy timed out strategy_name={} timeout_seconds={}",
+                strategy_name,
+                timeout_seconds,
+            )
+            self._log_strategy_signal(
+                strategy_name=strategy_name,
+                signal_id=stable_event_key(strategy_name, "cycle-timeout", cycle_ts.isoformat()),
+                market_id="",
+                token_id="",
+                final_action=DecisionAction.SKIP.value,
+                reason_code="STAGE_TIMEOUT",
+                extra={"cycle_ts": cycle_ts.isoformat(), "timeout_seconds": timeout_seconds},
+            )
+            return []
 
     def _effective_detection_category(
         self,
@@ -52,6 +124,82 @@ class StrategyEngine:
         if wallet_category:
             return wallet_category
         return "unknown"
+
+    def _live_detection_priority_score(self, detection: DetectionEvent, wallet: WalletMetrics) -> float:
+        category = self._effective_detection_category(detection, wallet)
+        if category in self.config.live.selected_categories:
+            category_score = 2.0
+        elif category in {"", "unknown"}:
+            category_score = 1.0
+        else:
+            category_score = 0.0
+
+        price = float(detection.price or 0.0)
+        preferred_min = float(self.config.live.preferred_entry_price_min)
+        preferred_max = float(self.config.live.preferred_entry_price_max)
+        if preferred_min <= price <= preferred_max:
+            price_score = 1.0
+        elif 0.05 <= price <= 0.90:
+            price_score = 0.55
+        else:
+            price_score = 0.0
+
+        freshness_score = clamp(
+            1.0 - (float(detection.detection_latency_seconds or 0.0) / max(float(self.config.risk.stale_signal_seconds or 1), 1.0)),
+            0.0,
+            1.0,
+        )
+        notional_score = clamp(float(detection.notional or 0.0) / max(self._max_notional_for_mode(), 1.0), 0.0, 1.0)
+        wallet_score = clamp(float(wallet.global_score or 0.0), 0.0, 1.0)
+        return (
+            category_score * 100.0
+            + price_score * 10.0
+            + freshness_score * 5.0
+            + wallet_score * 3.0
+            + notional_score
+        )
+
+    def _prioritize_detections(
+        self,
+        detections: list[DetectionEvent],
+        wallet_map: dict[str, WalletMetrics],
+    ) -> list[DetectionEvent]:
+        if self.config.mode.value != "LIVE":
+            return detections
+
+        def _score(detection: DetectionEvent) -> float:
+            wallet = wallet_map.get(detection.wallet_address)
+            if wallet is None:
+                return -1.0
+            return self._live_detection_priority_score(detection, wallet)
+
+        return sorted(detections, key=_score, reverse=True)
+
+    def _watchlist_token_ids(
+        self,
+        detections: list[DetectionEvent],
+        wallet_map: dict[str, WalletMetrics],
+        *,
+        max_detections: int,
+    ) -> list[str]:
+        token_ids: list[str] = []
+        seen: set[str] = set()
+        for detection in detections:
+            token_id = str(detection.token_id or "").strip()
+            if not token_id or token_id in seen:
+                continue
+            if self.config.mode.value == "LIVE":
+                wallet = wallet_map.get(detection.wallet_address)
+                if wallet is None:
+                    continue
+                category = self._effective_detection_category(detection, wallet)
+                if category not in self.config.live.selected_categories and category not in {"", "unknown"}:
+                    continue
+            token_ids.append(token_id)
+            seen.add(token_id)
+            if len(token_ids) >= self._watchlist_token_limit(max_detections):
+                break
+        return token_ids
 
     def _count_paper_entries_last_hour(self, stored_positions: dict[str, list[dict]], now: datetime) -> int:
         cutoff = now.timestamp() - 3600.0
@@ -188,7 +336,30 @@ class StrategyEngine:
         wallets: list[WalletMetrics],
     ) -> list[TradeDecision]:
         wallet_map = self._wallet_map(wallets)
+        effective_paper_wallets = approved_wallets.paper_wallets or approved_wallets.research_wallets[: self.config.wallet_selection.approved_paper_wallets]
+        effective_live_wallets = approved_wallets.live_wallets or effective_paper_wallets[:1]
         detections, burst_sizes = self._dedupe_wallet_follow_detections(detections)
+        detections = self._prioritize_detections(detections, wallet_map)
+        max_detections = self._max_wallet_follow_detections_per_cycle()
+        wallet_budget = len(effective_live_wallets) if self.config.mode.value == "LIVE" else len(effective_paper_wallets)
+        max_detections = min(max_detections, max(wallet_budget * 2, 3))
+        if len(detections) > max_detections:
+            skipped_count = len(detections) - max_detections
+            self._log_strategy_signal(
+                strategy_name="strategy_engine",
+                signal_id=stable_event_key("strategy_engine", "detection-backlog", datetime.now(timezone.utc).isoformat()),
+                market_id="",
+                token_id="",
+                final_action=DecisionAction.SKIP.value,
+                reason_code="DETECTION_BACKLOG_LIMIT",
+                extra={
+                    "total_detections": len(detections),
+                    "processed_detections": max_detections,
+                    "skipped_detections": skipped_count,
+                    "mode": self.config.mode.value,
+                },
+            )
+            detections = detections[:max_detections]
         clusters = cluster_detections(self.config, detections, self.data_dir)
         cluster_lookup = {(cluster.market_id, cluster.token_id): cluster for cluster in clusters}
         side_wallets, side_notional, market_summary = self._build_signal_consensus_maps(detections)
@@ -212,18 +383,47 @@ class StrategyEngine:
             active_wallet_exposure[wallet_address] = active_wallet_exposure.get(wallet_address, 0.0) + notional
             total_exposure += notional
 
-        await self.market_data.refresh_markets()
-        valid_watchlist_token_ids = sorted(
-            {
-                token_id
-                for token_id in (str(detection.token_id or "").strip() for detection in detections)
-                if token_id
-            }
+        try:
+            await self._await_stage_timeout(
+                stage_name="refresh_markets",
+                coro=self.market_data.refresh_markets(),
+                timeout_seconds=self._stage_timeout_seconds(multiplier=0.3, minimum=4.0, maximum=10.0),
+            )
+        except RuntimeError as exc:
+            logger.warning("Market refresh degraded reason={}", exc)
+            self._log_strategy_signal(
+                strategy_name="strategy_engine",
+                signal_id=stable_event_key("strategy_engine", "market-refresh-timeout", cycle_now.isoformat()),
+                market_id="",
+                token_id="",
+                final_action=DecisionAction.SKIP.value,
+                reason_code="MARKET_REFRESH_TIMEOUT",
+                extra={"cycle_ts": cycle_now.isoformat(), "error": str(exc)},
+            )
+        valid_watchlist_token_ids = self._watchlist_token_ids(
+            detections,
+            wallet_map,
+            max_detections=max_detections,
         )
-        ws_snapshots = await self.market_data.stream_watchlist(valid_watchlist_token_ids) if valid_watchlist_token_ids else {}
-        effective_paper_wallets = approved_wallets.paper_wallets or approved_wallets.research_wallets[: self.config.wallet_selection.approved_paper_wallets]
-        effective_live_wallets = approved_wallets.live_wallets or effective_paper_wallets[:1]
-
+        ws_snapshots: dict[str, dict] = {}
+        if valid_watchlist_token_ids:
+            try:
+                ws_snapshots = await self._await_stage_timeout(
+                    stage_name="stream_watchlist",
+                    coro=self.market_data.stream_watchlist(valid_watchlist_token_ids),
+                    timeout_seconds=self._stage_timeout_seconds(multiplier=0.15, minimum=2.0, maximum=4.0),
+                )
+            except RuntimeError as exc:
+                logger.warning("Market websocket snapshot degraded reason={}", exc)
+                self._log_strategy_signal(
+                    strategy_name="strategy_engine",
+                    signal_id=stable_event_key("strategy_engine", "watchlist-timeout", cycle_now.isoformat()),
+                    market_id="",
+                    token_id="",
+                    final_action=DecisionAction.SKIP.value,
+                    reason_code="WATCHLIST_TIMEOUT",
+                    extra={"cycle_ts": cycle_now.isoformat(), "error": str(exc)},
+                )
         for detection in detections:
             wallet = wallet_map.get(detection.wallet_address)
             if not wallet:
@@ -234,6 +434,45 @@ class StrategyEngine:
             discovery_state = str(state_snapshot.get("wallet_discovery_state", "UNKNOWN"))
             scoring_state = str(state_snapshot.get("wallet_scoring_state", "UNKNOWN"))
             decision_source_quality = min([wallet.source_quality, detection.source_quality], key=quality_rank)
+            if (
+                self.config.mode.value == "LIVE"
+                and decision_category not in {"", "unknown"}
+                and decision_category not in self.config.live.selected_categories
+            ):
+                skip = self._skip_decision(
+                    detection,
+                    wallet,
+                    min(detection.notional * self._select_copy_fraction(wallet), self._max_notional_for_mode()),
+                    "LIVE_CATEGORY_NOT_SELECTED",
+                    "Category is not enabled for live trading.",
+                )
+                skip.context.update(
+                    {
+                        "category": decision_category,
+                        "discovery_state": discovery_state,
+                        "scoring_state": scoring_state,
+                        "source_quality": decision_source_quality.value,
+                        "trust_level": classify_trust_level(
+                            source_quality=decision_source_quality.value,
+                            discovery_state=discovery_state,
+                            scoring_state=scoring_state,
+                            fallback_in_use=decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                        ),
+                        "fallback_used": decision_source_quality == SourceQuality.SYNTHETIC_FALLBACK,
+                        "counts_as_trustworthy_approval": False,
+                    }
+                )
+                self._write_decision_trace(
+                    detection,
+                    skip,
+                    False,
+                    [],
+                    discovery_state,
+                    scoring_state,
+                    decision_source_quality,
+                )
+                decisions.append(skip)
+                continue
             if not str(detection.token_id or "").strip():
                 skip = self._skip_decision(
                     detection,
@@ -270,16 +509,24 @@ class StrategyEngine:
                 continue
             try:
                 try:
-                    market_meta = await self.market_data.fetch_market_metadata(
-                        detection.market_id,
-                        detection.token_id,
-                        detection.market_slug,
-                        str(detection.market_metadata.get("outcome") or ""),
+                    market_meta = await self._await_stage_timeout(
+                        stage_name="fetch_market_metadata",
+                        coro=self.market_data.fetch_market_metadata(
+                            detection.market_id,
+                            detection.token_id,
+                            detection.market_slug,
+                            str(detection.market_metadata.get("outcome") or ""),
+                        ),
+                        timeout_seconds=self._stage_timeout_seconds(multiplier=0.18, minimum=2.5, maximum=5.0),
                     )
                 except TypeError:
-                    market_meta = await self.market_data.fetch_market_metadata(
-                        detection.market_id,
-                        detection.token_id,
+                    market_meta = await self._await_stage_timeout(
+                        stage_name="fetch_market_metadata",
+                        coro=self.market_data.fetch_market_metadata(
+                            detection.market_id,
+                            detection.token_id,
+                        ),
+                        timeout_seconds=self._stage_timeout_seconds(multiplier=0.18, minimum=2.5, maximum=5.0),
                     )
             except RuntimeError as exc:
                 if str(detection.token_id or "").strip() and detection.token_id != "unknown-token":
@@ -356,7 +603,11 @@ class StrategyEngine:
                 decisions.append(skip)
                 continue
             try:
-                tradability = await self.market_data.get_tradability(resolved_market_id, resolved_token_id)
+                tradability = await self._await_stage_timeout(
+                    stage_name="get_tradability",
+                    coro=self.market_data.get_tradability(resolved_market_id, resolved_token_id),
+                    timeout_seconds=self._stage_timeout_seconds(multiplier=0.20, minimum=3.0, maximum=6.0),
+                )
             except RuntimeError as exc:
                 skip = self._skip_decision(
                     detection,
@@ -400,7 +651,11 @@ class StrategyEngine:
                 decisions.append(skip)
                 continue
             try:
-                orderbook = await self.market_data.fetch_orderbook(resolved_token_id)
+                orderbook = await self._await_stage_timeout(
+                    stage_name="fetch_orderbook",
+                    coro=self.market_data.fetch_orderbook(resolved_token_id),
+                    timeout_seconds=self._stage_timeout_seconds(multiplier=0.06, minimum=0.8, maximum=1.5),
+                )
             except RuntimeError as exc:
                 skip = self._skip_decision(
                     detection,
@@ -712,35 +967,63 @@ class StrategyEngine:
             self._write_decision_trace(detection, best_decision, cluster_confirmed, style_evaluations, discovery_state, scoring_state, decision_source_quality)
             decisions.append(best_decision)
         decisions.extend(
-            await self._generate_event_driven_official_decisions(
-                stored_positions=active_positions,
-                total_exposure=total_exposure,
-                active_market_exposure=active_market_exposure,
-                active_wallet_exposure=active_wallet_exposure,
+            await self._run_supplemental_strategy(
+                strategy_name="event_driven_official",
+                coro=self._generate_event_driven_official_decisions(
+                    stored_positions=active_positions,
+                    total_exposure=total_exposure,
+                    active_market_exposure=active_market_exposure,
+                    active_wallet_exposure=active_wallet_exposure,
+                ),
+                cycle_ts=cycle_now,
             )
         )
         decisions.extend(
-            await self._generate_paired_binary_arb_decisions(
-                stored_positions=active_positions,
-                total_exposure=total_exposure,
-                active_market_exposure=active_market_exposure,
-                active_wallet_exposure=active_wallet_exposure,
+            await self._run_supplemental_strategy(
+                strategy_name="paired_binary_arb",
+                coro=self._generate_paired_binary_arb_decisions(
+                    stored_positions=active_positions,
+                    total_exposure=total_exposure,
+                    active_market_exposure=active_market_exposure,
+                    active_wallet_exposure=active_wallet_exposure,
+                ),
+                cycle_ts=cycle_now,
             )
         )
         decisions.extend(
-            await self._generate_correlation_dislocation_decisions(
-                stored_positions=active_positions,
-                total_exposure=total_exposure,
-                active_market_exposure=active_market_exposure,
-                active_wallet_exposure=active_wallet_exposure,
+            await self._run_supplemental_strategy(
+                strategy_name="correlation_dislocation",
+                coro=self._generate_correlation_dislocation_decisions(
+                    stored_positions=active_positions,
+                    total_exposure=total_exposure,
+                    active_market_exposure=active_market_exposure,
+                    active_wallet_exposure=active_wallet_exposure,
+                ),
+                cycle_ts=cycle_now,
             )
         )
         decisions.extend(
-            await self._generate_resolution_window_decisions(
-                stored_positions=active_positions,
-                total_exposure=total_exposure,
-                active_market_exposure=active_market_exposure,
-                active_wallet_exposure=active_wallet_exposure,
+            await self._run_supplemental_strategy(
+                strategy_name="resolution_window",
+                coro=self._generate_resolution_window_decisions(
+                    stored_positions=active_positions,
+                    total_exposure=total_exposure,
+                    active_market_exposure=active_market_exposure,
+                    active_wallet_exposure=active_wallet_exposure,
+                ),
+                cycle_ts=cycle_now,
+            )
+        )
+        decisions.extend(
+            await self._run_supplemental_strategy(
+                strategy_name="lag_signal",
+                coro=self._generate_lag_signal_decisions(
+                    stored_positions=active_positions,
+                    total_exposure=total_exposure,
+                    active_market_exposure=active_market_exposure,
+                    active_wallet_exposure=active_wallet_exposure,
+                ),
+                cycle_ts=cycle_now,
             )
         )
         if self.config.mode.value == "LIVE":
@@ -804,6 +1087,105 @@ class StrategyEngine:
         if normalized == "sports":
             return 0.15
         return 0.45
+
+    def _paired_binary_scan_limit(self) -> int:
+        if self.config.mode.value == "LIVE":
+            return max(int(self.config.strategies.paired_binary_max_candidates_per_cycle) * 4, 8)
+        return max(int(self.config.strategies.paired_binary_max_candidates_per_cycle) * 8, 24)
+
+    def _paired_binary_rough_priority(
+        self,
+        yes_market: MarketInfo,
+        no_market: MarketInfo,
+        category: str,
+    ) -> float:
+        liquidity_score = clamp(min(float(yes_market.liquidity or 0.0), float(no_market.liquidity or 0.0)) / 5000.0, 0.0, 1.0)
+        volume_score = clamp(min(float(yes_market.volume or 0.0), float(no_market.volume or 0.0)) / 10000.0, 0.0, 1.0)
+        return self._live_category_priority(category) * 10.0 + liquidity_score * 3.0 + volume_score
+
+    async def _evaluate_paired_binary_candidate(
+        self,
+        *,
+        market_id: str,
+        yes_market: MarketInfo,
+        no_market: MarketInfo,
+        category: str,
+        bundle_budget: float,
+        min_leg: float,
+        max_leg: float,
+        now: datetime,
+    ) -> dict[str, object] | None:
+        try:
+            yes_orderbook, no_orderbook = await asyncio.gather(
+                self.market_data.fetch_orderbook(yes_market.token_id),
+                self.market_data.fetch_orderbook(no_market.token_id),
+            )
+        except Exception:
+            return None
+        if not yes_orderbook.asks or not no_orderbook.asks:
+            return None
+        yes_ask = float(yes_orderbook.asks[0].price or 0.0)
+        no_ask = float(no_orderbook.asks[0].price or 0.0)
+        yes_size = float(yes_orderbook.asks[0].size or 0.0)
+        no_size = float(no_orderbook.asks[0].size or 0.0)
+        if yes_ask <= 0 or no_ask <= 0:
+            return None
+        if not (min_leg <= yes_ask <= max_leg and min_leg <= no_ask <= max_leg):
+            return None
+        yes_age_seconds = max((now - yes_orderbook.timestamp).total_seconds(), 0.0)
+        no_age_seconds = max((now - no_orderbook.timestamp).total_seconds(), 0.0)
+        if max(yes_age_seconds, no_age_seconds) > float(self.config.risk.stale_market_data_seconds):
+            return None
+        yes_depth = yes_ask * yes_size
+        no_depth = no_ask * no_size
+        min_depth = min(yes_depth, no_depth)
+        if min_depth < max(self.config.risk.min_orderbook_depth_usd * 0.5, 10.0):
+            return None
+        bundle_sum_ask = yes_ask + no_ask
+        gross_edge_pct = round(1.0 - bundle_sum_ask, 6)
+        if gross_edge_pct < float(self.config.strategies.paired_binary_min_edge_pct):
+            return None
+        fee_yes = self._paired_binary_fee_amount(yes_ask, category)
+        fee_no = self._paired_binary_fee_amount(no_ask, category)
+        slippage_buffer = float(self.config.strategies.paired_binary_slippage_buffer_pct)
+        net_edge_pct = round(gross_edge_pct - fee_yes - fee_no - slippage_buffer, 6)
+        if net_edge_pct < float(self.config.strategies.paired_binary_min_net_edge_pct):
+            return None
+        max_best_level_fraction = clamp(float(self.config.strategies.paired_binary_max_best_level_fraction), 0.01, 1.0)
+        max_bundle_shares_from_depth = min(yes_size, no_size) * max_best_level_fraction
+        max_bundle_shares_from_budget = bundle_budget / max(bundle_sum_ask, 1e-6)
+        min_bundle_shares = self._paired_binary_min_bundle_shares(yes_ask, no_ask)
+        bundle_shares = round(min(max_bundle_shares_from_depth, max_bundle_shares_from_budget), 6)
+        if bundle_shares < min_bundle_shares:
+            return None
+        yes_notional = round(bundle_shares * yes_ask, 6)
+        no_notional = round(bundle_shares * no_ask, 6)
+        return {
+            "market_id": market_id,
+            "yes_market": yes_market,
+            "no_market": no_market,
+            "yes_ask": yes_ask,
+            "no_ask": no_ask,
+            "bundle_sum_ask": round(bundle_sum_ask, 6),
+            "gross_edge_pct": gross_edge_pct,
+            "net_edge_pct": net_edge_pct,
+            "fee_yes": fee_yes,
+            "fee_no": fee_no,
+            "slippage_buffer": slippage_buffer,
+            "min_depth": round(min_depth, 6),
+            "bundle_shares": bundle_shares,
+            "min_bundle_shares": min_bundle_shares,
+            "yes_notional": yes_notional,
+            "no_notional": no_notional,
+            "category": category,
+            "score": self._paired_binary_candidate_score(
+                net_edge_pct=net_edge_pct,
+                min_depth_usd=min_depth,
+                yes_ask=yes_ask,
+                no_ask=no_ask,
+                category=category,
+            ),
+        }
 
     def _stale_signal_threshold_seconds(
         self,
@@ -1257,6 +1639,54 @@ class StrategyEngine:
             return "NO"
         return ""
 
+    def _is_crypto_category(self, category: str) -> bool:
+        normalized = str(category or "").strip().lower()
+        return normalized == "crypto price" or "crypto" in normalized
+
+    def _paired_binary_fee_amount(self, price: float, category: str) -> float:
+        if not self._is_crypto_category(category):
+            return 0.0
+        clipped_price = clamp(float(price or 0.0), 0.01, 0.99)
+        fee_rate = 0.25
+        exponent = 2
+        return round(clipped_price * fee_rate * pow(clipped_price * (1.0 - clipped_price), exponent), 6)
+
+    def _paired_binary_min_bundle_shares(self, yes_ask: float, no_ask: float) -> float:
+        min_shares = 1.0
+        if self.config.mode.value != "LIVE":
+            return min_shares
+        min_shares = max(min_shares, float(self.config.live.minimum_order_size_shares or 0.0))
+        min_notional = float(self.config.live.minimum_order_notional_usd or 0.0)
+        if min_notional > 0:
+            min_shares = max(
+                min_shares,
+                min_notional / max(yes_ask, 1e-6),
+                min_notional / max(no_ask, 1e-6),
+            )
+        return round(min_shares, 6)
+
+    def _paired_binary_candidate_score(
+        self,
+        *,
+        net_edge_pct: float,
+        min_depth_usd: float,
+        yes_ask: float,
+        no_ask: float,
+        category: str,
+    ) -> float:
+        min_net_edge = max(float(self.config.strategies.paired_binary_min_net_edge_pct), 0.001)
+        edge_score = clamp(net_edge_pct / max(min_net_edge * 2.0, 0.01), 0.0, 1.0)
+        depth_score = clamp(min_depth_usd / 50.0, 0.0, 1.0)
+        leg_balance_score = clamp(1.0 - abs(yes_ask - no_ask), 0.0, 1.0)
+        category_priority = self._live_category_priority(category) if self.config.mode.value == "LIVE" else 0.5
+        return round(
+            edge_score * 0.55
+            + depth_score * 0.2
+            + leg_balance_score * 0.15
+            + category_priority * 0.1,
+            6,
+        )
+
     def _has_conflicting_market_position(
         self,
         active_positions: list[dict],
@@ -1429,6 +1859,8 @@ class StrategyEngine:
             return self.config.strategies.correlation_live_enabled
         if strategy_name == "resolution_window":
             return self.config.strategies.resolution_window_live_enabled
+        if strategy_name == "lag_signal":
+            return self.config.lag_signal.live_enabled
         return False
 
     def _official_signal_confidence(
@@ -1677,7 +2109,7 @@ class StrategyEngine:
             market_exposure=active_market_exposure.get(market_id, 0.0),
             wallet_exposure=active_wallet_exposure.get(wallet.wallet_address, 0.0),
             daily_pnl=self.state.read().get("daily_pnl", 0.0),
-            cluster_confirmed=False,
+            cluster_confirmed=True,  # Supplemental strategies have own validation; bypass wallet-cluster gate
             infra_ok=bool(market_meta.get("active", True)) and not self.state.read().get("paused", False),
             entry_style_allowed=True,
             category=category,
@@ -1745,7 +2177,7 @@ class StrategyEngine:
             token_id=token_id,
             entry_style=EntryStyle.PASSIVE_LIMIT,
             category=category,
-            scaled_notional=round(scaled_notional, 4),
+            scaled_notional=round(scaled_notional, 6 if thesis_type == "paired_arb" else 4),
             source_price=source_price,
             executable_price=fill.executable_price or best_ask,
             cluster_confirmed=False,
@@ -1829,6 +2261,185 @@ class StrategyEngine:
             extra={"confidence_score": confidence_score, **extra_context},
         )
         return decision
+
+    async def _generate_lag_signal_decisions(
+        self,
+        *,
+        stored_positions: list[dict],
+        total_exposure: float,
+        active_market_exposure: dict[str, float],
+        active_wallet_exposure: dict[str, float],
+    ) -> list[TradeDecision]:
+        """
+        Oracle-aligned lag arbitrage strategy.
+
+        Fires when the Polymarket CLOB price lags a Chainlink-consistent
+        move from the Binance feed, net of fees and spread.  Only applies
+        to crypto-price YES/NO markets.
+        """
+        if not self.config.lag_signal.enabled:
+            return []
+
+        rtds_client = get_rtds_client()
+        if rtds_client is None:
+            return []
+        rtds = rtds_client.snapshot()
+
+        # Quick pre-check: if RTDS is completely dead, don't bother
+        if rtds.staleness_seconds() > self.config.rtds.staleness_max_seconds * 5:
+            self._log_strategy_signal(
+                strategy_name="lag_signal",
+                signal_id=stable_event_key("lag_signal", "rtds-stale", datetime.now(timezone.utc).isoformat()),
+                market_id="",
+                token_id="",
+                final_action=DecisionAction.SKIP.value,
+                reason_code="RTDS_UNAVAILABLE",
+                extra={"rtds_staleness_seconds": round(rtds.staleness_seconds(), 2)},
+            )
+            return []
+
+        lag_cfg = _LagSignalCfg(
+            min_price_divergence_pct=self.config.lag_signal.min_price_divergence_pct,
+            min_spot_move_pct=self.config.lag_signal.min_spot_move_pct,
+            rtds_staleness_max_seconds=self.config.rtds.staleness_max_seconds,
+            clob_staleness_max_seconds=self.config.rtds.clob_staleness_max_seconds,
+            min_net_edge_taker=self.config.lag_signal.min_net_edge_taker,
+            min_net_edge_maker=self.config.lag_signal.min_net_edge_maker,
+            min_lag_ms=self.config.lag_signal.min_lag_ms,
+            min_time_remaining_seconds=self.config.lag_signal.min_time_remaining_seconds,
+        )
+
+        now = datetime.now(timezone.utc)
+        entries_last_hour = self._actual_entries_last_hour(self.positions.load(), now)
+        max_candidates = max(int(self.config.lag_signal.max_candidates_per_cycle), 1)
+
+        # Group crypto-price markets by market_id to find YES/NO pairs
+        grouped: dict[str, list[MarketInfo]] = {}
+        for market in self.market_data.token_cache.values():
+            if not market.active or market.closed:
+                continue
+            if not self._is_crypto_category(market.category or ""):
+                continue
+            grouped.setdefault(market.market_id, []).append(market)
+
+        decisions: list[TradeDecision] = []
+        cycle_ts = now
+
+        for market_id, markets in grouped.items():
+            if len(decisions) >= max_candidates:
+                break
+            if len(markets) != 2:
+                continue
+            outcome_map = {self._binary_outcome_side(market.title): market for market in markets}
+            yes_market = outcome_map.get("YES")
+            no_market = outcome_map.get("NO")
+            if yes_market is None or no_market is None:
+                continue
+            if self.config.mode.value == "LIVE" and market_id not in (self.config.live.selected_categories or []):
+                pass  # category check below is sufficient
+
+            # Parse time remaining
+            end_at = None
+            for m in (yes_market, no_market):
+                if m.end_date_iso:
+                    try:
+                        end_at = datetime.fromisoformat(m.end_date_iso.replace("Z", "+00:00"))
+                        break
+                    except ValueError:
+                        pass
+            if end_at is None or end_at <= now:
+                continue
+            time_remaining_seconds = (end_at - now).total_seconds()
+            if time_remaining_seconds < self.config.lag_signal.min_time_remaining_seconds:
+                continue
+
+            # Track reference "start price" for this market (first-seen Chainlink price)
+            start_price = self._lag_start_prices.get(market_id, 0.0)
+            if start_price <= 0 and rtds.chainlink_price > 0:
+                self._lag_start_prices[market_id] = rtds.chainlink_price
+                start_price = rtds.chainlink_price
+
+            # Fetch both orderbooks concurrently
+            try:
+                yes_ob, no_ob = await asyncio.gather(
+                    self.market_data.fetch_orderbook(yes_market.token_id),
+                    self.market_data.fetch_orderbook(no_market.token_id),
+                )
+            except RuntimeError:
+                continue
+
+            yes_ask = yes_ob.asks[0].price if yes_ob.asks else 0.0
+            no_ask = no_ob.asks[0].price if no_ob.asks else 0.0
+            if yes_ask <= 0 or no_ask <= 0:
+                continue
+
+            clob_ts_epoch = yes_ob.timestamp.timestamp()
+            realized_vol_per_second = 0.005  # ~0.3%/min, typical for BTC in a 5-min window
+
+            sig = evaluate_lag_signal(
+                rtds=rtds,
+                start_price=start_price,
+                time_remaining_seconds=time_remaining_seconds,
+                realized_vol_per_second=realized_vol_per_second,
+                yes_ask=yes_ask,
+                no_ask=no_ask,
+                yes_token_id=yes_market.token_id,
+                no_token_id=no_market.token_id,
+                clob_timestamp_epoch=clob_ts_epoch,
+                category="crypto price",
+                is_taker=True,
+                config=lag_cfg,
+            )
+
+            signal_id = stable_event_key("lag_signal", market_id, cycle_ts.isoformat())
+
+            if not sig.fire:
+                self._log_strategy_signal(
+                    strategy_name="lag_signal",
+                    signal_id=signal_id,
+                    market_id=market_id,
+                    token_id=sig.token_id or yes_market.token_id,
+                    final_action=DecisionAction.SKIP.value,
+                    reason_code=sig.skip_reason or "NO_SIGNAL",
+                    extra=sig.to_dict(),
+                )
+                continue
+
+            # Signal fires — build a trade decision
+            fire_token_id = sig.token_id
+            fire_market = yes_market if fire_token_id == yes_market.token_id else no_market
+            market_title = fire_market.title
+            source_price = sig.executable_price
+            fair_price = sig.estimated_fair_p
+            scaled_notional = min(self._max_notional_for_mode(), self.config.risk.max_single_live_trade_usd if self.config.mode.value == "LIVE" else self._max_notional_for_mode())
+            confidence_score = round(clamp(sig.net_edge / max(self.config.lag_signal.min_net_edge_taker * 2.0, 0.01), 0.0, 1.0), 4)
+
+            decision = await self._build_supplemental_decision(
+                strategy_name="lag_signal",
+                signal_id=signal_id,
+                market_id=market_id,
+                token_id=fire_token_id,
+                category="crypto price",
+                market_title=market_title,
+                source_price=source_price,
+                fair_price=fair_price,
+                scaled_notional=scaled_notional,
+                reason=f"Oracle-lag arb: side={sig.side} net_edge={sig.net_edge:.4f} lag_ms={sig.lag_ms:.0f}ms div_pct={sig.price_divergence_pct:.4f}",
+                confidence_score=confidence_score,
+                extra_context={
+                    "lag_signal": sig.to_dict(),
+                    "time_remaining_seconds": round(time_remaining_seconds, 1),
+                },
+                stored_positions=stored_positions,
+                total_exposure=total_exposure,
+                active_market_exposure=active_market_exposure,
+                active_wallet_exposure=active_wallet_exposure,
+                entries_last_hour_override=entries_last_hour,
+                age_seconds=rtds.staleness_seconds(),
+            )
+            decisions.append(decision)
+
+        return decisions
 
     async def _generate_event_driven_official_decisions(
         self,
@@ -2000,7 +2611,10 @@ class StrategyEngine:
                 continue
             grouped.setdefault(market.market_id, []).append(market)
 
-        best_candidate: dict[str, object] | None = None
+        min_leg = float(self.config.strategies.paired_binary_min_leg_price)
+        max_leg = float(self.config.strategies.paired_binary_max_leg_price)
+        bundle_budget = max(self._max_notional_for_mode(), 1.0)
+        grouped_candidates: list[tuple[float, str, MarketInfo, MarketInfo, str]] = []
         for market_id, markets in grouped.items():
             if len(markets) != 2:
                 continue
@@ -2009,49 +2623,40 @@ class StrategyEngine:
             no_market = outcome_map.get("NO")
             if yes_market is None or no_market is None:
                 continue
-            try:
-                yes_orderbook = await self.market_data.fetch_orderbook(yes_market.token_id)
-                no_orderbook = await self.market_data.fetch_orderbook(no_market.token_id)
-            except Exception:
-                continue
-            if not yes_orderbook.asks or not no_orderbook.asks:
-                continue
-            yes_ask = float(yes_orderbook.asks[0].price or 0.0)
-            no_ask = float(no_orderbook.asks[0].price or 0.0)
-            if yes_ask <= 0 or no_ask <= 0:
-                continue
-            min_leg = float(self.config.strategies.paired_binary_min_leg_price)
-            max_leg = float(self.config.strategies.paired_binary_max_leg_price)
-            if not (min_leg <= yes_ask <= max_leg and min_leg <= no_ask <= max_leg):
-                continue
             category = str(yes_market.category or no_market.category or "unknown")
             if category == "sports":
                 continue
-            yes_depth = yes_ask * float(yes_orderbook.asks[0].size or 0.0)
-            no_depth = no_ask * float(no_orderbook.asks[0].size or 0.0)
-            min_depth = min(yes_depth, no_depth)
-            if min_depth < max(self.config.risk.min_orderbook_depth_usd * 0.5, 10.0):
+            if self.config.mode.value == "LIVE" and category not in self.config.live.selected_categories:
                 continue
-            bundle_sum_ask = yes_ask + no_ask
-            locked_edge_pct = round(1.0 - bundle_sum_ask, 6)
-            if locked_edge_pct < float(self.config.strategies.paired_binary_min_edge_pct):
-                continue
-            candidate = {
-                "market_id": market_id,
-                "yes_market": yes_market,
-                "no_market": no_market,
-                "yes_ask": yes_ask,
-                "no_ask": no_ask,
-                "bundle_sum_ask": round(bundle_sum_ask, 6),
-                "locked_edge_pct": locked_edge_pct,
-                "min_depth": round(min_depth, 6),
-                "category": category,
-                "score": round(locked_edge_pct * 0.75 + clamp(min_depth / 50.0, 0.0, 1.0) * 0.25, 6),
-            }
-            if best_candidate is None or float(candidate["score"]) > float(best_candidate["score"]):
-                best_candidate = candidate
+            grouped_candidates.append(
+                (
+                    self._paired_binary_rough_priority(yes_market, no_market, category),
+                    market_id,
+                    yes_market,
+                    no_market,
+                    category,
+                )
+            )
 
-        if best_candidate is None:
+        scan_candidates = sorted(grouped_candidates, key=lambda item: item[0], reverse=True)[: self._paired_binary_scan_limit()]
+        evaluated_candidates = await asyncio.gather(
+            *[
+                self._evaluate_paired_binary_candidate(
+                    market_id=market_id,
+                    yes_market=yes_market,
+                    no_market=no_market,
+                    category=category,
+                    bundle_budget=bundle_budget,
+                    min_leg=min_leg,
+                    max_leg=max_leg,
+                    now=now,
+                )
+                for _, market_id, yes_market, no_market, category in scan_candidates
+            ]
+        )
+        candidates = [candidate for candidate in evaluated_candidates if candidate is not None]
+
+        if not candidates:
             self._log_strategy_signal(
                 strategy_name="paired_binary_arb",
                 signal_id=stable_event_key("paired_binary_arb", "cycle-empty", now.isoformat()),
@@ -2063,70 +2668,76 @@ class StrategyEngine:
             )
             return []
 
-        yes_market = best_candidate["yes_market"]
-        no_market = best_candidate["no_market"]
-        yes_market = yes_market if isinstance(yes_market, MarketInfo) else None
-        no_market = no_market if isinstance(no_market, MarketInfo) else None
-        if yes_market is None or no_market is None:
-            return []
-
-        pair_title = yes_market.title.rsplit(" [", 1)[0]
-        bundle_id = stable_event_key("paired_binary_arb", best_candidate["market_id"], now.isoformat())
-        half_trade_budget = max(self._max_notional_for_mode() / 2.0, 1.0)
-        per_leg_notional = round(min(half_trade_budget, float(best_candidate["min_depth"]) * 0.5), 4)
-        confidence_score = round(
-            clamp(
-                float(best_candidate["locked_edge_pct"]) / max(float(self.config.strategies.paired_binary_min_edge_pct) * 2.0, 0.01),
-                0.0,
-                1.0,
-            ),
-            4,
-        )
-        common_context = {
-            "strategy_rationale": f"Paired binary arbitrage detected with combined ask {float(best_candidate['bundle_sum_ask']):.3f}.",
-            "paired_market_title": pair_title,
-            "bundle_sum_ask": float(best_candidate["bundle_sum_ask"]),
-            "bundle_locked_edge_pct": float(best_candidate["locked_edge_pct"]),
-            "paired_leg_prices": {
-                yes_market.token_id: float(best_candidate["yes_ask"]),
-                no_market.token_id: float(best_candidate["no_ask"]),
-            },
-            "paired_min_depth_usd": float(best_candidate["min_depth"]),
-        }
         decisions: list[TradeDecision] = []
-        for market, role, paired_market, source_price in (
-            (yes_market, "paired_yes", no_market, float(best_candidate["yes_ask"])),
-            (no_market, "paired_no", yes_market, float(best_candidate["no_ask"])),
-        ):
-            decision = await self._build_supplemental_decision(
-                strategy_name="paired_binary_arb",
-                signal_id=stable_event_key(bundle_id, market.token_id, role),
-                market_id=market.market_id,
-                token_id=market.token_id,
-                category=str(best_candidate["category"]),
-                market_title=market.title,
-                source_price=source_price,
-                fair_price=min(0.99, max(source_price + float(best_candidate["locked_edge_pct"]), source_price)),
-                scaled_notional=per_leg_notional,
-                reason="Paired yes/no asks imply a positive locked edge after conservative buffers.",
-                confidence_score=confidence_score,
-                extra_context={
-                    **common_context,
-                    "paired_leg_role": role,
-                    "paired_token_id": paired_market.token_id,
-                },
-                stored_positions=stored_positions,
-                total_exposure=total_exposure,
-                active_market_exposure=active_market_exposure,
-                active_wallet_exposure=active_wallet_exposure,
-                entries_last_hour_override=entries_last_hour,
-                age_seconds=0.0,
-                thesis_type="paired_arb",
-                bundle_id=bundle_id,
-                bundle_role=role,
-                paired_token_id=paired_market.token_id,
+        ranked_candidates = sorted(candidates, key=lambda item: float(item["score"]), reverse=True)
+        for index, candidate in enumerate(ranked_candidates[: max(int(self.config.strategies.paired_binary_max_candidates_per_cycle), 1)]):
+            yes_market = candidate["yes_market"]
+            no_market = candidate["no_market"]
+            yes_market = yes_market if isinstance(yes_market, MarketInfo) else None
+            no_market = no_market if isinstance(no_market, MarketInfo) else None
+            if yes_market is None or no_market is None:
+                continue
+
+            pair_title = yes_market.title.rsplit(" [", 1)[0]
+            bundle_id = stable_event_key("paired_binary_arb", candidate["market_id"], str(index), now.isoformat())
+            confidence_score = round(
+                clamp(
+                    float(candidate["net_edge_pct"]) / max(float(self.config.strategies.paired_binary_min_net_edge_pct) * 2.0, 0.01),
+                    0.0,
+                    1.0,
+                ),
+                4,
             )
-            decisions.append(decision)
+            common_context = {
+                "strategy_rationale": f"Paired yes/no asks imply a positive executable net edge after fees and buffers ({float(candidate['net_edge_pct']):.3f}).",
+                "selection_thesis": "paired_full_set_parity",
+                "signal_quality_score": clamp(float(candidate["score"]), 0.0, 1.0),
+                "paired_market_title": pair_title,
+                "bundle_sum_ask": float(candidate["bundle_sum_ask"]),
+                "bundle_gross_edge_pct": float(candidate["gross_edge_pct"]),
+                "bundle_net_edge_pct": float(candidate["net_edge_pct"]),
+                "bundle_fee_estimate": round(float(candidate["fee_yes"]) + float(candidate["fee_no"]), 6),
+                "bundle_slippage_buffer_pct": float(candidate["slippage_buffer"]),
+                "bundle_shares": float(candidate["bundle_shares"]),
+                "paired_leg_prices": {
+                    yes_market.token_id: float(candidate["yes_ask"]),
+                    no_market.token_id: float(candidate["no_ask"]),
+                },
+                "paired_min_depth_usd": float(candidate["min_depth"]),
+            }
+            for market, role, paired_market, source_price, scaled_notional in (
+                (yes_market, "paired_yes", no_market, float(candidate["yes_ask"]), float(candidate["yes_notional"])),
+                (no_market, "paired_no", yes_market, float(candidate["no_ask"]), float(candidate["no_notional"])),
+            ):
+                decision = await self._build_supplemental_decision(
+                    strategy_name="paired_binary_arb",
+                    signal_id=stable_event_key(bundle_id, market.token_id, role),
+                    market_id=market.market_id,
+                    token_id=market.token_id,
+                    category=str(candidate["category"]),
+                    market_title=market.title,
+                    source_price=source_price,
+                    fair_price=min(0.99, max(source_price + float(candidate["net_edge_pct"]), source_price)),
+                    scaled_notional=scaled_notional,
+                    reason="Paired yes/no asks imply a positive net locked edge after fees and execution buffers.",
+                    confidence_score=confidence_score,
+                    extra_context={
+                        **common_context,
+                        "paired_leg_role": role,
+                        "paired_token_id": paired_market.token_id,
+                    },
+                    stored_positions=stored_positions,
+                    total_exposure=total_exposure,
+                    active_market_exposure=active_market_exposure,
+                    active_wallet_exposure=active_wallet_exposure,
+                    entries_last_hour_override=entries_last_hour,
+                    age_seconds=0.0,
+                    thesis_type="paired_arb",
+                    bundle_id=bundle_id,
+                    bundle_role=role,
+                    paired_token_id=paired_market.token_id,
+                )
+                decisions.append(decision)
         return decisions
 
     async def _generate_correlation_dislocation_decisions(
