@@ -307,13 +307,19 @@ class WalletDiscoveryService:
         buy_count = 0
         sell_count = 0
 
+        _short_dur_kws = ("updown-5m", "updown-1m", "updown-15m", "updown-30m",
+                          "up-or-down", "up or down", "5-minute", "1-minute",
+                          "15-minute", "30-minute", "5min", "1min",
+                          "intraday-price", "price-up", "price-down")
+        short_duration_count = 0
         for row in activities:
             price = float(row.get("price") or row.get("outcomePrice") or 0.5)
             size = float(row.get("size") or row.get("amount") or row.get("shares") or 10.0)
             timestamp = self._parse_timestamp(row.get("timestamp") or row.get("time"))
             side = str(row.get("side") or row.get("type") or "BUY").upper()
             market_id = str(row.get("market_id") or row.get("conditionId") or row.get("market") or "")
-            category = str(row.get("category") or getattr(market_by_id.get(market_id, None), "category", "unknown"))
+            market_obj = market_by_id.get(market_id)
+            category = str(row.get("category") or getattr(market_obj, "category", None) or "unknown")
             if category == "unknown":
                 category = categories[len(parsed) % len(categories)]
             category_counter[category] += 1
@@ -323,6 +329,11 @@ class WalletDiscoveryService:
                 buy_count += 1
             else:
                 sell_count += 1
+            # Track short-duration market trades for scoring penalty
+            _title = str(row.get("title") or getattr(market_obj, "title", None) or "").lower()
+            _slug = str(row.get("slug") or getattr(market_obj, "slug", None) or "").lower()
+            if any(kw in _title or kw in _slug for kw in _short_dur_kws):
+                short_duration_count += 1
             parsed.append({"timestamp": timestamp, "price": price, "size": size, "side": side, "category": category})
 
         parsed.sort(key=lambda item: item["timestamp"])
@@ -339,6 +350,7 @@ class WalletDiscoveryService:
         holding_hours = self._holding_time_estimate(parsed)
         drawdown_proxy = clamp(1.0 - max(pnl_proxy + 0.5, 0.0), 0.0, 1.0)
         low_velocity_score = clamp(1.0 - trades_per_day / 5.0, 0.0, 1.0)
+        short_duration_rate = short_duration_count / max(trade_count, 1)
         copyability_score = clamp(
             0.35 * low_velocity_score
             + 0.20 * win_rate
@@ -348,6 +360,8 @@ class WalletDiscoveryService:
             0.0,
             1.0,
         )
+        if short_duration_rate > 0.3:
+            copyability_score = clamp(copyability_score * (1.0 - short_duration_rate * 0.8), 0.0, 1.0)
         delay_base = clamp(copyability_score * 0.9 + low_velocity_score * 0.1, 0.0, 1.0)
 
         return WalletMetrics(
