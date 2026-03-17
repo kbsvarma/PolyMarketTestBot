@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -109,3 +110,28 @@ def test_trade_monitor_inferrs_oscars_as_entertainment(tmp_path: Path) -> None:
 
     assert detection is not None
     assert detection.category == "entertainment / pop culture"
+
+
+def test_trade_monitor_poll_wallets_times_out_safely(tmp_path: Path) -> None:
+    monitor = _monitor(tmp_path)
+    monitor.config.mode = Mode.LIVE
+    monitor._wallet_poll_timeout_seconds = lambda: 0.1  # type: ignore[method-assign]
+
+    async def _slow_fetch(_wallet: str, limit: int = 20):  # noqa: ARG001
+        await asyncio.sleep(2)
+        return [
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "market_id": "m1",
+                "token_id": "t1",
+                "side": "BUY",
+                "price": 0.5,
+                "size": 10,
+            }
+        ]
+
+    monitor.client.fetch_wallet_activity = _slow_fetch  # type: ignore[method-assign]
+
+    detections = asyncio.run(monitor.poll_wallets(["0xabc"]))
+
+    assert detections == []

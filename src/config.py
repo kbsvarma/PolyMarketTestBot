@@ -117,6 +117,10 @@ class LiveConfig(BaseModel):
     strong_winner_profit_pct: float = 0.35
     strong_winner_retrace_pct: float = 0.20
     paired_arb_time_stop_hours: int = 168
+    # Binary prediction market exit rules — wide by design since price moves
+    # are noise before resolution; premature exits were the #1 PnL destroyer.
+    binary_stop_loss_pct: float = 0.45   # only exit on a genuine directional collapse
+    binary_time_stop_hours: int = 168    # 7 days; most markets resolve within that window
 
 
 class StrategyConfig(BaseModel):

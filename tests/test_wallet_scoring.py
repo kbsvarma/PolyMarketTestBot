@@ -47,7 +47,7 @@ def test_select_wallets_uses_operator_live_wallet_count_override() -> None:
     approved = service.select_wallets(scoring, [{"wallet_address": f"0x{i}", "expectancy": 0.02} for i in range(6)])
 
     assert len(approved.live_wallets) == 5
-    assert approved.live_wallets == approved.paper_wallets
+    assert approved.live_wallets == approved.paper_wallets[:5]
 
 
 def test_select_wallets_uses_configured_live_wallet_count_when_no_override() -> None:
@@ -64,3 +64,24 @@ def test_select_wallets_uses_configured_live_wallet_count_when_no_override() -> 
     approved = service.select_wallets(scoring, [{"wallet_address": f"0x{i}", "expectancy": 0.02} for i in range(4)])
 
     assert len(approved.live_wallets) == 2
+
+
+def test_select_wallets_live_mode_backfills_near_pass_wallets() -> None:
+    config = _config()
+    service = WalletScoringService(config, Path("/tmp"))
+    wallets = [
+        _wallet("0x0", copyability=0.60, delay=0.51),
+        _wallet("0x1", copyability=0.53, delay=0.44),
+        _wallet("0x2", copyability=0.57, delay=0.48),
+        _wallet("0x3", copyability=0.51, delay=0.43),
+        _wallet("0x4", copyability=0.51, delay=0.43),
+    ]
+    for index, wallet in enumerate(wallets):
+        wallet.global_score = 0.55 - index * 0.03
+    scoring = WalletScoringResult(scored_wallets=wallets, state="SUCCESS", source_quality=SourceQuality.REAL_PUBLIC_DATA)
+
+    approved = service.select_wallets(scoring, [{"wallet_address": f"0x{i}", "expectancy": 0.02} for i in range(5)])
+
+    assert len(approved.paper_wallets) == 5
+    assert len(approved.live_wallets) == 5
+    assert approved.live_wallets == approved.paper_wallets

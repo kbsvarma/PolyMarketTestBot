@@ -103,3 +103,54 @@ def test_wallet_discovery_research_fallback_is_labeled(monkeypatch) -> None:
     assert result.wallets
     assert result.source_quality == SourceQuality.SYNTHETIC_FALLBACK
     assert result.state == DiscoveryState.SYNTHETIC_FALLBACK_USED
+
+
+def test_wallet_discovery_times_out_source_and_continues(monkeypatch) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.yaml", root / ".env.example").model_copy(update={"mode": Mode.PAPER})
+    service = WalletDiscoveryService(config, root / "data")
+
+    monkeypatch.setattr(service, "_source_timeout_seconds", lambda name: 0.1)
+
+    async def fake_slow_leaderboard(limit: int = 20):
+        await asyncio.sleep(0.25)
+        return [{"wallet_address": "0xslow"}]
+
+    async def fake_empty(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(service.client, "fetch_leaderboard", fake_slow_leaderboard)
+    monkeypatch.setattr(service.client, "fetch_markets", fake_empty)
+    monkeypatch.setattr(service.client, "fetch_recent_public_activity", fake_empty)
+
+    result = asyncio.run(service.run_discovery_cycle())
+    assert result.state == DiscoveryState.FETCH_FAILED
+    assert not result.wallets
+    assert any(entry.get("error") == "leaderboard timed out." for entry in result.diagnostics.get("sources", []))
+
+
+def test_wallet_discovery_limits_candidate_activity_fetches(monkeypatch) -> None:
+    root = Path(__file__).resolve().parent.parent
+    config = load_config(root / "config.yaml", root / ".env.example").model_copy(update={"mode": Mode.PAPER})
+    service = WalletDiscoveryService(config, root / "data")
+
+    async def fake_leaderboard(limit: int = 20):
+        return [{"wallet_address": f"0xabc{idx:02d}", "volume": 10 + idx, "activity_count": 2} for idx in range(30)]
+
+    async def fake_empty(*args, **kwargs):
+        return []
+
+    seen_wallets: list[str] = []
+
+    async def fake_activity(wallet_address: str, limit: int = 80):
+        seen_wallets.append(wallet_address)
+        return _activity_rows(20)
+
+    monkeypatch.setattr(service.client, "fetch_leaderboard", fake_leaderboard)
+    monkeypatch.setattr(service.client, "fetch_markets", fake_empty)
+    monkeypatch.setattr(service.client, "fetch_recent_public_activity", fake_empty)
+    monkeypatch.setattr(service.client, "fetch_wallet_activity", fake_activity)
+
+    result = asyncio.run(service.run_discovery_cycle())
+    assert result.wallets
+    assert len(seen_wallets) == service._candidate_activity_limit()

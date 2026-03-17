@@ -210,6 +210,8 @@ class PaperTradingEngine:
                 position,
                 position.current_mark_price,
                 hold_to_resolution=position.thesis_type == "paired_arb",
+                stop_loss_pct=self.config.live.binary_stop_loss_pct,
+                time_stop_hours=self.config.live.binary_time_stop_hours,
                 profit_arm_pct=self.config.live.adaptive_profit_arm_pct,
                 min_profit_lock_pct=self.config.live.adaptive_profit_min_lock_pct,
                 trailing_profit_retrace_pct=self.config.live.trailing_profit_retrace_pct,

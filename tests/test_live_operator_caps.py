@@ -325,6 +325,79 @@ def test_live_engine_skips_tradability_lookup_errors_without_crashing(tmp_path: 
     assert engine.state.read()["paused"] is False
 
 
+def test_live_engine_reuses_cached_tradability_when_lookup_fails(tmp_path: Path) -> None:
+    engine = _engine(tmp_path)
+    engine.state.write(
+        {
+            "paused": False,
+            "kill_switch": False,
+            "manual_live_enable": True,
+            "manual_resume_required": False,
+            "live_readiness_last_result": {"ready": True, "checks": []},
+            "reconciliation_clean": True,
+        }
+    )
+    engine.health_monitor = HealthMonitor(tmp_path / "health_status.json")
+    engine.geoblock.live_trading_allowed = lambda: type("Geo", (), {"eligible": True, "detail": "ok"})()  # type: ignore[method-assign]
+
+    async def _refresh_live_status():
+        engine.state.update_system_status(
+            paused=False,
+            manual_resume_required=False,
+            live_readiness_last_result={"ready": True, "checks": []},
+            reconciliation_clean=True,
+        )
+
+    async def _collect_health(reconciliation_override=None):
+        return engine.health_monitor.aggregate(
+            [HealthComponent(name="market_ws", state=HealthState.DEGRADED, detail="lagging stream")]
+        )
+
+    async def _tradability(_market_id: str, _token_id: str):
+        raise RuntimeError("tradability metadata missing")
+
+    async def _submit(order, side: str):
+        order.last_exchange_status = "LIVE"
+        order.last_update_at = datetime.now(timezone.utc)
+        return {"exchange_order_id": "ex-1", "status": "LIVE"}
+
+    async def _manage_existing_orders(live_orders, live_positions, decisions):
+        return None
+
+    async def _apply_live_exits(live_positions, live_orders):
+        return None
+
+    async def _reconcile():
+        return type("Recon", (), {"clean": True, "severity": "NONE", "model_dump": lambda self, mode="json": {"clean": True}})()
+
+    engine.refresh_live_status = _refresh_live_status  # type: ignore[method-assign]
+    engine.collect_health = _collect_health  # type: ignore[method-assign]
+    engine.market_data.get_tradability = _tradability  # type: ignore[method-assign]
+    engine.order_manager.submit_order = _submit  # type: ignore[method-assign]
+    engine._manage_existing_orders = _manage_existing_orders  # type: ignore[method-assign]
+    engine._apply_live_exits = _apply_live_exits  # type: ignore[method-assign]
+    engine.reconcile = _reconcile  # type: ignore[method-assign]
+
+    decision = _decision(1.0).model_copy(
+        update={
+            "context": {
+                "tradability": {
+                    "market_id": "m1",
+                    "token_id": "t1",
+                    "tradable": True,
+                    "orderbook_enabled": True,
+                }
+            }
+        }
+    )
+
+    asyncio.run(engine.handle_decisions([decision]))
+
+    orders = engine.orders.load()
+    assert len(orders) == 1
+    assert orders[0].local_decision_id == "d1"
+
+
 def test_live_engine_rate_limit_applies_to_actual_created_orders(tmp_path: Path) -> None:
     engine = _engine(tmp_path)
     engine.config.risk.max_new_entries_per_hour = 1

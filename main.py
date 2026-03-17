@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.alerts import AlertManager
@@ -15,16 +15,18 @@ from src.logger import setup_logging
 from src.logger import logger
 from src.paper_engine import PaperTradingEngine
 from src.reporting import ReportWriter
+from src.rtds_client import get_rtds_client
 from src.scheduler import AppScheduler
 from src.state import AppStateStore
 from src.strategy import StrategyEngine
 from src.trade_monitor import TradeMonitor
-from src.utils import append_jsonl, stable_event_key, write_json
+from src.utils import append_jsonl, read_json, stable_event_key, write_json
 from src.wallet_discovery import WalletDiscoveryService
 from src.wallet_scoring import WalletScoringService
+from src.momentum_signal_generator import generate_momentum_signals
 from backtest.evaluator import BacktestEvaluator
 from src.live_orders import LiveOrderStore
-from src.models import DecisionAction, Mode, OrderLifecycleStatus, TradeDecision
+from src.models import ApprovedWallets, DecisionAction, DiscoveryResult, DiscoveryState, Mode, OrderLifecycleStatus, SourceQuality, TradeDecision, WalletMetrics
 
 
 def _build_shadow_config(config: AppConfig) -> AppConfig:
@@ -90,6 +92,108 @@ def _decision_snapshot(decision: TradeDecision) -> dict[str, object]:
         "source_quality": decision.context.get("source_quality", ""),
         "trust_level": decision.context.get("trust_level", ""),
     }
+
+
+async def _run_cycle_stage(
+    *,
+    state: AppStateStore,
+    stage_name: str,
+    coro: object,
+    timeout_seconds: float,
+    default: object,
+):
+    state.update_system_status(
+        last_cycle_stage=stage_name,
+        last_cycle_stage_started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    try:
+        result = await asyncio.wait_for(coro, timeout=timeout_seconds)  # type: ignore[arg-type]
+    except asyncio.TimeoutError:
+        logger.warning("Cycle stage timed out stage={} timeout_seconds={}", stage_name, timeout_seconds)
+        state.update_system_status(
+            last_cycle_stage=f"{stage_name}:timeout",
+            last_cycle_stage_error=f"Timed out after {timeout_seconds:.1f}s",
+            last_cycle_stage_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return default
+    except Exception as exc:
+        logger.warning("Cycle stage failed stage={} error={}", stage_name, exc)
+        state.update_system_status(
+            last_cycle_stage=f"{stage_name}:error",
+            last_cycle_stage_error=str(exc),
+            last_cycle_stage_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return default
+    state.update_system_status(
+        last_cycle_stage=f"{stage_name}:complete",
+        last_cycle_stage_error="",
+        last_cycle_stage_completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return result
+
+
+async def _run_startup_stage(
+    *,
+    state: AppStateStore,
+    stage_name: str,
+    coro: object,
+    timeout_seconds: float,
+    default: object,
+):
+    state.update_system_status(
+        startup_stage=stage_name,
+        startup_stage_started_at=datetime.now(timezone.utc).isoformat(),
+    )
+    try:
+        result = await asyncio.wait_for(coro, timeout=timeout_seconds)  # type: ignore[arg-type]
+    except asyncio.TimeoutError:
+        logger.warning("Startup stage timed out stage={} timeout_seconds={}", stage_name, timeout_seconds)
+        state.update_system_status(
+            startup_stage=f"{stage_name}:timeout",
+            startup_stage_error=f"Timed out after {timeout_seconds:.1f}s",
+            startup_stage_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return default
+    except Exception as exc:
+        logger.warning("Startup stage failed stage={} error={}", stage_name, exc)
+        state.update_system_status(
+            startup_stage=f"{stage_name}:error",
+            startup_stage_error=str(exc),
+            startup_stage_completed_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return default
+    state.update_system_status(
+        startup_stage=f"{stage_name}:complete",
+        startup_stage_error="",
+        startup_stage_completed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return result
+
+
+def _restore_cached_wallet_context(
+    *,
+    root: Path,
+    existing_state: dict[str, object],
+) -> tuple[ApprovedWallets | None, list[WalletMetrics]]:
+    approved_wallets: ApprovedWallets | None = None
+    approved_raw = existing_state.get("approved_wallets", {})
+    if isinstance(approved_raw, dict):
+        try:
+            approved_wallets = ApprovedWallets.model_validate(approved_raw)
+        except Exception:
+            approved_wallets = None
+
+    scored_wallets: list[WalletMetrics] = []
+    raw_rows = read_json(root / "data" / "top_wallets.json", [])
+    if isinstance(raw_rows, list):
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                scored_wallets.append(WalletMetrics.model_validate(row))
+            except Exception:
+                continue
+    return approved_wallets, scored_wallets
 
 
 def _write_shadow_cycle_artifacts(
@@ -262,6 +366,7 @@ async def run() -> None:
 
     state = AppStateStore(root / "data" / "app_state.json")
     existing_state = state.read()
+    cached_approved_wallets, cached_scored_wallets = _restore_cached_wallet_context(root=root, existing_state=existing_state)
     if preflight_only:
         state.clear_pause()
     alerts = AlertManager(config, root / "logs")
@@ -372,11 +477,66 @@ async def run() -> None:
         await live_engine.refresh_live_status()
         return
 
-    discovery_result = await discovery.run_discovery_cycle()
-    scoring_result = scorer.score_wallets(discovery_result.wallets)
-    category_scorecards = category_scorer.build_scorecards(scoring_result.scored_wallets)
-    replay_rows = evaluator.evaluate_wallets(scoring_result.scored_wallets)
+    startup_timeout_base = max(float(config.live.bounded_execution_seconds or 20), 10.0)
+    discovery_result = await _run_startup_stage(
+        state=state,
+        stage_name="wallet_discovery",
+        coro=discovery.run_discovery_cycle(),
+        timeout_seconds=min(startup_timeout_base * 2.0, 45.0),
+        default=DiscoveryResult(
+            wallets=[],
+            state=DiscoveryState.FETCH_FAILED,
+            source_quality=SourceQuality.DEGRADED_PUBLIC_DATA,
+            reason="Startup discovery timed out or failed before cycle start.",
+            diagnostics={"startup_timeout": True},
+        ),
+    )
+    scoring_result = await _run_startup_stage(
+        state=state,
+        stage_name="wallet_scoring",
+        coro=asyncio.to_thread(scorer.score_wallets, discovery_result.wallets),
+        timeout_seconds=min(startup_timeout_base, 20.0),
+        default=scorer.score_wallets([]),
+    )
+    category_scorecards = await _run_startup_stage(
+        state=state,
+        stage_name="category_scoring",
+        coro=asyncio.to_thread(category_scorer.build_scorecards, scoring_result.scored_wallets),
+        timeout_seconds=min(startup_timeout_base, 20.0),
+        default=[],
+    )
+    replay_rows = await _run_startup_stage(
+        state=state,
+        stage_name="wallet_backtest",
+        coro=asyncio.to_thread(evaluator.evaluate_wallets, scoring_result.scored_wallets),
+        timeout_seconds=min(startup_timeout_base * 2.0, 30.0),
+        default=[],
+    )
     approved_wallets = scorer.select_wallets(scoring_result, replay_rows)
+
+    if (not scoring_result.scored_wallets or not approved_wallets.paper_wallets) and cached_scored_wallets:
+        logger.warning(
+            "Startup wallet context degraded; restoring cached scored wallets count={} approved_live_count={}",
+            len(cached_scored_wallets),
+            len(cached_approved_wallets.live_wallets) if cached_approved_wallets else 0,
+        )
+        scoring_result = scoring_result.model_copy(update={"scored_wallets": cached_scored_wallets})
+        if cached_approved_wallets is not None:
+            approved_wallets = cached_approved_wallets
+        elif not approved_wallets.paper_wallets:
+            cached_addresses = [wallet.wallet_address for wallet in cached_scored_wallets]
+            fallback_count = max(int(config.env.operator_live_wallet_count or config.wallet_selection.approved_live_wallets), 1)
+            approved_wallets = ApprovedWallets(
+                research_wallets=cached_addresses[: config.wallet_selection.top_research_wallets],
+                paper_wallets=cached_addresses[: config.wallet_selection.approved_paper_wallets],
+                live_wallets=cached_addresses[:fallback_count],
+            )
+        state.update_system_status(
+            wallet_startup_fallback_used=True,
+            wallet_startup_fallback_reason="Restored cached wallet context after degraded startup discovery/scoring.",
+        )
+    else:
+        state.update_system_status(wallet_startup_fallback_used=False, wallet_startup_fallback_reason="")
 
     state.set_wallets(approved_wallets, scoring_result.scored_wallets)
     state.update_system_status(
@@ -404,11 +564,91 @@ async def run() -> None:
         elif paper_quality.get("paper_readiness") != "STRONG":
             logger.warning("Paper mode is running in a degraded state and should not be treated as strong pre-live evidence.")
 
+    # ------------------------------------------------------------------ #
+    # Start RTDS WebSocket background task for oracle-aligned lag signal
+    # ------------------------------------------------------------------ #
+    if config.rtds.enabled:
+        _rtds_client = get_rtds_client(config.rtds.url)
+        asyncio.create_task(_rtds_client.run_forever())
+        logger.info("RTDS background task started url={}", config.rtds.url)
+
     scheduler = AppScheduler(config)
+    cycle_timeout_base = max(float(config.live.bounded_execution_seconds or 20), 10.0)
+    last_discovery_at: datetime = datetime.now(timezone.utc)
+
+    async def rediscover_wallets() -> None:
+        nonlocal approved_wallets, scoring_result, last_discovery_at
+        logger.info(
+            "Periodic wallet rediscovery starting interval_minutes={}",
+            config.runtime.discovery_interval_minutes,
+        )
+        new_discovery = await _run_startup_stage(
+            state=state,
+            stage_name="wallet_discovery",
+            coro=discovery.run_discovery_cycle(),
+            timeout_seconds=60.0,
+            default=discovery_result,
+        )
+        new_scoring = await _run_startup_stage(
+            state=state,
+            stage_name="wallet_scoring",
+            coro=asyncio.to_thread(scorer.score_wallets, new_discovery.wallets),
+            timeout_seconds=20.0,
+            default=scoring_result,
+        )
+        new_replay = await _run_startup_stage(
+            state=state,
+            stage_name="wallet_backtest",
+            coro=asyncio.to_thread(evaluator.evaluate_wallets, new_scoring.scored_wallets),
+            timeout_seconds=30.0,
+            default=[],
+        )
+        new_approved = scorer.select_wallets(new_scoring, new_replay)
+        last_discovery_at = datetime.now(timezone.utc)
+        if new_approved.live_wallets:
+            approved_wallets = new_approved
+            scoring_result = new_scoring
+            state.set_wallets(approved_wallets, scoring_result.scored_wallets)
+            state.update_system_status(
+                wallet_discovery_state=new_discovery.state.value,
+                wallet_scoring_state=new_scoring.state,
+                wallet_discovery_source_quality=new_discovery.source_quality.value,
+                wallet_scoring_source_quality=new_scoring.source_quality.value,
+            )
+            logger.info(
+                "Periodic wallet rediscovery complete live_wallets={}",
+                approved_wallets.live_wallets,
+            )
+        else:
+            logger.warning("Periodic wallet rediscovery yielded no live wallets; keeping current selection")
+
+        # ── Momentum signal refresh ────────────────────────────────────────
+        if config.strategies.official_signal_live_enabled and config.mode.value == "LIVE":
+            signal_path = root / config.strategies.official_signal_file
+            try:
+                n_new = await generate_momentum_signals(
+                    config=config,
+                    market_data=strategy.market_data,
+                    output_path=signal_path,
+                )
+                if n_new:
+                    logger.info("momentum_signal_generator: {} new signals written to {}", n_new, signal_path)
+            except Exception as _sig_exc:
+                logger.warning("momentum_signal_generator error (non-fatal): {}", _sig_exc)
 
     async def cycle() -> list:
+        nonlocal last_discovery_at
         if config.mode.value == "LIVE":
             await live_engine.refresh_live_status()
+        discovery_interval = timedelta(minutes=max(config.runtime.discovery_interval_minutes, 1))
+        if datetime.now(timezone.utc) - last_discovery_at >= discovery_interval:
+            await _run_cycle_stage(
+                state=state,
+                stage_name="wallet_rediscovery",
+                coro=rediscover_wallets(),
+                timeout_seconds=120.0,
+                default=None,
+            )
         cycle_started_at = datetime.now(timezone.utc).isoformat()
         state_snapshot = state.read()
         state.update_system_status(
@@ -433,13 +673,51 @@ async def run() -> None:
             len(watched_wallets),
             watched_wallets,
         )
-        detections = await monitor.poll_wallets(watched_wallets)
-        decisions = await strategy.process_detections(detections, approved_wallets, scoring_result.scored_wallets)
-        shadow_decisions = await shadow_strategy.process_detections(detections, approved_wallets, scoring_result.scored_wallets)
+        strategy_stage_timeout = min(cycle_timeout_base * 3.0, 65.0) if config.mode.value == "LIVE" else min(cycle_timeout_base * 2.0, 45.0)
+        shadow_strategy_stage_timeout = min(cycle_timeout_base * 3.5, 75.0) if config.mode.value == "LIVE" else min(cycle_timeout_base * 2.0, 45.0)
+        detections = await _run_cycle_stage(
+            state=state,
+            stage_name="poll_wallets",
+            coro=monitor.poll_wallets(watched_wallets),
+            timeout_seconds=min(cycle_timeout_base, 15.0),
+            default=[],
+        )
+        decisions = await _run_cycle_stage(
+            state=state,
+            stage_name="strategy_process",
+            coro=strategy.process_detections(detections, approved_wallets, scoring_result.scored_wallets),
+            timeout_seconds=strategy_stage_timeout,
+            default=[],
+        )
+        shadow_decisions = await _run_cycle_stage(
+            state=shadow_state,
+            stage_name="shadow_strategy_process",
+            coro=shadow_strategy.process_detections(detections, approved_wallets, scoring_result.scored_wallets),
+            timeout_seconds=shadow_strategy_stage_timeout,
+            default=[],
+        )
         if config.mode.value != "PAPER" or state_snapshot.get("paper_run_enabled", False):
-            await paper_engine.handle_decisions(decisions)
-        await shadow_paper_engine.handle_decisions(shadow_decisions)
-        await live_engine.handle_decisions(decisions)
+            await _run_cycle_stage(
+                state=state,
+                stage_name="paper_engine",
+                coro=paper_engine.handle_decisions(decisions),
+                timeout_seconds=min(cycle_timeout_base * 1.5, 30.0),
+                default=None,
+            )
+        await _run_cycle_stage(
+            state=shadow_state,
+            stage_name="shadow_paper_engine",
+            coro=shadow_paper_engine.handle_decisions(shadow_decisions),
+            timeout_seconds=min(cycle_timeout_base * 1.5, 30.0),
+            default=None,
+        )
+        await _run_cycle_stage(
+            state=state,
+            stage_name="live_engine",
+            coro=live_engine.handle_decisions(decisions),
+            timeout_seconds=min(cycle_timeout_base * 3.0, 90.0),  # increased: 6+ positions need 5s each for orderbooks
+            default=None,
+        )
         reporter.write_daily_summary(scoring_result.scored_wallets, decisions)
         paper_quality = reporter.write_paper_quality_summary(decisions)
         shadow_reporter.write_daily_summary(scoring_result.scored_wallets, shadow_decisions)
@@ -457,6 +735,7 @@ async def run() -> None:
         state.update_system_status(
             mode=config.mode.value,
             bot_loop_running=True,
+            last_cycle_stage="cycle_complete",
             last_cycle_completed_at=datetime.now(timezone.utc).isoformat(),
             last_cycle_detection_count=len(detections),
             last_cycle_decision_count=len(decisions),

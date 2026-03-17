@@ -18,7 +18,7 @@ risk:
   max_single_live_trade_usd: 5.0
   daily_stop_loss_pct: 0.05
   max_new_entries_per_hour: 8
-  stale_signal_seconds: 180
+  stale_signal_seconds: 3600  # Increased from 180: allows copy-trading trades made hours ago for multi-day markets (EXPIRED_MARKET filter protects against closed markets)
   stale_market_data_seconds: 15
   max_spread_pct: 0.04
   max_entry_drift_pct: 0.05
@@ -54,15 +54,15 @@ backtest:
     - 15
     - 30
     - 60
-  min_wallet_replay_expectancy: 0.01
-  min_wallet_copyability_score: 0.55
+  min_wallet_replay_expectancy: 0.001
+  min_wallet_copyability_score: 0.20
 wallet_selection:
-  top_research_wallets: 10
+  top_research_wallets: 20
   approved_paper_wallets: 10
   approved_live_wallets: 10
   min_trade_count: 12
-  min_copyability_score: 0.55
-  min_delay_viability_score: 0.50
+  min_copyability_score: 0.20
+  min_delay_viability_score: 0.15
 categories:
   tracked:
     - politics
@@ -108,6 +108,7 @@ live:
     - macro / economics
     - geopolitics
     - crypto price
+    - sports
     # entertainment / pop culture removed: Oscar signals caused losses
 strategies:
   enable_event_driven_official: true

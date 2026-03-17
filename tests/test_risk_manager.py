@@ -50,7 +50,7 @@ def test_risk_manager_blocks_stale_signal() -> None:
         size=10,
         notional=5,
         transaction_hash="tx",
-        detection_latency_seconds=999,
+        detection_latency_seconds=7200,  # 2 hours — exceeds stale_signal_seconds=3600
         source_trade_timestamp=datetime.now(timezone.utc),
     )
     fill = FillEstimate(fillable=True, executable_price=0.51, spread_pct=0.01, slippage_pct=0.01, filled_notional=5, reason="OK")
