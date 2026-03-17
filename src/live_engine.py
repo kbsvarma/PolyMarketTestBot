@@ -54,7 +54,13 @@ class LiveTradingEngine:
         normalized = str(reason or "").strip()
         if not normalized:
             return False
-        return normalized.startswith("Live exit ambiguity for ")
+        # Soft pauses are automatically cleared when reconciliation becomes clean again.
+        # Reconciliation mismatches (size rounding, fill drift) are transient and
+        # should not require manual intervention.
+        return (
+            normalized.startswith("Live exit ambiguity for ")
+            or normalized.startswith("Live reconciliation mismatch")
+        )
 
     def _entries_last_hour(self, live_orders: list[LiveOrder]) -> int:
         cutoff = datetime.now(timezone.utc).timestamp() - 3600.0
