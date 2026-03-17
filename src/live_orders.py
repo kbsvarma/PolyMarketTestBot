@@ -35,6 +35,14 @@ class LiveOrderStore:
 
     def create_from_decision(self, decision: TradeDecision) -> LiveOrder:
         local_order_id = stable_event_key(decision.local_decision_id, decision.market_id, decision.token_id, "order")
+        intended_size = round(decision.scaled_notional / max(decision.executable_price, 1e-6), 6)
+        if decision.thesis_type == "paired_arb":
+            try:
+                bundle_shares = float(decision.context.get("bundle_shares", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                bundle_shares = 0.0
+            if bundle_shares > 0:
+                intended_size = round(bundle_shares, 6)
         return LiveOrder(
             local_decision_id=decision.local_decision_id,
             local_order_id=local_order_id,
@@ -47,13 +55,13 @@ class LiveOrderStore:
             token_id=decision.token_id,
             side="BUY",
             intended_price=decision.executable_price,
-            intended_size=round(decision.scaled_notional / max(decision.executable_price, 1e-6), 6),
+            intended_size=intended_size,
             entry_style=EntryStyle(decision.entry_style),
             thesis_type=decision.thesis_type,
             bundle_id=decision.bundle_id,
             bundle_role=decision.bundle_role,
             paired_token_id=decision.paired_token_id,
-            remaining_size=round(decision.scaled_notional / max(decision.executable_price, 1e-6), 6),
+            remaining_size=intended_size,
             lifecycle_status=OrderLifecycleStatus.CREATED,
             timeout_at=datetime.now(timezone.utc),
         )

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
 from src.config import AppConfig
+from src.logger import logger
 from src.models import DetectionEvent, SourceQuality
 from src.polymarket_client import PolymarketClient
 from src.utils import append_csv_row, stable_event_key
@@ -20,10 +22,38 @@ class TradeMonitor:
     def make_event_key(self, wallet: str, market_id: str, token_id: str, tx_hash: str, side: str) -> str:
         return stable_event_key(wallet, market_id, token_id, tx_hash, side)
 
+    def _wallet_poll_timeout_seconds(self) -> float:
+        live_bound = float(self.config.live.bounded_execution_seconds or 20)
+        if self.config.mode.value == "LIVE":
+            return max(6.0, min(live_bound, 12.0))
+        return max(10.0, live_bound)
+
+    async def _fetch_wallet_activity_safe(self, wallet: str, limit: int) -> tuple[str, list[dict]]:
+        timeout_seconds = self._wallet_poll_timeout_seconds()
+        try:
+            activities = await asyncio.wait_for(
+                self.client.fetch_wallet_activity(wallet, limit=limit),
+                timeout=timeout_seconds,
+            )
+            return wallet, activities
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Wallet activity fetch timed out wallet={} timeout_seconds={}",
+                wallet,
+                timeout_seconds,
+            )
+        except RuntimeError as exc:
+            logger.warning("Wallet activity fetch failed wallet={} error={}", wallet, exc)
+        except Exception as exc:  # pragma: no cover - defensive safety net
+            logger.warning("Wallet activity fetch errored wallet={} error={}", wallet, exc)
+        return wallet, []
+
     async def poll_wallets(self, wallets: list[str]) -> list[DetectionEvent]:
         detections: list[DetectionEvent] = []
-        for wallet in wallets:
-            activities = await self.client.fetch_wallet_activity(wallet, limit=20)
+        results = await asyncio.gather(
+            *(self._fetch_wallet_activity_safe(wallet, limit=20) for wallet in wallets)
+        )
+        for wallet, activities in results:
             for row in activities:
                 detection = self._row_to_detection(wallet, row)
                 if detection is None:

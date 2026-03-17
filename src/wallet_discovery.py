@@ -312,6 +312,7 @@ class WalletDiscoveryService:
                           "15-minute", "30-minute", "5min", "1min",
                           "intraday-price", "price-up", "price-down")
         short_duration_count = 0
+        extreme_price_count = 0  # trades at near-certainty prices (yield farming)
         for row in activities:
             price = float(row.get("price") or row.get("outcomePrice") or 0.5)
             size = float(row.get("size") or row.get("amount") or row.get("shares") or 10.0)
@@ -334,6 +335,9 @@ class WalletDiscoveryService:
             _slug = str(row.get("slug") or getattr(market_obj, "slug", None) or "").lower()
             if any(kw in _title or kw in _slug for kw in _short_dur_kws):
                 short_duration_count += 1
+            # Track extreme-price trades (yield farming near resolution)
+            if price > 0.88 or price < 0.12:
+                extreme_price_count += 1
             parsed.append({"timestamp": timestamp, "price": price, "size": size, "side": side, "category": category})
 
         parsed.sort(key=lambda item: item["timestamp"])
@@ -351,6 +355,7 @@ class WalletDiscoveryService:
         drawdown_proxy = clamp(1.0 - max(pnl_proxy + 0.5, 0.0), 0.0, 1.0)
         low_velocity_score = clamp(1.0 - trades_per_day / 5.0, 0.0, 1.0)
         short_duration_rate = short_duration_count / max(trade_count, 1)
+        extreme_price_rate = extreme_price_count / max(trade_count, 1)
         copyability_score = clamp(
             0.35 * low_velocity_score
             + 0.20 * win_rate
@@ -362,6 +367,9 @@ class WalletDiscoveryService:
         )
         if short_duration_rate > 0.3:
             copyability_score = clamp(copyability_score * (1.0 - short_duration_rate * 0.8), 0.0, 1.0)
+        # Penalize yield-farmers who only trade near-certainty prices (>88% or <12%)
+        if extreme_price_rate > 0.5:
+            copyability_score = clamp(copyability_score * (1.0 - extreme_price_rate * 0.9), 0.0, 1.0)
         delay_base = clamp(copyability_score * 0.9 + low_velocity_score * 0.1, 0.0, 1.0)
 
         return WalletMetrics(

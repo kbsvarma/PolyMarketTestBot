@@ -102,7 +102,19 @@ def resolve_official_signal_market(row: dict[str, Any], markets: list[MarketInfo
         for market in candidates:
             if market.market_id == market_id and market.token_id == token_id:
                 return market, "exact_market_and_token"
-        return None, "missing_exact_market_and_token"
+        # Market not in the local cache but has explicit IDs (e.g. momentum signal for
+        # a short-term market not returned by the standard Gamma /markets endpoint).
+        # Trust the explicit IDs and create a synthetic stub so the strategy can proceed.
+        return (
+            MarketInfo(
+                market_id=market_id,
+                token_id=token_id,
+                title=str(row.get("market_title") or row.get("title") or market_id),
+                slug=str(row.get("market_slug") or row.get("slug") or ""),
+                category=str(row.get("category") or "unknown"),
+            ),
+            "exact_market_and_token",
+        )
 
     if token_id:
         token_matches = [market for market in candidates if market.token_id == token_id and _outcome_matches(market, outcome)]

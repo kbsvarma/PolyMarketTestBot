@@ -17,6 +17,8 @@ class MarketDataService:
         self.ws = MarketWSClient()
         self.market_cache: dict[str, MarketInfo] = {}
         self.token_cache: dict[str, MarketInfo] = {}
+        self._cache_last_refreshed_at: datetime | None = None
+        self._CACHE_REFRESH_INTERVAL_SECONDS = 300  # 5 minutes
 
     def _market_rank(self, market: MarketInfo) -> tuple[int, float, float]:
         end_at = None
@@ -54,30 +56,63 @@ class MarketDataService:
         markets = sorted(markets_by_token.values(), key=self._market_rank)
         self.market_cache = {market.market_id: market for market in markets}
         self.token_cache = {market.token_id: market for market in markets}
+        self._cache_last_refreshed_at = datetime.now(timezone.utc)
         return self.market_cache
 
     async def fetch_orderbook(self, token_id: str) -> OrderbookSnapshot:
         return await self.client.get_orderbook(token_id)
 
     async def fetch_market_metadata(self, market_id: str, token_id: str = "", market_slug: str = "", outcome: str = "") -> dict[str, object]:
-        if market_id not in self.market_cache and (not token_id or token_id not in self.token_cache):
-            await self.refresh_markets()
+        # Quick cache check first.
         market = self.market_cache.get(market_id)
         if market is None and token_id:
             market = self.token_cache.get(token_id)
-        if market is None:
-            try:
-                market = await self.client.fetch_market_lookup(market_id, token_id, market_slug=market_slug, outcome=outcome)
-            except TypeError:
-                market = await self.client.fetch_market_lookup(market_id, token_id)
-            if market is not None:
-                self.market_cache[market.market_id] = market
-                self.token_cache[market.token_id] = market
         if market:
             return market.model_dump()
-        if self.config.mode.value == "LIVE":
-            raise RuntimeError(f"Missing market metadata for {market_id}/{token_id or 'unknown-token'} in LIVE mode.")
-        return {"market_id": market_id, "title": market_id, "category": "unknown", "tradable": False}
+
+        # Only refresh the full market list if the cache is stale (older than ~5 min).
+        # Avoids expensive bulk fetches every cycle for short-term markets that will
+        # never appear in the standard Gamma /markets endpoint (5-min BTC/ETH markets etc).
+        now = datetime.now(timezone.utc)
+        cache_age_s = float("inf") if self._cache_last_refreshed_at is None else (now - self._cache_last_refreshed_at).total_seconds()
+        if cache_age_s > self._CACHE_REFRESH_INTERVAL_SECONDS:
+            await self.refresh_markets()
+            market = self.market_cache.get(market_id)
+            if market is None and token_id:
+                market = self.token_cache.get(token_id)
+            if market:
+                return market.model_dump()
+
+        # Try a direct API lookup — but only when token_id is NOT already provided.
+        # When both market_id AND token_id are present (e.g. momentum signals), the stub
+        # below is sufficient: the orderbook and tradability checks will gate the trade.
+        # Skipping the API call avoids 1-2s latency per signal which causes strategy timeouts.
+        if market_id and not token_id:
+            try:
+                looked_up = await self.client.fetch_market_lookup(market_id, token_id, market_slug=market_slug, outcome=outcome)
+            except TypeError:
+                try:
+                    looked_up = await self.client.fetch_market_lookup(market_id, token_id)
+                except Exception:
+                    looked_up = None
+            except Exception:
+                looked_up = None
+            if looked_up is not None:
+                self.market_cache[looked_up.market_id] = looked_up
+                self.token_cache[looked_up.token_id] = looked_up
+                return looked_up.model_dump()
+
+        # Market not found in cache or API (e.g. short-term markets not surfaced by Gamma endpoint).
+        # Return a minimal stub so other gates (orderbook depth, tradability) can decide.
+        # Expired/closed markets will be naturally blocked by empty orderbooks.
+        return {
+            "market_id": market_id,
+            "token_id": token_id or "",
+            "title": market_id,
+            "category": "unknown",
+            "active": True,
+            "tradable": bool(token_id),
+        }
 
     async def stream_watchlist(self, token_ids: list[str]) -> dict[str, dict]:
         if token_ids != self.ws.watched_token_ids or not self.ws.latest_messages:

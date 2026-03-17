@@ -1,6 +1,43 @@
 from __future__ import annotations
 
+from src.fees import taker_fee, net_edge_after_fees, meets_min_edge
 from src.models import FillEstimate, OrderbookSnapshot
+
+
+def compute_executable_edge(
+    *,
+    fair_value: float,
+    fill: FillEstimate,
+    category: str = "crypto price",
+    is_taker: bool = True,
+    min_edge_taker: float = 0.020,
+    min_edge_maker: float = 0.010,
+) -> dict:
+    """
+    Given a fair-value estimate and a FillEstimate, compute:
+      - gross_edge    : fair_value - executable_price
+      - fee           : taker/maker fee at executable_price
+      - net_edge      : gross_edge - fee
+      - passes_gate   : True if net_edge >= threshold
+
+    Returns a dict safe for JSON serialisation and decision context.
+    """
+    exec_price = float(fill.executable_price or 0.0)
+    gross = round(fair_value - exec_price, 8)
+    fee = taker_fee(exec_price, category=category) if is_taker else 0.0
+    net = round(gross - fee, 8)
+    passes = meets_min_edge(net, is_taker=is_taker, min_taker=min_edge_taker, min_maker=min_edge_maker)
+    return {
+        "fair_value": round(fair_value, 6),
+        "executable_price": round(exec_price, 6),
+        "gross_edge": round(gross, 6),
+        "taker_fee": round(fee, 6),
+        "net_edge": round(net, 6),
+        "passes_min_edge_gate": passes,
+        "is_taker": is_taker,
+        "category": category,
+        "min_edge_threshold": min_edge_taker if is_taker else min_edge_maker,
+    }
 
 
 def estimate_fill(orderbook: OrderbookSnapshot, target_notional: float, max_slippage_pct: float) -> FillEstimate:

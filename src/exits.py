@@ -45,6 +45,10 @@ def evaluate_exit(
         position.trailing_stop_price = round(trailing_stop_price, 6)
         if pnl_pct <= locked_profit_pct:
             return True, "TRAILING_PROFIT"
+        # Strong winners that have held for 4+ hours: lock in the gain rather than
+        # waiting for a large retrace or the 48-hour time stop.
+        if pnl_pct >= abs(strong_winner_profit_pct) and age >= timedelta(hours=4):
+            return True, "STRONG_WINNER_TAKE"
     elif pnl_pct >= abs(take_profit_pct) and age >= timedelta(hours=max(time_stop_hours / 3, 6)):
         return True, "TAKE_PROFIT"
 

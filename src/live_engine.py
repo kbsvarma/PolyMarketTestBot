@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from src.positions import PositionStore
 from src.reconciliation import RECENT_EXCHANGE_VISIBILITY_GRACE_SECONDS, reconcile_live_state
 from src.state import AppStateStore
 from src.state_machine import SystemStateMachine
+from src.logger import logger
 from src.utils import append_csv_row, stable_event_key
 
 
@@ -359,6 +361,16 @@ class LiveTradingEngine:
                 remaining_exchange_quantity = max(remaining_exchange_quantity - target_open_size, 0.0)
             exchange_position["_uncovered_quantity"] = remaining_exchange_quantity
 
+        # Build a set of (market_id, token_id, side) keys that we've already written
+        # off as RESOLVED_ZERO.  If the exchange still shows shares (because the AMM
+        # contract holds them), we must NOT recreate a new local position — doing so
+        # causes an infinite force-close / repair loop every cycle.
+        resolved_zero_keys: set[tuple[str, str, str]] = {
+            (p.market_id, p.token_id, p.side)
+            for p in live_positions
+            if p.exit_reason == "RESOLVED_ZERO"
+        }
+
         for exchange_position in exchange_positions:
             market_id = self._exchange_position_market_id(exchange_position)
             token_id = self._exchange_position_token_id(exchange_position)
@@ -368,6 +380,10 @@ class LiveTradingEngine:
             else:
                 quantity = self._exchange_position_quantity(exchange_position)
             if not market_id or not token_id or quantity <= 0:
+                continue
+            # Skip markets we've already written off as zero-value — shares may still
+            # sit in the AMM contract but have no economic recovery potential.
+            if (market_id, token_id, side) in resolved_zero_keys:
                 continue
 
             matching_order = next(
@@ -1281,9 +1297,14 @@ class LiveTradingEngine:
             try:
                 await self.order_manager.refresh_order(order)
             except Exception as exc:
-                order.lifecycle_status = OrderLifecycleStatus.UNKNOWN
-                self.state.pause(f"Order status ambiguity for {order.local_order_id}: {exc}")
-                return
+                # Retry once for transient API failures (empty response, timeout) before pausing.
+                try:
+                    await asyncio.sleep(2)
+                    await self.order_manager.refresh_order(order)
+                except Exception as exc2:
+                    order.lifecycle_status = OrderLifecycleStatus.UNKNOWN
+                    self.state.pause(f"Order status ambiguity for {order.local_order_id}: {exc2}")
+                    return
 
             if order.lifecycle_status in {OrderLifecycleStatus.PARTIALLY_FILLED, OrderLifecycleStatus.FILLED}:
                 decision = next((item for item in decisions if item.local_decision_id == order.local_decision_id), None)
@@ -1345,17 +1366,136 @@ class LiveTradingEngine:
         for position in live_positions:
             if position.closed or position.remaining_size <= 0:
                 continue
+            # Quarantined positions normally wait for on-chain settlement, but if
+            # the stored mark price is still near entry (never repriced since quarantine)
+            # periodically retry the orderbook/midpoint so the position can escape if
+            # the API issue was transient.  Retry at most once per 10 minutes.
             if self._is_unmanaged_exit_hold(position):
+                stored_mark = position.current_mark_price or 0.0
+                last_check = position.last_reconciled_at
+                try:
+                    if isinstance(last_check, datetime):
+                        _aware = last_check if last_check.tzinfo else last_check.replace(tzinfo=timezone.utc)
+                        minutes_since_check = (datetime.now(timezone.utc) - _aware).total_seconds() / 60.0
+                    else:
+                        minutes_since_check = 999.0
+                except Exception:
+                    minutes_since_check = 999.0
+                if stored_mark >= 0.10 and minutes_since_check >= 10.0:
+                    # Retry: try midpoint first (cheaper), then orderbook
+                    try:
+                        _mid_retry = await self.client.get_token_midpoint(position.token_id)
+                        if _mid_retry is not None:
+                            entry_ref_retry = position.entry_price_actual or position.entry_price
+                            position.current_mark_price = _mid_retry
+                            position.unrealized_pnl = round((_mid_retry - entry_ref_retry) * position.remaining_size - position.fees_paid, 4)
+                            if _mid_retry >= 0.02:
+                                # Market may be active again — clear quarantine so exit logic runs next cycle
+                                position.source_exit_following_enabled = True
+                                position.exit_state = "OPEN"
+                                self.audit.record("quarantine_retry_cleared", {
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                    "position_id": position.position_id,
+                                    "mid": _mid_retry,
+                                })
+                                logger.info("Cleared quarantine for position with recovered AMM mid position_id={} mid={}", position.position_id, _mid_retry)
+                    except Exception:
+                        pass
+                    position.last_reconciled_at = datetime.now(timezone.utc)
                 continue
             try:
                 orderbook = await self.client.get_orderbook(position.token_id)
-                best_bid = orderbook.bids[0].price if orderbook.bids else position.entry_price_actual or position.entry_price
+                entry_ref = position.entry_price_actual or position.entry_price
+                raw_bid = orderbook.bids[0].price if orderbook.bids else 0.0
+                raw_ask = orderbook.asks[0].price if orderbook.asks else 1.0
+
+                # AMM markets show placeholder CLOB bids (0.001) and asks (0.999).
+                # Also catch thin-bid markets where CLOB bid is near-zero but
+                # AMM has real liquidity (stored mark >> bid).
+                # Detect and replace with the real AMM midpoint price so exit
+                # logic works correctly for AMM-based markets.
+                _using_amm_mid = False
+                _stored_mark = position.current_mark_price or 0.0
+                _clob_is_placeholder = (raw_bid <= 0.01) and (
+                    (raw_ask >= 0.98) or (_stored_mark > raw_bid * 3)
+                )
+                if _clob_is_placeholder:
+                    _mid = await self.client.get_token_midpoint(position.token_id)
+                    # Threshold: if AMM mid is < 2 cents, the market has effectively
+                    # resolved to zero (can't recover). Force-close to free exposure.
+                    if _mid is not None and _mid >= 0.02:
+                        # Price at AMM bid (≈mid - 0.02) so the exit order actually
+                        # fills against the AMM's buy side rather than sitting unfilled
+                        # at the midpoint above the AMM bid.
+                        _amm_bid_est = round(max(_mid - 0.02, 0.01), 2)
+                        raw_bid = _amm_bid_est
+                        _using_amm_mid = True  # verified real price; bypass CLOB floor below
+                    else:
+                        # AMM mid is near-zero or unavailable — market likely resolved to 0.
+                        # Quarantine rather than force-close: shares still exist on-chain;
+                        # close locally only when exchange confirms settlement
+                        # (EXCHANGE_POSITION_MISSING in reconciliation).
+                        _near_zero = _mid if (_mid is not None and _mid > 0) else 0.005
+                        position.current_mark_price = _near_zero
+                        position.unrealized_pnl = round((_near_zero - entry_ref) * position.remaining_size - position.fees_paid, 4)
+                        position.source_exit_following_enabled = False
+                        position.exit_state = "EXIT_DATA_UNAVAILABLE"
+                        self.audit.record(
+                            "quarantine_near_zero_amm",
+                            {
+                                "ts": datetime.now(timezone.utc).isoformat(),
+                                "position_id": position.position_id,
+                                "market_id": position.market_id,
+                                "entry_price": entry_ref,
+                                "remaining_size": position.remaining_size,
+                                "amm_mid": _mid,
+                                "reason": "clob_placeholder_near_zero",
+                            },
+                        )
+                        logger.info(
+                            "Quarantined near-zero AMM position (awaiting on-chain settlement) "
+                            "position_id={} market_id={} amm_mid={}",
+                            position.position_id,
+                            position.market_id,
+                            _mid,
+                        )
+                        position.last_reconciled_at = datetime.now(timezone.utc)
+                        continue
+
+                if raw_bid <= 0.0:
+                    raw_bid = entry_ref
+
+                # When using a validated AMM midpoint we've already confirmed the real
+                # market price — the hard_skip_price_floor exists to block CLOB
+                # placeholder bids (0.001), not real AMM prices.  Bypass it so that
+                # low-price AMM positions can be properly evaluated and exited.
+                if _using_amm_mid:
+                    exit_price_floor = 0.001  # near-zero only; real mid already validated
+                else:
+                    exit_price_floor = max(float(self.config.live.hard_skip_price_floor), entry_ref * 0.10)
+                if raw_bid < exit_price_floor:
+                    self.audit.record(
+                        "exit_price_floor_skip",
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "position_id": position.position_id,
+                            "raw_bid": raw_bid,
+                            "floor": exit_price_floor,
+                            "entry_ref": entry_ref,
+                        },
+                    )
+                    position.exit_state = "EXIT_PRICE_TOO_LOW"
+                    continue
+                best_bid = raw_bid
                 position.current_mark_price = best_bid
-                position.unrealized_pnl = round((best_bid - (position.entry_price_actual or position.entry_price)) * position.remaining_size - position.fees_paid, 4)
+                position.unrealized_pnl = round((best_bid - entry_ref) * position.remaining_size - position.fees_paid, 4)
+                # Clear any stale exit state — position has a valid price and is being monitored
+                if position.exit_state in ("EXIT_PRICE_TOO_LOW", "EXIT_DATA_UNAVAILABLE"):
+                    position.exit_state = "OPEN"
                 should_exit, reason = evaluate_exit(
                     position,
                     best_bid,
-                    hold_to_resolution=position.thesis_type == "paired_arb",
+                    hold_to_resolution=position.thesis_type in {"paired_arb", "resolution_arb"},
                     profit_arm_pct=self.config.live.adaptive_profit_arm_pct,
                     min_profit_lock_pct=self.config.live.adaptive_profit_min_lock_pct,
                     trailing_profit_retrace_pct=self.config.live.trailing_profit_retrace_pct,
@@ -1416,6 +1556,52 @@ class LiveTradingEngine:
                 position.exit_state = "EXIT_DATA_UNAVAILABLE"
                 if "404" in str(exc):
                     position.source_exit_following_enabled = False
+                # For any orderbook error (404, timeout, etc.) try midpoint to detect
+                # resolved-to-zero markets and update mark price so PnL is accurate.
+                try:
+                    _mid_exc = await self.client.get_token_midpoint(position.token_id)
+                    if _mid_exc is not None:
+                        if _mid_exc < 0.02:
+                            # Orderbook unavailable and AMM mid near-zero — quarantine.
+                            # Shares still exist on-chain; don't force-close locally or
+                            # reconciliation will see a SEVERE mismatch. Let on-chain
+                            # settlement (EXCHANGE_POSITION_MISSING) close the position.
+                            _entry_ref_exc = position.entry_price_actual or position.entry_price
+                            position.current_mark_price = _mid_exc
+                            position.unrealized_pnl = round((_mid_exc - _entry_ref_exc) * position.remaining_size - position.fees_paid, 4)
+                            position.source_exit_following_enabled = False
+                            position.exit_state = "EXIT_DATA_UNAVAILABLE"
+                            self.audit.record(
+                                "quarantine_near_zero_amm",
+                                {
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                    "position_id": position.position_id,
+                                    "market_id": position.market_id,
+                                    "entry_price": _entry_ref_exc,
+                                    "remaining_size": position.remaining_size,
+                                    "mid": _mid_exc,
+                                    "reason": "orderbook_unavailable_near_zero",
+                                },
+                            )
+                            logger.info(
+                                "Quarantined near-zero position (orderbook unavailable, awaiting settlement) "
+                                "position_id={} market_id={} mid={}",
+                                position.position_id,
+                                position.market_id,
+                                _mid_exc,
+                            )
+                            position.last_reconciled_at = datetime.now(timezone.utc)
+                            continue
+                        else:
+                            # Market still active — update mark price so PnL shows correctly
+                            _entry_ref_exc = position.entry_price_actual or position.entry_price
+                            position.current_mark_price = _mid_exc
+                            position.unrealized_pnl = round(
+                                (_mid_exc - _entry_ref_exc) * position.remaining_size - position.fees_paid, 4
+                            )
+                except Exception:
+                    pass
+                if "404" in str(exc):
                     self.audit.record(
                         "live_exit_management_quarantined",
                         {

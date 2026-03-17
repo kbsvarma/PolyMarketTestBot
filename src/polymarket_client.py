@@ -624,6 +624,26 @@ class PolymarketClient:
                     return rows
             except Exception:
                 continue
+        # Fallback: find active sophisticated traders from recent large trades.
+        # The /trades endpoint returns rows with proxyWallet which the discovery
+        # service already knows how to extract as wallet_address.
+        try:
+            trade_rows = await self._get_json(f"{self.data_url}/trades", params={"limit": limit * 5, "minSize": 100})
+            if isinstance(trade_rows, list) and trade_rows:
+                wallet_size: dict[str, float] = {}
+                wallet_rows: dict[str, dict] = {}
+                for trade in trade_rows:
+                    wallet = str(trade.get("proxyWallet") or "")
+                    if wallet and not wallet.startswith("0x000"):
+                        wallet_size[wallet] = wallet_size.get(wallet, 0.0) + float(trade.get("size") or 0.0)
+                        if wallet not in wallet_rows:
+                            wallet_rows[wallet] = trade
+                sorted_wallets = sorted(wallet_size.items(), key=lambda x: x[1], reverse=True)[:limit]
+                rows = [wallet_rows[w] for w, _ in sorted_wallets]
+                if rows:
+                    return rows
+        except Exception:
+            pass
         if self._live_mode():
             raise RuntimeError("Unable to fetch real leaderboard in LIVE mode.")
         return []
@@ -681,6 +701,22 @@ class PolymarketClient:
                 bids=[OrderbookLevel(price=0.47, size=120), OrderbookLevel(price=0.46, size=180)],
                 asks=[OrderbookLevel(price=0.49, size=110), OrderbookLevel(price=0.50, size=150)],
             )
+
+    async def get_token_midpoint(self, token_id: str) -> float | None:
+        """Return the AMM midpoint price for a token, or None if unavailable.
+
+        Uses the CLOB /midpoint endpoint which returns the real market-clearing
+        price even for AMM-based markets where the /book endpoint shows placeholder
+        bids/asks (0.001/0.999).  Returns None on any error (404, network, etc.).
+        """
+        try:
+            payload = await self._get_json(f"{self.base_url}/midpoint", params={"token_id": token_id})
+            raw = payload.get("mid")
+            if raw is None:
+                return None
+            return float(raw)
+        except Exception:
+            return None
 
     async def get_balance(self) -> dict[str, Any]:
         if self._sdk_client is None:

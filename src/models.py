@@ -242,6 +242,7 @@ class TradeDecision(BaseModel):
     executable_price: float
     cluster_confirmed: bool
     hedge_suspicion_score: float
+    side: str = "BUY"
     thesis_type: str = "directional"
     bundle_id: str = ""
     bundle_role: str = ""

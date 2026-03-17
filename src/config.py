@@ -141,8 +141,12 @@ class StrategyConfig(BaseModel):
     supplemental_paper_relaxed_enabled: bool = True
     supplemental_paper_relaxed_min_confidence: float = 0.72
     paired_binary_min_edge_pct: float = 0.035
+    paired_binary_min_net_edge_pct: float = 0.012
     paired_binary_min_leg_price: float = 0.06
     paired_binary_max_leg_price: float = 0.94
+    paired_binary_slippage_buffer_pct: float = 0.003
+    paired_binary_max_candidates_per_cycle: int = 2
+    paired_binary_max_best_level_fraction: float = 0.15
     paired_binary_live_enabled: bool = False
     resolution_window_max_hours: int = 168
     resolution_window_min_price: float = 0.68
@@ -152,6 +156,57 @@ class StrategyConfig(BaseModel):
     resolution_window_target_fair_price: float = 0.94
     resolution_window_min_liquidity: float = 100.0
     resolution_window_live_enabled: bool = False
+
+
+class RTDSConfig(BaseModel):
+    """Real-Time Data Socket (RTDS) configuration."""
+    enabled: bool = True
+    url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/price"
+    ping_interval_seconds: float = 5.0
+    staleness_max_seconds: float = 1.5      # hard skip if RTDS older than this
+    clob_staleness_max_seconds: float = 0.8 # hard skip if CLOB book older than this
+
+
+class FeeConfig(BaseModel):
+    """Fee model configuration."""
+    # Minimum net edge after taker fees to allow a signal through
+    min_edge_after_fees_taker: float = 0.020   # 2.0 ¢
+    # Minimum net edge after maker rebate (net cost ~0) for maker fills
+    min_edge_after_fees_maker: float = 0.010   # 1.0 ¢
+    # Enable fee gate in risk_manager for all strategies (not just paired arb)
+    enable_global_fee_gate: bool = True
+
+
+class LagSignalConfig(BaseModel):
+    """Oracle-aligned lag signal configuration."""
+    enabled: bool = True
+    live_enabled: bool = False              # gate for live trading
+    # Minimum Binance-Chainlink price divergence (fraction) to consider a lag
+    min_price_divergence_pct: float = 0.003
+    # Minimum Binance move (fraction) over short window
+    min_spot_move_pct: float = 0.003
+    # Minimum Binance-Chainlink timestamp lag (ms)
+    min_lag_ms: float = 50.0
+    # Minimum net edge after fees to fire a signal
+    min_net_edge_taker: float = 0.020
+    min_net_edge_maker: float = 0.010
+    # Don't lag-arb if < N seconds remain in the window
+    min_time_remaining_seconds: float = 30.0
+    # Max candidates to emit per cycle
+    max_candidates_per_cycle: int = 2
+
+
+class CompletionTrackerConfig(BaseModel):
+    """Bayesian completion probability tracker configuration."""
+    enabled: bool = True
+    # Only enter leg-1 if P(complete) > this
+    entry_threshold: float = 0.70
+    # Abort (flatten) if posterior P(complete) drops below this
+    abort_threshold: float = 0.40
+    # Switch to management mode after this fraction of time-to-expiry has elapsed
+    deadline_fraction: float = 0.60
+    # Tick the tracker every N seconds during live monitoring
+    tick_interval_seconds: float = 5.0
 
 
 class EndpointConfig(BaseModel):
@@ -198,6 +253,11 @@ class AppConfig(BaseModel):
     strategies: StrategyConfig = Field(default_factory=StrategyConfig)
     endpoints: EndpointConfig = Field(default_factory=EndpointConfig)
     env: EnvConfig = Field(default_factory=EnvConfig)
+    # New modules
+    rtds: RTDSConfig = Field(default_factory=RTDSConfig)
+    fees: FeeConfig = Field(default_factory=FeeConfig)
+    lag_signal: LagSignalConfig = Field(default_factory=LagSignalConfig)
+    completion_tracker: CompletionTrackerConfig = Field(default_factory=CompletionTrackerConfig)
 
 
 RUNTIME_FILES: dict[str, str] = {

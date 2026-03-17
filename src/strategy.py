@@ -83,11 +83,19 @@ class StrategyEngine:
     ) -> list[TradeDecision]:
         if self.config.mode.value == "LIVE":
             if strategy_name == "paired_binary_arb":
-                timeout_seconds = self._stage_timeout_seconds(multiplier=0.5, minimum=4.0, maximum=12.0)
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.5, minimum=15.0, maximum=25.0)
+            elif strategy_name in {"correlation_dislocation", "resolution_window"}:
+                # Both strategies now call /midpoint for up to 10 markets (10 extra API calls).
+                # Give them 20-30s to avoid timeouts.
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.6, minimum=20.0, maximum=30.0)
+            elif strategy_name == "event_driven_official":
+                # event_driven_official makes 2+ API calls per signal and can have 6+ signals;
+                # give it more headroom so momentum signals don't time out.
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.8, minimum=20.0, maximum=45.0)
             else:
-                timeout_seconds = self._stage_timeout_seconds(multiplier=0.4, minimum=3.0, maximum=8.0)
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.4, minimum=3.0, maximum=12.0)
         else:
-            timeout_seconds = self._stage_timeout_seconds(multiplier=0.75, minimum=5.0, maximum=15.0)
+            timeout_seconds = self._stage_timeout_seconds(multiplier=0.75, minimum=5.0, maximum=20.0)
         try:
             return await asyncio.wait_for(coro, timeout=timeout_seconds)  # type: ignore[arg-type]
         except asyncio.TimeoutError:
@@ -376,6 +384,11 @@ class StrategyEngine:
         for position in active_positions:
             if position.get("closed"):
                 continue
+            # Quarantined positions (awaiting on-chain settlement) cannot be
+            # proactively exited, so exclude them from the tradeable exposure
+            # budget to avoid blocking new entries indefinitely.
+            if not position.get("source_exit_following_enabled", True):
+                continue
             notional = float(position.get("notional", 0.0))
             market_id = str(position.get("market_id", ""))
             wallet_address = str(position.get("wallet_address", ""))
@@ -600,6 +613,26 @@ class StrategyEngine:
                 self._write_decision_trace(detection, skip, False, [], discovery_state, scoring_state, decision_source_quality)
                 decisions.append(skip)
                 continue
+            # Skip markets whose end date is in the past (settled/expired markets).
+            # Old resolved markets sometimes surface as "recent" in the trades API.
+            _market_end_date = market_meta.get("endDate") or market_meta.get("end_date_iso")
+            if _market_end_date:
+                try:
+                    _end_dt = datetime.fromisoformat(str(_market_end_date).replace("Z", "+00:00"))
+                    if _end_dt < datetime.now(timezone.utc):
+                        skip = self._skip_decision(
+                            detection,
+                            wallet,
+                            min(detection.notional * self._select_copy_fraction(wallet), self._max_notional_for_mode()),
+                            "EXPIRED_MARKET",
+                            f"Signal skipped: market end date {_market_end_date} is in the past (settled/expired market).",
+                        )
+                        skip.context.update({"market_meta": market_meta, "discovery_state": discovery_state})
+                        self._write_decision_trace(detection, skip, False, [], discovery_state, scoring_state, decision_source_quality)
+                        decisions.append(skip)
+                        continue
+                except Exception:
+                    pass
             resolved_market_id = str(market_meta.get("market_id") or detection.market_id)
             resolved_token_id = str(detection.token_id or "").strip()
             if not resolved_token_id or resolved_token_id == "unknown-token":
@@ -1149,6 +1182,19 @@ class StrategyEngine:
         no_ask = float(no_orderbook.asks[0].price or 0.0)
         yes_size = float(yes_orderbook.asks[0].size or 0.0)
         no_size = float(no_orderbook.asks[0].size or 0.0)
+        # For AMM-based markets CLOB shows placeholder asks ≈0.999.  Use the real AMM
+        # midpoint price so bundle_sum_ask reflects actual trade cost, not 0.999+0.999.
+        _yes_bid = yes_orderbook.bids[0].price if yes_orderbook.bids else 0.0
+        _no_bid = no_orderbook.bids[0].price if no_orderbook.bids else 0.0
+        if (_yes_bid <= 0.01 and yes_ask >= 0.98) or (_no_bid <= 0.01 and no_ask >= 0.98):
+            yes_mid = await self.market_data.client.get_token_midpoint(yes_market.token_id)
+            no_mid = await self.market_data.client.get_token_midpoint(no_market.token_id)
+            if yes_mid is not None and yes_mid > 0:
+                yes_ask = yes_mid
+                yes_size = 1000.0  # AMM has effectively unlimited depth
+            if no_mid is not None and no_mid > 0:
+                no_ask = no_mid
+                no_size = 1000.0
         if yes_ask <= 0 or no_ask <= 0:
             return None
         if not (min_leg <= yes_ask <= max_leg and min_leg <= no_ask <= max_leg):
@@ -1445,7 +1491,26 @@ class StrategyEngine:
         entry_style: EntryStyle,
     ) -> FillEstimate:
         if entry_style == EntryStyle.FOLLOW_TAKER:
-            return estimate_fill(orderbook, target_notional, self.config.risk.max_slippage_pct)
+            fill = estimate_fill(orderbook, target_notional, self.config.risk.max_slippage_pct)
+            # Polymarket is AMM-based. Many actively traded markets have no real CLOB depth —
+            # the orderbook shows only placeholder bids/asks near 0.001/0.999.  In that case,
+            # estimate_fill returns executable_price≈0.999 which incorrectly triggers
+            # EXTREME_PRICE_BOOK.  Detect placeholder-only books and substitute the actual
+            # AMM price (the detection price paid by the followed wallet) as the executable price.
+            best_bid = orderbook.bids[0].price if orderbook.bids else 0.0
+            best_ask = orderbook.asks[0].price if orderbook.asks else 0.0
+            clob_is_placeholder = (best_bid <= 0.01 or best_ask <= 0.0) and (best_ask <= 0.0 or best_ask >= 0.98)
+            if clob_is_placeholder and detection.price > 0:
+                target_price = round(float(detection.price), 6)
+                return FillEstimate(
+                    fillable=True,
+                    executable_price=target_price,
+                    spread_pct=0.0,
+                    slippage_pct=0.0,
+                    filled_notional=round(target_notional, 6),
+                    reason="AMM proxy: using detection price as executable price for placeholder-only CLOB.",
+                )
+            return fill
         return self._estimate_resting_fill(detection, orderbook, target_notional, entry_style)
 
     def _estimate_resting_fill(
@@ -2494,7 +2559,12 @@ class StrategyEngine:
             if published_at is None:
                 continue
             age_seconds = max((now - published_at).total_seconds(), 0.0)
-            if age_seconds > self.config.strategies.official_signal_max_age_minutes * 60:
+            # Momentum signals (generated from on-chain activity for short-lived markets)
+            # expire quickly — 8 minutes.  External signals (news, research) use the
+            # configured official_signal_max_age_minutes value (typically 240 min).
+            _is_momentum_signal = str(row.get("event_id") or "").startswith("momentum_")
+            _signal_max_age_s = (8 * 60) if _is_momentum_signal else (self.config.strategies.official_signal_max_age_minutes * 60)
+            if age_seconds > _signal_max_age_s:
                 continue
             try:
                 fair_price = float(row.get("fair_price"))
@@ -2805,7 +2875,18 @@ class StrategyEngine:
                 orderbook = orderbooks[market.market_id]
                 if not orderbook.bids or not orderbook.asks:
                     continue
-                mid_prices[market.market_id] = round((orderbook.bids[0].price + orderbook.asks[0].price) / 2.0, 6)
+                _bid = orderbook.bids[0].price
+                _ask = orderbook.asks[0].price
+                # For AMM-based markets both sides are placeholders (bid≈0.001, ask≈0.999).
+                # Use the real AMM midpoint price from the CLOB /midpoint endpoint instead.
+                _clob_placeholder = (_bid <= 0.01) and (_ask >= 0.98)
+                if _clob_placeholder:
+                    _mid = await self.market_data.client.get_token_midpoint(market.token_id)
+                    if _mid is None or _mid <= 0.0:
+                        continue
+                    mid_prices[market.market_id] = round(_mid, 6)
+                else:
+                    mid_prices[market.market_id] = round((_bid + _ask) / 2.0, 6)
             if len(mid_prices) < 2:
                 continue
             best_pair = find_best_dislocation_pair(group, mid_prices, self.config.strategies.correlation_min_gap_pct)
@@ -2971,8 +3052,6 @@ class StrategyEngine:
         for market in self.market_data.market_cache.values():
             if market.closed or not market.active or not market.market_id or not market.token_id:
                 continue
-            if "sports" in (market.category or "").lower():
-                continue
             end_at = None
             if market.end_date_iso:
                 try:
@@ -3022,6 +3101,16 @@ class StrategyEngine:
                 diagnostic_counts["no_asks"] += 1
                 continue
             ask_price = orderbook.asks[0].price
+            # For AMM-based markets the CLOB shows placeholder bids/asks near 0.001/0.999.
+            # Fall back to the real AMM midpoint price when both sides look like placeholders.
+            _best_bid = orderbook.bids[0].price if orderbook.bids else 0.0
+            _clob_is_placeholder = (_best_bid <= 0.01) and (ask_price >= 0.98)
+            if _clob_is_placeholder:
+                midpoint = await self.market_data.client.get_token_midpoint(market.token_id)
+                if midpoint is None or midpoint <= 0.0:
+                    diagnostic_counts["no_asks"] += 1
+                    continue
+                ask_price = midpoint
             if ask_price < self.config.strategies.resolution_window_min_price:
                 diagnostic_counts["below_price_floor"] += 1
                 fair_price = max(self.config.strategies.resolution_window_target_fair_price, ask_price)
@@ -3113,6 +3202,7 @@ class StrategyEngine:
                 scaled_notional=self._max_notional_for_mode(),
                 reason="Near-resolution market is still discounted relative to conservative settlement value.",
                 confidence_score=round(confidence_score, 4),
+                thesis_type="resolution_arb",  # hold to resolution rather than stop-loss out early
                 extra_context={
                     "hours_to_resolution": round(hours_to_resolution, 3),
                     "market_liquidity": market.liquidity,

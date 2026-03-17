@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from src.config import AppConfig
+from src.fees import taker_fee, meets_min_edge
 from src.models import DecisionAction, DetectionEvent, FillEstimate, HealthState, RiskResult, WalletMetrics
 
 
@@ -60,6 +61,7 @@ class RiskManager:
         bankroll_override: float | None = None,
         entries_last_hour_override: int | None = None,
         stale_signal_seconds_override: float | None = None,
+        live_category_bypass: bool = False,
     ) -> RiskResult:
         bankroll = self.config.bankroll.paper_starting_bankroll if mode != "LIVE" else self.config.bankroll.live_bankroll_reference
         if mode != "LIVE" and bankroll_override and bankroll_override > 0:
@@ -133,7 +135,7 @@ class RiskManager:
         selected_category = category or wallet.dominant_category
         if selected_category not in self.config.risk.allow_categories:
             return RiskResult(allowed=False, reason_code="CATEGORY_BLOCKED", human_readable_reason="Category not allowed.", context={"category": selected_category})
-        if mode == "LIVE" and selected_category not in self.config.live.selected_categories:
+        if mode == "LIVE" and not live_category_bypass and selected_category not in self.config.live.selected_categories:
             return RiskResult(
                 allowed=False,
                 reason_code="LIVE_CATEGORY_NOT_SELECTED",
@@ -150,6 +152,23 @@ class RiskManager:
             return RiskResult(allowed=False, reason_code="INFRA_DEGRADED", human_readable_reason="Infrastructure health degraded.", context={})
         if not entry_style_allowed:
             return RiskResult(allowed=False, reason_code="ENTRY_STYLE_BLOCKED", human_readable_reason="Entry style not approved.", context={})
+        # Fee gate — only applies to crypto markets where taker fees are non-zero.
+        # Placed last so higher-priority reason codes (category, drift, etc.) take precedence.
+        if self.config.fees.enable_global_fee_gate and fill.fillable and detection.price > 0:
+            _exec_p = float(fill.executable_price)
+            _fc = category or wallet.dominant_category
+            _fee = taker_fee(_exec_p, category=_fc)
+            if _fee > 0:
+                _gross_edge = detection.price - _exec_p
+                _net_edge = _gross_edge - _fee
+                _min_net = self.config.fees.min_edge_after_fees_taker
+                if _net_edge < _min_net:
+                    return RiskResult(
+                        allowed=False,
+                        reason_code="NET_EDGE_AFTER_FEES",
+                        human_readable_reason=f"Net edge after fees ({_net_edge:.4f}) below minimum ({_min_net:.4f}).",
+                        context={"gross_edge": round(_gross_edge, 6), "fee": round(_fee, 6), "net_edge": round(_net_edge, 6), "min_net_edge": _min_net},
+                    )
         return RiskResult(
             allowed=True,
             reason_code="OK",

@@ -130,10 +130,8 @@ def build_relationship_groups(markets: list[MarketInfo], min_group_size: int) ->
         if not market.market_id or not market.token_id or market.closed or not market.active:
             continue
         category = (market.category or "").lower()
-        # Sports futures create lots of noisy same-team cross-competition groupings that
-        # are not useful for this dislocation heuristic.
-        if "sports" in category:
-            continue
+        # NOTE: sports markets are now included — dated playoff/championship markets can
+        # legitimately show dislocation (e.g. "wins series in 5" vs "wins series in 6").
         for key in relationship_keys(market):
             groups[(market.category, key)].append(market)
     candidates: list[list[MarketInfo]] = []
