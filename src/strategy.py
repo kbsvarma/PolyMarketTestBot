@@ -83,19 +83,19 @@ class StrategyEngine:
     ) -> list[TradeDecision]:
         if self.config.mode.value == "LIVE":
             if strategy_name == "paired_binary_arb":
-                timeout_seconds = self._stage_timeout_seconds(multiplier=0.5, minimum=15.0, maximum=25.0)
+                # Paired arb needs orderbook lookups but keep it snappy
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.4, minimum=8.0, maximum=15.0)
             elif strategy_name in {"correlation_dislocation", "resolution_window"}:
-                # Both strategies now call /midpoint for up to 10 markets (10 extra API calls).
-                # Give them 20-30s to avoid timeouts.
-                timeout_seconds = self._stage_timeout_seconds(multiplier=0.6, minimum=20.0, maximum=30.0)
+                # Supplemental paper-only strategies: capped tightly so they don't eat
+                # into the 60s strategy_process budget and cause cascading stage timeouts.
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.35, minimum=6.0, maximum=12.0)
             elif strategy_name == "event_driven_official":
-                # event_driven_official makes 2+ API calls per signal and can have 6+ signals;
-                # give it more headroom so momentum signals don't time out.
-                timeout_seconds = self._stage_timeout_seconds(multiplier=0.8, minimum=20.0, maximum=45.0)
+                # Momentum signals — allow a bit more for API calls but still lean
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.5, minimum=8.0, maximum=20.0)
             else:
-                timeout_seconds = self._stage_timeout_seconds(multiplier=0.4, minimum=3.0, maximum=12.0)
+                timeout_seconds = self._stage_timeout_seconds(multiplier=0.4, minimum=3.0, maximum=10.0)
         else:
-            timeout_seconds = self._stage_timeout_seconds(multiplier=0.75, minimum=5.0, maximum=20.0)
+            timeout_seconds = self._stage_timeout_seconds(multiplier=0.5, minimum=5.0, maximum=15.0)
         try:
             return await asyncio.wait_for(coro, timeout=timeout_seconds)  # type: ignore[arg-type]
         except asyncio.TimeoutError:

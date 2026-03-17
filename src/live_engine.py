@@ -1048,9 +1048,12 @@ class LiveTradingEngine:
             return
 
         state_snapshot = self.state.read()
-        if state_snapshot.get("paused") or state_snapshot.get("kill_switch") or state_snapshot.get("manual_resume_required"):
+        # Hard stop: kill switch always blocks everything
+        if state_snapshot.get("kill_switch"):
             return
-        if not state_snapshot.get("live_readiness_last_result", {}).get("ready", False):
+        # Hard stop: emergency flatten ignores pause state but needs readiness
+        if self.config.live.emergency_flatten_flag:
+            await self._emergency_flatten()
             return
 
         geostatus = self.geoblock.live_trading_allowed()
@@ -1058,14 +1061,24 @@ class LiveTradingEngine:
             self.state.pause(geostatus.detail)
             return
 
-        if self.config.live.emergency_flatten_flag:
-            await self._emergency_flatten()
+        # Soft stop: paused or manual_resume_required — block new entries but
+        # still manage open orders and apply exits so winners don't sit uncollected.
+        _entries_allowed = (
+            not state_snapshot.get("paused")
+            and not state_snapshot.get("manual_resume_required")
+            and state_snapshot.get("live_readiness_last_result", {}).get("ready", False)
+        )
+        if not _entries_allowed and not state_snapshot.get("paused"):
+            # readiness not yet evaluated — skip everything
+            pass
+        if state_snapshot.get("kill_switch"):
             return
 
         health = await self.collect_health()
         if health.overall == HealthState.UNHEALTHY:
             self.state.update_system_status(live_health_state=health.overall.value)
-            return
+            if _entries_allowed:
+                return
 
         try:
             self.state_machine.transition(SystemStatus.LIVE_ACTIVE, "Managing live orders.")
@@ -1079,10 +1092,15 @@ class LiveTradingEngine:
 
         self.state.update_system_status(**self._operator_cap_state(live_positions, live_orders))
 
+        # Always run exit/order management even when entries are blocked
         await self._manage_existing_orders(live_orders, live_positions, decisions)
         await self._apply_live_exits(live_positions, live_orders)
         await self._repair_closed_live_positions_from_exit_orders(live_positions=live_positions, live_orders=live_orders)
         await self._repair_missing_live_positions(live_positions=live_positions, live_orders=live_orders)
+
+        # New entries only allowed when fully ready and not paused
+        if not _entries_allowed:
+            return
 
         for decision in decisions:
             effective_decision = decision

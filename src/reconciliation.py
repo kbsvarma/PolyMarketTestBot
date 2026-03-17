@@ -7,6 +7,11 @@ from src.models import ReconciliationIssue, ReconciliationSummary
 
 RECENT_EXCHANGE_VISIBILITY_GRACE_SECONDS = 90.0
 
+# Position size tolerance: differences within these bounds are WARN, not SEVERE.
+# Handles fill-rounding and partial-exit edge cases (e.g. local=5.0 vs exchange=5.55).
+POSITION_SIZE_TOLERANCE_ABS = 1.5   # absolute share difference
+POSITION_SIZE_TOLERANCE_REL = 0.15  # relative fraction of exchange size
+
 
 def _normalize_order_status(value: object) -> str:
     status = str(value or "").upper()
@@ -83,6 +88,42 @@ def _is_recent_exchange_lag(value: object, now: datetime) -> bool:
     return (now - parsed).total_seconds() <= RECENT_EXCHANGE_VISIBILITY_GRACE_SECONDS
 
 
+def _local_position_market_key(item: dict) -> tuple[str, str, str]:
+    """Match key without quantity — size is checked separately with tolerance."""
+    return (
+        str(item.get("market_id")),
+        str(item.get("token_id")),
+        str(item.get("side", "BUY")),
+    )
+
+
+def _exchange_position_market_key(item: dict) -> tuple[str, str, str]:
+    """Match key without quantity — size is checked separately with tolerance."""
+    return (
+        str(item.get("market_id") or item.get("conditionId") or item.get("market")),
+        str(item.get("token_id") or item.get("asset") or item.get("asset_id") or item.get("tokenId")),
+        str(item.get("side") or "BUY"),
+    )
+
+
+def _exchange_position_quantity(item: dict) -> float:
+    try:
+        return round(float(item.get("quantity") or item.get("size") or item.get("shares") or 0.0), 6)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _size_within_tolerance(local_qty: float, exchange_qty: float) -> bool:
+    """Return True if the size difference is small enough to be treated as WARN."""
+    diff = abs(local_qty - exchange_qty)
+    if diff <= POSITION_SIZE_TOLERANCE_ABS:
+        return True
+    if exchange_qty > 0 and diff / exchange_qty <= POSITION_SIZE_TOLERANCE_REL:
+        return True
+    return False
+
+
+# Keep old key functions as aliases used internally for log detail strings
 def _local_position_key(item: dict) -> tuple[str, str, str, float]:
     quantity_source = item.get("remaining_size")
     if quantity_source in (None, "", 0, 0.0):
@@ -162,23 +203,60 @@ def reconcile_live_state(local_positions: list[dict], exchange_positions: list[d
         for item in local_positions
         if not item.get("closed") and _local_position_open_quantity(item) > 0
     ]
-    local_position_keys = {_local_position_key(item) for item in local_open_positions}
-    exchange_position_keys = {_exchange_position_key(item) for item in exchange_positions}
+    # Build market-key maps (market_id, token_id, side) — no quantity in key
+    local_by_market_key: dict[tuple[str, str, str], dict] = {
+        _local_position_market_key(item): item for item in local_open_positions
+    }
+    exchange_by_market_key: dict[tuple[str, str, str], dict] = {
+        _exchange_position_market_key(item): item for item in exchange_positions
+    }
+
+    # Positions that exist in one place but not the other — unambiguously bad
     unmatched_local_positions = [
-        item for item in local_open_positions if _local_position_key(item) not in exchange_position_keys
+        item for item in local_open_positions
+        if _local_position_market_key(item) not in exchange_by_market_key
     ]
     unmatched_exchange_positions = [
-        item for item in exchange_positions if _exchange_position_key(item) not in local_position_keys
+        item for item in exchange_positions
+        if _exchange_position_market_key(item) not in local_by_market_key
     ]
     significant_unmatched_local_positions = [
         item for item in unmatched_local_positions if not _should_grace_local_position(item, now)
     ]
-    if significant_unmatched_local_positions or unmatched_exchange_positions:
+
+    # Positions that exist on both sides but sizes diverge beyond tolerance
+    size_mismatch_severe: list[tuple[tuple[str, str, str], float, float]] = []
+    size_mismatch_warn: list[tuple[tuple[str, str, str], float, float]] = []
+    for mkey, local_item in local_by_market_key.items():
+        if mkey not in exchange_by_market_key:
+            continue
+        local_qty = _local_position_open_quantity(local_item)
+        exchange_qty = _exchange_position_quantity(exchange_by_market_key[mkey])
+        if abs(local_qty - exchange_qty) == 0:
+            continue
+        if _size_within_tolerance(local_qty, exchange_qty):
+            size_mismatch_warn.append((mkey, local_qty, exchange_qty))
+        else:
+            size_mismatch_severe.append((mkey, local_qty, exchange_qty))
+
+    if significant_unmatched_local_positions or unmatched_exchange_positions or size_mismatch_severe:
+        local_position_keys = {_local_position_key(item) for item in local_open_positions}
+        exchange_position_keys = {_exchange_position_key(item) for item in exchange_positions}
         issues.append(
             ReconciliationIssue(
                 severity="SEVERE",
                 issue_type="POSITION_MISMATCH",
                 detail=f"local={sorted(local_position_keys)} exchange={sorted(exchange_position_keys)}",
+            )
+        )
+    elif size_mismatch_warn:
+        # Minor fill-rounding discrepancies: log as WARN but don't block the bot
+        warn_detail = "; ".join(f"{k[0][:16]} local={lq} exchange={eq}" for k, lq, eq in size_mismatch_warn)
+        issues.append(
+            ReconciliationIssue(
+                severity="WARN",
+                issue_type="POSITION_SIZE_DRIFT",
+                detail=f"Size within tolerance — fill rounding or partial exit: {warn_detail}",
             )
         )
 
@@ -221,4 +299,7 @@ def reconcile_live_state(local_positions: list[dict], exchange_positions: list[d
         )
 
     severity = "NONE" if not issues else ("SEVERE" if any(issue.severity == "SEVERE" for issue in issues) else "WARN")
-    return ReconciliationSummary(clean=not issues, severity=severity, issues=issues)
+    # Only mark unclean when there are SEVERE issues — WARN-only (fill rounding, minor
+    # size drift) should not block the bot from entering or exiting positions.
+    has_severe = any(issue.severity == "SEVERE" for issue in issues)
+    return ReconciliationSummary(clean=not has_severe, severity=severity, issues=issues)
