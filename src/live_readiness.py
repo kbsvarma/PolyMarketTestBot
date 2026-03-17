@@ -12,9 +12,19 @@ def build_readiness_result(config: AppConfig, state: AppStateStore, health: Syst
     manual_live_enabled = bool(current.get("manual_live_enable", False) or config.live.manual_live_enable)
     market_ws_component = next((component for component in health.components if component.name == "market_ws"), None)
     market_ws_usable = market_ws_component is None or market_ws_component.state != HealthState.UNHEALTHY
+    _pause_reason = str(current.get("pause_reason", ""))
+    # Auto-clear a stale readiness/reconciliation pause when current checks pass.
+    # The two pause messages come from different code paths:
+    #   • "Live readiness gate failed."       — from refresh_live_status
+    #   • "Live reconciliation mismatch: …"   — from end-of-cycle reconcile
+    # Both should be treated as transient and self-clearing once reconciliation
+    # is clean again, so the bot doesn't require manual intervention for fill-
+    # rounding discrepancies.
+    _reconciliation_pause = _pause_reason.startswith("Live reconciliation mismatch")
+    _readiness_pause = _pause_reason == "Live readiness gate failed."
     stale_pause_cleared_by_current_truth = (
         current.get("paused", False)
-        and str(current.get("pause_reason", "")) == "Live readiness gate failed."
+        and (_readiness_pause or _reconciliation_pause)
         and bool(client_checks.get("reconciliation_clean", False))
     )
     pause_blocking = bool(current.get("paused", False)) and not stale_pause_cleared_by_current_truth
