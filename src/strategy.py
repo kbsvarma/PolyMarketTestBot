@@ -82,16 +82,16 @@ class StrategyEngine:
         cycle_ts: datetime,
     ) -> list[TradeDecision]:
         if self.config.mode.value == "LIVE":
+            if strategy_name in {"correlation_dislocation", "resolution_window", "event_driven_official"}:
+                # These three strategies have produced 0% live conversion across hundreds of
+                # cycles while consuming 30-60% of the cycle budget (7-20s each).  Skip them
+                # entirely in LIVE mode so the full budget is available for wallet_follow.
+                if hasattr(coro, "close"):
+                    coro.close()
+                return []
             if strategy_name == "paired_binary_arb":
                 # Paired arb needs orderbook lookups but keep it snappy
                 timeout_seconds = self._stage_timeout_seconds(multiplier=0.4, minimum=8.0, maximum=15.0)
-            elif strategy_name in {"correlation_dislocation", "resolution_window"}:
-                # Supplemental paper-only strategies: capped tightly so they don't eat
-                # into the 60s strategy_process budget and cause cascading stage timeouts.
-                timeout_seconds = self._stage_timeout_seconds(multiplier=0.35, minimum=6.0, maximum=12.0)
-            elif strategy_name == "event_driven_official":
-                # Momentum signals — allow a bit more for API calls but still lean
-                timeout_seconds = self._stage_timeout_seconds(multiplier=0.5, minimum=8.0, maximum=20.0)
             else:
                 timeout_seconds = self._stage_timeout_seconds(multiplier=0.4, minimum=3.0, maximum=10.0)
         else:
@@ -1436,19 +1436,20 @@ class StrategyEngine:
         category_priority = self._live_category_priority(category)
         style_score = 1.0 if entry_style in {EntryStyle.PASSIVE_LIMIT, EntryStyle.POST_ONLY_MAKER} else 0.35
         wallet_score = clamp(float(wallet.global_score or 0.0), 0.0, 1.0)
-        burst_penalty = max(burst_size - 1, 0) * 0.04
+        # Multi-wallet consensus is a signal of strength, not noise — reward it.
+        burst_bonus = min(max(burst_size - 1, 0), 4) * 0.02
         opposing_share_penalty = clamp(opposing_wallets / max(same_side_wallets + opposing_wallets, 1), 0.0, 1.0) * 0.12
         score = clamp(
             wallet_score * 0.2
             + consensus_ratio * 0.22
             + notional_ratio * 0.14
-            + max(cluster_strength, 0.35 if same_side_wallets >= 2 else 0.0) * 0.16
+            + (cluster_strength if same_side_wallets >= 2 else 0.0) * 0.16
             + freshness_score * 0.14
             + category_priority * 0.1
             + source_quality_score * 0.08
             + price_band_score * 0.06
             + style_score * 0.04
-            - burst_penalty
+            + burst_bonus
             - opposing_share_penalty,
             0.0,
             1.0,
@@ -1601,7 +1602,7 @@ class StrategyEngine:
             extreme_price_penalty = 0.35
         elif not (self.config.live.preferred_entry_price_min <= price <= self.config.live.preferred_entry_price_max):
             extreme_price_penalty = 0.1
-        burst_penalty = max(burst_size - 1, 0) * 0.05
+        burst_bonus = min(max(burst_size - 1, 0), 4) * 0.025
         return round(
             wallet.global_score * 0.55
             + fillability_score * 0.55
@@ -1612,9 +1613,9 @@ class StrategyEngine:
             + strategy_bonus
             + (0.15 if decision.cluster_confirmed else 0.0)
             + hybrid_modifier
+            + burst_bonus
             - slippage
             - extreme_price_penalty
-            - burst_penalty
             - wallet.hedge_suspicion_score * 0.4,
             6,
         )
