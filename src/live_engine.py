@@ -361,7 +361,37 @@ class LiveTradingEngine:
             remaining_exchange_quantity = exchange_quantity
             for position in sorted(positions_for_key, key=lambda item: item.opened_at):
                 current_open_size = self._position_open_size(position)
-                target_open_size = min(current_open_size, remaining_exchange_quantity)
+                # Normal case: exchange shows ≤ local — the exchange settled a partial or
+                # full exit we placed, so shrink local to match.
+                # Repair case: exchange shows > local — a prior exit order was placed
+                # locally (PARTIAL_EXIT) but never settled on-chain (cancelled/timed out).
+                # Local state is ahead of reality: restore local to the exchange quantity
+                # so reconciliation clears and the position can be properly re-evaluated.
+                if remaining_exchange_quantity > current_open_size and position.exit_state == "PARTIAL_EXIT":
+                    target_open_size = min(remaining_exchange_quantity, position.entry_size or position.quantity)
+                    position.exit_state = "OPEN"
+                    position.exited_size = max(0.0, round((position.entry_size or position.quantity) - target_open_size, 6))
+                    logger.info(
+                        "Repaired PARTIAL_EXIT: exchange shows larger size than local "
+                        "position_id={} local={} exchange={} restored={}",
+                        position.position_id,
+                        current_open_size,
+                        remaining_exchange_quantity,
+                        target_open_size,
+                    )
+                    self.audit.record(
+                        "live_partial_exit_reverted_from_exchange",
+                        {
+                            "ts": now.isoformat(),
+                            "position_id": position.position_id,
+                            "market_id": position.market_id,
+                            "local_size": current_open_size,
+                            "exchange_size": remaining_exchange_quantity,
+                            "restored_size": target_open_size,
+                        },
+                    )
+                else:
+                    target_open_size = min(current_open_size, remaining_exchange_quantity)
                 if self._sync_position_open_size(position, target_open_size, current_mark_price, now):
                     repaired = True
                 remaining_exchange_quantity = max(remaining_exchange_quantity - target_open_size, 0.0)
@@ -1397,14 +1427,59 @@ class LiveTradingEngine:
             if self._is_unmanaged_exit_hold(position):
                 stored_mark = position.current_mark_price or 0.0
                 last_check = position.last_reconciled_at
+                now_utc = datetime.now(timezone.utc)
                 try:
                     if isinstance(last_check, datetime):
                         _aware = last_check if last_check.tzinfo else last_check.replace(tzinfo=timezone.utc)
-                        minutes_since_check = (datetime.now(timezone.utc) - _aware).total_seconds() / 60.0
+                        minutes_since_check = (now_utc - _aware).total_seconds() / 60.0
                     else:
                         minutes_since_check = 999.0
                 except Exception:
                     minutes_since_check = 999.0
+
+                # 48-hour hard timeout: if a position has been stuck as
+                # EXIT_DATA_UNAVAILABLE for more than 48 hours with no on-chain
+                # settlement detected, close it locally at the last known mark
+                # price.  The exchange will settle it on-chain when resolved;
+                # locally we must free exposure and stop letting it sit idle.
+                try:
+                    _opened = position.opened_at
+                    if _opened is not None:
+                        _opened_aware = _opened if _opened.tzinfo else _opened.replace(tzinfo=timezone.utc)
+                        hours_stuck = (now_utc - _opened_aware).total_seconds() / 3600.0
+                    else:
+                        hours_stuck = 0.0
+                except Exception:
+                    hours_stuck = 0.0
+
+                if hours_stuck >= 48.0:
+                    _close_price = position.current_mark_price or 0.005
+                    _entry_ref_to = position.entry_price_actual or position.entry_price
+                    _realized = round((_close_price - _entry_ref_to) * position.remaining_size - position.fees_paid, 4)
+                    position.realized_pnl = round((position.realized_pnl or 0.0) + _realized, 4)
+                    position.unrealized_pnl = 0.0
+                    position.closed = True
+                    position.closed_at = now_utc
+                    position.exit_state = "CLOSED"
+                    position.remaining_size = 0.0
+                    self.audit.record(
+                        "exit_data_unavailable_timeout_close",
+                        {
+                            "ts": now_utc.isoformat(),
+                            "position_id": position.position_id,
+                            "market_id": position.market_id,
+                            "hours_stuck": round(hours_stuck, 1),
+                            "close_price": _close_price,
+                            "realized_pnl": _realized,
+                        },
+                    )
+                    logger.warning(
+                        "EXIT_DATA_UNAVAILABLE 48h timeout — closing locally "
+                        "position_id={} hours_stuck={:.1f} close_price={} realized_pnl={}",
+                        position.position_id, hours_stuck, _close_price, _realized,
+                    )
+                    continue
+
                 if stored_mark >= 0.10 and minutes_since_check >= 10.0:
                     # Retry: try midpoint first (cheaper), then orderbook
                     try:
@@ -1496,7 +1571,13 @@ class LiveTradingEngine:
                 if _using_amm_mid:
                     exit_price_floor = 0.001  # near-zero only; real mid already validated
                 else:
-                    exit_price_floor = max(float(self.config.live.hard_skip_price_floor), entry_ref * 0.10)
+                    # Exit floor must NOT use the entry hard_skip_price_floor — that filter
+                    # is for new entries (avoid cheap markets), not exits (avoid catastrophic
+                    # fills).  Applying it to exits silently blocked valid exits: e.g. an
+                    # entry at 0.35 with bid 0.29 was rejected because 0.29 < floor 0.30,
+                    # even though the position had only lost 17%.  Use a relative gate only:
+                    # block exits where the bid represents >90% loss from entry.
+                    exit_price_floor = max(0.005, entry_ref * 0.10)
                 if raw_bid < exit_price_floor:
                     self.audit.record(
                         "exit_price_floor_skip",
@@ -1516,6 +1597,10 @@ class LiveTradingEngine:
                 # Clear any stale exit state — position has a valid price and is being monitored
                 if position.exit_state in ("EXIT_PRICE_TOO_LOW", "EXIT_DATA_UNAVAILABLE"):
                     position.exit_state = "OPEN"
+                # PARTIAL_EXIT: a prior exit order was started but not fully completed
+                # (e.g. due to order timeout/cancel).  Force completion so local state
+                # stays in sync with exchange and reconciliation stays clean.
+                _was_partial_exit = position.exit_state == "PARTIAL_EXIT"
                 should_exit, reason = evaluate_exit(
                     position,
                     best_bid,
@@ -1529,6 +1614,18 @@ class LiveTradingEngine:
                     strong_winner_retrace_pct=self.config.live.strong_winner_retrace_pct,
                     paired_arb_time_stop_hours=self.config.live.paired_arb_time_stop_hours,
                 )
+                if not should_exit and _was_partial_exit:
+                    # Force-complete the remaining position — we already started exiting
+                    # and must finish to restore reconciliation consistency.
+                    should_exit = True
+                    reason = "PARTIAL_EXIT_COMPLETION"
+                    logger.info(
+                        "Force-completing PARTIAL_EXIT position to restore reconciliation "
+                        "position_id={} remaining_size={} bid={}",
+                        position.position_id,
+                        position.remaining_size,
+                        best_bid,
+                    )
                 if not should_exit:
                     continue
 
