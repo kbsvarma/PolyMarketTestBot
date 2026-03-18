@@ -847,6 +847,7 @@ async def run_bracket_signal_observer(
                             no_ask_final=w.no_ask(),
                             last_signal_event=last_event_dict,
                             eval_log_path=cfg.evaluation_log_path,
+                            yes_won=yes_won,  # pass directly — more reliable than ask-price inference
                         )
 
                     # Settle any open bracket positions for this window

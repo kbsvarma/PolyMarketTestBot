@@ -152,11 +152,16 @@ class WindowReportWriter:
         no_ask_final: float,
         last_signal_event: dict | None,
         eval_log_path: str,
+        yes_won: bool | None = None,
     ) -> None:
         """
         Called when a window transition is detected. Reads the evaluation log
         for the closing window, builds a summary, appends it, and rewrites
         the report.
+
+        yes_won: directly passed from the evaluator (asset_close > asset_open).
+          Preferred over inferring from ask prices, which are unreliable at
+          settlement time (both tokens go near 0, making inference ambiguous).
         """
         gate_counts = self._scan_eval_log(eval_log_path, window_ts, asset)
 
@@ -186,16 +191,23 @@ class WindowReportWriter:
                 # actual y price at which Phase 2 would have triggered.
                 phase2_price = float(obs.get("phase2_trigger_price") or 0.0)
 
-        # Infer resolution from final prices
+        # Resolve outcome — prefer the directly-passed yes_won flag (most reliable).
+        # Post-settlement ask prices are unreliable: after market close both tokens
+        # drop to near-zero (no one quotes a settled market), so price-based inference
+        # frequently returns wrong results.  The yes_won flag is computed directly
+        # from asset_close > asset_open which is always available and correct.
         resolved_yes: Optional[bool] = None
-        if yes_ask_final >= 0.90:
-            resolved_yes = True   # YES near 1.0 = YES won
+        if yes_won is not None:
+            resolved_yes = yes_won   # direct — always use this when available
+        elif yes_ask_final >= 0.90:
+            resolved_yes = True      # YES near 1.0 = YES won (pre-settlement snap)
         elif no_ask_final >= 0.90:
-            resolved_yes = False  # NO near 1.0 = NO won
-        elif yes_ask_final <= 0.10:
-            resolved_yes = False  # YES near 0 = NO won
-        elif no_ask_final <= 0.10:
-            resolved_yes = True   # NO near 0 = YES won
+            resolved_yes = False     # NO near 1.0 = NO won (pre-settlement snap)
+        elif yes_ask_final <= 0.10 and no_ask_final > yes_ask_final:
+            resolved_yes = False     # YES near 0 AND NO higher → NO won
+        elif no_ask_final <= 0.10 and yes_ask_final > no_ask_final:
+            resolved_yes = True      # NO near 0 AND YES higher → YES won
+        # else: both near 0 and can't tell — leave None (ambiguous post-settlement)
 
         # Compute hypothetical PnL
         hyp_pnl_per_share = 0.0

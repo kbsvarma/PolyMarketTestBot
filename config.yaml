@@ -218,8 +218,8 @@ crypto_direction:
 
   # Asset selection
   track_btc: true
-  track_eth: true
-  prefer_higher_liquidity: true       # Use whichever market (BTC/ETH) has more liquidity
+  track_eth: false                    # ETH paused — BTC-only mode for cleaner signal data
+  prefer_higher_liquidity: false      # Single asset (BTC), no need to compare liquidity
 
   # Signal gate parameters
   window_settle_seconds: 75           # Wait 75s after window open before evaluating (AMM settling)
