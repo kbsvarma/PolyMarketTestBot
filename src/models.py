@@ -426,3 +426,123 @@ class ReconciliationSummary(BaseModel):
     severity: str
     issues: list[ReconciliationIssue] = Field(default_factory=list)
     checked_at: datetime = Field(default_factory=utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Bracket strategy — direction signal models
+# ---------------------------------------------------------------------------
+
+class WindowCheckpoint(BaseModel):
+    """
+    A single BTC or ETH price sample recorded at a :00-second boundary.
+
+    We only record prices at :00-second marks (e.g., 14:03:00, 14:04:00)
+    because those are the reference points Chainlink uses for settlement.
+    Using these as checkpoints means our chop filter is evaluating the
+    same price series that will determine the outcome.
+    """
+    ts: float       # Unix epoch seconds — always a :00-second boundary
+    price: float    # BTC/USD or ETH/USD price at this moment
+
+
+class PostSignalObservation(BaseModel):
+    """
+    Tracks what actually happened AFTER a direction signal fired.
+
+    This is filled in continuously on every poll cycle until the 15m window
+    closes. It answers the key calibration questions:
+      - Did the bracket actually become achievable?
+      - Would Phase 2 (opposite-side buy) have triggered?
+      - What profit would the early-exit path have captured?
+
+    No orders are placed — this is purely observation data for strategy
+    validation and parameter calibration.
+    """
+    # Links back to the BracketSignalEvent that spawned this observation
+    event_id: str
+
+    # Bracket margin tracking: best spread seen after signal (positive = profitable)
+    # bracket_margin = 1.0 - (x_cost*(1+fee_x) + y_cost*(1+fee_y))
+    peak_bracket_margin: float = 0.0
+
+    # Lowest price seen for the opposite side after the signal fired
+    # (the floor we'd wait for before buying the second leg)
+    min_opposite_price: float = 999.0
+
+    # Would the bracket equation have been solvable at any point?
+    # True if x + y + fees < $1.00 was satisfied after signal fired
+    bracket_would_have_formed: bool = False
+
+    # Phase 2 check: did the opposite side reverse upward from its floor
+    # by more than the reversal_threshold? This is the trigger for buying
+    # the second leg in the real strategy.
+    phase2_would_have_triggered: bool = False
+    phase2_trigger_price: float | None = None  # y price at the reversal point
+
+    # Momentum side tracking: how far did it travel after signal?
+    momentum_side_peak: float = 0.0       # highest momentum_side ask seen
+    momentum_side_at_close: float = 0.0   # momentum_side ask at window close
+
+    # Resolution outcome (filled in when window resolves)
+    outcome: str = ""                     # "YES_WINS", "NO_WINS", "UNKNOWN"
+    asset_close_price: float = 0.0        # BTC/ETH price at window close
+
+    # Estimated P&L if Phase 1 was exited at the momentum_side peak
+    # (the early-exit path: sell momentum_side when bracket never formed)
+    estimated_phase1_exit_pnl: float = 0.0   # in dollars per 10-share position
+
+
+class BracketSignalEvent(BaseModel):
+    """
+    Emitted when all direction signal gates pass for a 15m BTC/ETH market.
+
+    This records the complete state at signal-fire time so we can:
+      1. Replay and audit exactly why the signal fired
+      2. Compare predicted vs actual market movement
+      3. Calibrate gate thresholds (lag_threshold, entry_range, chop_window)
+
+    IMPORTANT: This module is observation-only. No orders are placed.
+    The 'observation' field is populated after the window closes.
+    """
+    event_id: str           # uuid4 — unique identifier for this signal
+    fired_at: datetime      # UTC timestamp when signal fired
+    asset: str              # "BTC" or "ETH"
+
+    # --- Window context ---
+    window_open_ts: int     # Unix ts of 15m window start (:00/:15/:30/:45 minute)
+    window_close_ts: int    # window_open_ts + 900
+    minutes_remaining: float    # minutes left when signal fired (should be > 9.0)
+    mid_window_start: bool = False  # True if bot started mid-window (less reliable baseline)
+
+    # --- Asset price at signal time ---
+    asset_open: float       # Asset price at window open (BTC/USD or ETH/USD)
+    asset_current: float    # Asset price when signal fired
+    asset_move_pct: float   # (asset_current - asset_open) / asset_open — direction + magnitude
+
+    # --- Signal quality metrics ---
+    momentum_side: str      # "YES" (BTC going up) or "NO" (BTC going down)
+    momentum_price: float   # Best ask price of momentum_side token at signal time
+    opposite_price: float   # Best ask price of opposite_side token at signal time
+    implied_momentum_price: float  # GBM-model fair value for momentum_side
+    lag_gap: float          # implied_momentum_price - momentum_price (larger = better entry)
+    chop_score: float       # 0.0 (choppy) to 1.0 (perfectly clean directional move)
+
+    # --- :00-second BTC/ETH price history this window ---
+    checkpoints: list[WindowCheckpoint] = Field(default_factory=list)
+
+    # --- Fee context (using the actual Polymarket crypto fee curve) ---
+    fee_at_momentum_price: float   # taker_fee(momentum_price, "crypto price")
+    fee_at_target_y: float         # taker_fee(target_y_price, "crypto price")
+    # Net bracket margin if second leg enters at target_y (e.g. 0.34):
+    # 1.0 - momentum_price*(1+fee_x) - target_y*(1+fee_y)
+    net_bracket_at_target: float
+
+    # --- Market identifiers ---
+    market_id: str
+    yes_token_id: str
+    no_token_id: str
+    market_liquidity: float = 0.0   # From Polymarket market metadata
+    market_volume: float = 0.0      # 24h volume if available
+
+    # --- Post-signal outcome (populated after window closes) ---
+    observation: PostSignalObservation | None = None

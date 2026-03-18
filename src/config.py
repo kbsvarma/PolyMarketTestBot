@@ -382,21 +382,16 @@ class CryptoDirectionConfig(BaseModel):
     # ---- Live execution (bracket_executor.py) ----
     # SAFETY: execute_enabled MUST be set true in config AND LIVE_TRADING_ENABLED
     # must be set in .env before any real orders are placed.
-    #
-    # SEQUENTIAL TESTING:
-    #   Step 1 — set execute_enabled: true, phase2_enabled: false
-    #            Verify Phase 1 fills in logs/bracket_trades.jsonl
-    #   Step 2 — set phase2_enabled: true
-    #            Phase 2 bracket orders will now be placed automatically
+    # To go live: set execute_enabled: true in config.yaml and run:
+    #   python main.py --execute-crypto
     execute_enabled: bool = False               # master switch — must be explicit
-    phase2_enabled: bool = False                # enables Phase 2 bracket entry
+    phase2_enabled: bool = True                 # both phases run together by default
     max_concurrent_brackets: int = 1            # max open positions across all assets
     phase1_bet_size_usd: float = 5.0            # USD notional for the Phase 1 leg
     min_bracket_shares: float = 1.0             # minimum shares per order
-    # Phase 1: FOLLOW_TAKER for immediate fill (captures the Binance lag)
+    # FOLLOW_TAKER (FOK) for both phases — immediate fill, locks bracket in real-time
     phase1_entry_style: str = "FOLLOW_TAKER"
-    # Phase 2: PASSIVE_LIMIT — resting bid at the reversal price
-    phase2_entry_style: str = "PASSIVE_LIMIT"
+    phase2_entry_style: str = "FOLLOW_TAKER"
     bracket_audit_log_path: str = "logs/bracket_trades.jsonl"
 
 

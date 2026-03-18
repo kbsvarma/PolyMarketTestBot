@@ -251,19 +251,20 @@ crypto_direction:
   # Live execution (bracket_executor.py)
   # SAFETY: set execute_enabled: true ONLY when ready to trade real money.
   # Also requires LIVE_TRADING_ENABLED=true in .env and valid wallet credentials.
-  # Run with:  python main.py --execute-crypto
   #
-  # SEQUENTIAL TESTING:
-  #   Step 1 — set execute_enabled: true, leave phase2_enabled: false
-  #            → only Phase 1 buys will be placed; verify fills in bracket_trades.jsonl
-  #   Step 2 — once Phase 1 fills are confirmed, set phase2_enabled: true
-  #            → Phase 2 bracket orders activate automatically when margin locks in
+  # To go live:
+  #   1. Set execute_enabled: true below
+  #   2. Run: python main.py --execute-crypto
+  #
+  # Both phases run together. Phase 1 fires on signal; Phase 2 fires automatically
+  # when the bracket equation locks guaranteed profit. Both use FOLLOW_TAKER (FOK)
+  # for immediate fills. All trades logged to logs/bracket_trades.jsonl.
   # ---------------------------------------------------------------------------
-  execute_enabled: false              # Step 1: flip to true when ready
-  phase2_enabled: false               # Step 2: flip to true after Phase 1 verified
+  execute_enabled: false              # flip to true when ready to trade
+  phase2_enabled: true                # both phases active — set false to test P1 only
   max_concurrent_brackets: 1         # max open bracket positions across all assets
   phase1_bet_size_usd: 5.0           # USD notional per Phase 1 leg ($5 to start)
   min_bracket_shares: 1.0            # minimum shares per order
-  phase1_entry_style: FOLLOW_TAKER   # immediate fill — captures the Binance lag
-  phase2_entry_style: PASSIVE_LIMIT  # resting bid at reversal price
+  phase1_entry_style: FOLLOW_TAKER   # FOK — immediate fill, captures Binance lag
+  phase2_entry_style: FOLLOW_TAKER   # FOK — locks bracket the moment margin turns positive
   bracket_audit_log_path: "logs/bracket_trades.jsonl"
