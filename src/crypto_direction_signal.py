@@ -182,7 +182,7 @@ class DirectionSignalEvaluator:
         self._state = _WindowState(
             asset=self.asset,
             window_open_ts=window_open_ts,
-            window_close_ts=window_open_ts + 900,
+            window_close_ts=window_open_ts + self._cfg.window_duration_seconds,
             asset_open=asset_price,
             mid_window_start=mid_window,
             checkpoints=[WindowCheckpoint(ts=float(window_open_ts), price=asset_price)],
@@ -798,7 +798,7 @@ async def run_bracket_signal_observer(
     # We don't know the true window_open asset price, so we use the current
     # price as a synthetic baseline. Signals this window are flagged as
     # mid_window_start=True in the log.
-    init_window_ts = current_window_ts()
+    init_window_ts = current_window_ts(cfg.window_duration_seconds)
     await _initialise_window(watcher, evaluators, init_window_ts, mid_window=True)
 
     logger.info(

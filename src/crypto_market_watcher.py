@@ -48,25 +48,25 @@ WINDOW_DURATION_SECONDS: int = 900
 # Helpers
 # ---------------------------------------------------------------------------
 
-def current_window_ts() -> int:
+def current_window_ts(duration: int = WINDOW_DURATION_SECONDS) -> int:
     """
-    Return the Unix timestamp of the START of the current 15-minute window.
+    Return the Unix timestamp of the START of the current window.
 
-    Polymarket 15m windows align to :00/:15/:30/:45 of each hour, which
-    corresponds to multiples of 900 seconds in Unix time.
+    Works for any window size — pass duration=300 for 5-min, 900 for 15-min.
+    Polymarket windows align to multiples of the duration in Unix time.
 
-    Examples:
+    Examples (15-min / duration=900):
       14:02:30 → window started at 14:00:00
       14:16:00 → window started at 14:15:00
       14:45:59 → window started at 14:45:00
     """
-    return int(time.time() // WINDOW_DURATION_SECONDS) * WINDOW_DURATION_SECONDS
+    return int(time.time() // duration) * duration
 
 
-def minutes_remaining_in_window() -> float:
-    """Return how many minutes are left in the current 15-minute window."""
+def minutes_remaining_in_window(duration: int = WINDOW_DURATION_SECONDS) -> float:
+    """Return how many minutes are left in the current window."""
     now = time.time()
-    window_end = (current_window_ts() + WINDOW_DURATION_SECONDS)
+    window_end = current_window_ts(duration) + duration
     return max(0.0, (window_end - now) / 60.0)
 
 
@@ -184,7 +184,7 @@ class AssetWatcher:
         # Build candidate slugs: try current window, then next
         candidates = [
             f"{self._asset_cfg.slug_prefix}-{window_ts}",
-            f"{self._asset_cfg.slug_prefix}-{window_ts + WINDOW_DURATION_SECONDS}",
+            f"{self._asset_cfg.slug_prefix}-{window_ts + self._cfg.window_duration_seconds}",
         ]
 
         for slug in candidates:
@@ -416,7 +416,7 @@ class CryptoMarketWatcher:
           - Call evaluator.on_window_open() for each transitioned asset
           - Log the transition prominently for monitoring
         """
-        new_ts = current_window_ts()
+        new_ts = current_window_ts(self._cfg.window_duration_seconds)
         if new_ts == self._last_window_ts:
             return []   # still in the same window
 

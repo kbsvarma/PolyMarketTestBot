@@ -320,6 +320,11 @@ class CryptoDirectionConfig(BaseModel):
     #   False → evaluate and emit signals for both independently
     prefer_higher_liquidity: bool = True
 
+    # ---- Window duration ----
+    # Seconds per Polymarket window. 900 = 15-min, 300 = 5-min.
+    # Change this (and btc.slug_prefix) to switch between window sizes.
+    window_duration_seconds: int = 900
+
     # ---- Gate 0: Window settle gate ----
     # Seconds to wait after window open before evaluating signals.
     # The AMM seeds liquidity in the first ~60s; prices are noisy until
