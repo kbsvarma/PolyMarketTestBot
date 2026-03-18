@@ -61,7 +61,7 @@ _GATE_RANK: dict[str, int] = {
 @dataclass
 class WindowSummary:
     window_ts: int              # Unix timestamp of window start
-    window_close_ts: int        # window_ts + 900
+    window_close_ts: int        # window_ts + window_duration_seconds
     asset: str                  # "BTC" or "ETH"
     asset_open: float           # price at window open
     asset_close: float          # price at window close (last BTC/ETH price seen)
@@ -128,11 +128,13 @@ class WindowReportWriter:
         hypothetical_bet_size: float = 10.0,
         max_windows: int = 200,
         live_execution: bool = False,   # True when BracketExecutor is wired in
+        window_duration_seconds: int = 900,
     ) -> None:
         self._report_path = Path(report_path)
         self._bet_size = hypothetical_bet_size
         self._max_windows = max_windows
         self._live_execution = live_execution
+        self._window_duration_seconds = window_duration_seconds
         self._windows: list[WindowSummary] = []
         self._report_path.parent.mkdir(parents=True, exist_ok=True)
         # Seed with an empty report on startup
@@ -237,7 +239,7 @@ class WindowReportWriter:
 
         summary = WindowSummary(
             window_ts=window_ts,
-            window_close_ts=window_ts + 900,
+            window_close_ts=window_ts + self._window_duration_seconds,
             asset=asset,
             asset_open=asset_open,
             asset_close=asset_close,

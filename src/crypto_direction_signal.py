@@ -792,6 +792,7 @@ async def run_bracket_signal_observer(
         report_path=cfg.window_report_path,
         hypothetical_bet_size=cfg.hypothetical_bet_size,
         live_execution=(executor is not None),   # flag live mode in the report header
+        window_duration_seconds=cfg.window_duration_seconds,
     )
 
     # ---- Initial window setup (likely starting mid-window) ----
