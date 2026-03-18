@@ -398,6 +398,10 @@ class CryptoDirectionConfig(BaseModel):
     phase1_entry_style: str = "FOLLOW_TAKER"
     phase2_entry_style: str = "FOLLOW_TAKER"
     bracket_audit_log_path: str = "logs/bracket_trades.jsonl"
+    # Hard exit: sell Phase-1 leg mid-window to cap losses.
+    # Triggers if mark drops to stop_price OR we're in the final N seconds losing.
+    hard_exit_stop_price: float = 0.50
+    hard_exit_final_seconds: int = 30
 
 
 class AppConfig(BaseModel):

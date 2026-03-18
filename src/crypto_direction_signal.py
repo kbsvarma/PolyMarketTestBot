@@ -513,8 +513,10 @@ class DirectionSignalEvaluator:
             }
 
         # ---- Gate 7: Cooldown ----
-        # Don't fire the same side twice in one window (prevents signal spam).
-        if state.signal_fired and state.signal_fired_side == momentum_side:
+        # Block ALL second signals in one window — even opposite side.
+        # Allowing NO then YES (or vice versa) in the same window would buy
+        # both sides for total cost > $1.00, guaranteeing a loss.
+        if state.signal_fired:
             return {
                 "result": GATE_COOLDOWN,
                 "fired_side": state.signal_fired_side,

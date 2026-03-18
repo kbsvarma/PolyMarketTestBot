@@ -202,11 +202,9 @@ crypto_direction:
   # BTC configuration
   btc:
     binance_ws_url: "wss://stream.binance.com/ws/btcusdt@aggTrade"
-    slug_prefix: "btc-updown-15m"      # Confirmed from data/strategy_signal_log.jsonl
+    slug_prefix: "btc-updown-5m"       # 5-min mode. Change to "btc-updown-15m" for 15-min.
     annual_vol_pct: 0.69              # ~69% annualised vol; used by the GBM lag model
-    min_asset_move_pct: 0.0004        # BTC must have moved >= 0.04% from window open
-                                      # (calibrated: 0.2% puts YES at 0.75+, outside entry range;
-                                      #  0.04% aligns with entry_range [0.57,0.60])
+    min_asset_move_pct: 0.0002        # was 0.0004 — BTC moves ~half as much in 5 min vs 15 min
 
   # ETH configuration
   eth:
@@ -221,16 +219,19 @@ crypto_direction:
   track_eth: false                    # ETH paused — BTC-only mode for cleaner signal data
   prefer_higher_liquidity: false      # Single asset (BTC), no need to compare liquidity
 
-  # Signal gate parameters
-  window_settle_seconds: 45           # was 75 — catch early clean moves (AMM settles faster in practice)
-  time_gate_minutes: 6.0              # was 9.0 — capture reversals; 6+ min is enough for FOK fill
+  # Window duration — CHANGE THIS to switch between 5-min and 15-min mode
+  # Also update btc.slug_prefix above to match.
+  window_duration_seconds: 300        # 300 = 5-min mode, 900 = 15-min mode
+
+  # Signal gate parameters (calibrated for 5-min windows)
+  window_settle_seconds: 15           # was 45 — 5% of 300s; AMM settles fast in 5-min markets
+  time_gate_minutes: 1.0              # was 2.0 — for 5-min windows, 1 min is enough for FOK fill
   entry_range_low: 0.53               # Momentum-side ask must be in [53c, 65c] to enter
-  entry_range_high: 0.65              # Bracket economics: 0.53*1.0086+0.34*1.0043=0.876<1.00 ✓
-                                      #                    0.65*1.0086+0.34*1.0043=0.997<1.00 ✓
-  chop_window: 4                      # Number of :00-second checkpoints to evaluate
-  chop_max_reversal_pct: 0.001        # was 0.0005 — wider noise band; BTC 0.05% steps are often noise
-  chop_min_score: 0.25                # was 0.6 — 1-in-3 directional steps is sufficient signal
-  lag_threshold: 0.01                 # was 0.04 — market is efficient; 1c lag is reliable confirmation
+  entry_range_high: 0.65              # Bracket economics unchanged: x+y+fees<1.00 holds regardless of window
+  chop_window: 3                      # was 4 — 5-min window yields max 3 minute-mark checkpoints before time gate
+  chop_max_reversal_pct: 0.001        # unchanged — same BTC noise band
+  chop_min_score: 0.51                # was 0.25 — blocks soft passes (0.50) which fired before enough checkpoints existed
+  lag_threshold: 0.015                # raised from 0.005 — weak-lag signals (0.014) were losing; winners had 0.115+
 
   # Bracket parameters
   target_y_price: 0.34                # Target entry for the second leg (opposite side)
@@ -268,3 +269,8 @@ crypto_direction:
   phase1_entry_style: FOLLOW_TAKER   # FOK — immediate fill, captures Binance lag
   phase2_entry_style: FOLLOW_TAKER   # FOK — locks bracket the moment margin turns positive
   bracket_audit_log_path: "logs/bracket_trades.jsonl"
+  # Hard exit: sell Phase-1 position to cut losses mid-window
+  # Triggers if (a) momentum-side mark drops to stop_price, OR
+  # (b) we're in the final hard_exit_final_seconds AND still losing.
+  hard_exit_stop_price: 0.50         # sell if mark drops to 50c (bought above this)
+  hard_exit_final_seconds: 30        # also sell in last 30s if mark < entry price

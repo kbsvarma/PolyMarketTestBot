@@ -71,6 +71,7 @@ class BracketPhase(str, Enum):
     BRACKET_COMPLETE   = "BRACKET_COMPLETE"    # Both legs filled — profit locked, window still open
     BRACKET_SETTLED    = "BRACKET_SETTLED"     # Bracket settled at window close — terminal state
     PHASE1_ONLY_CLOSED = "PHASE1_ONLY_CLOSED"  # Window closed with Phase 1 filled, no Phase 2
+    HARD_EXITED        = "HARD_EXITED"         # Sold Phase-1 mid-window: 50c stop or final-30s cut
     CANCELLED          = "CANCELLED"           # Order failed, timed out, or window-close cancelled
 
 
@@ -110,6 +111,7 @@ class BracketPosition:
     closed_at:            float = 0.0
     fill_check_attempts:  int = 0        # poll counter for PASSIVE_LIMIT P1
     p2_last_attempt_ts:   float = 0.0   # last Phase 2 placement attempt time
+    hard_exit_attempted:  bool = False   # prevents repeated hard-exit attempts
 
     # ── Outcome (filled at window close) ─────────────────────────────────
     outcome:        str   = ""    # "YES_WINS" | "NO_WINS" | "UNKNOWN"
@@ -328,7 +330,7 @@ class BracketExecutor:
         Called every poll cycle (~1 s) per asset.
 
           PHASE1_PENDING → poll CLOB for fill (PASSIVE_LIMIT only)
-          PHASE1_FILLED  → update opposite-side floor; trigger Phase 2 if ready
+          PHASE1_FILLED  → check hard exit first, then Phase 2 if still open
         """
         for pos in list(self._positions.values()):
             if pos.asset != asset:
@@ -336,8 +338,93 @@ class BracketExecutor:
             if pos.phase == BracketPhase.PHASE1_PENDING:
                 await self._poll_phase1_fill(pos)
             elif pos.phase == BracketPhase.PHASE1_FILLED:
-                if self._cfg.phase2_enabled:
+                # Hard exit check takes priority over Phase 2.
+                # If it fires, phase becomes HARD_EXITED and Phase 2 is skipped.
+                await self._check_hard_exit(pos, yes_ask, no_ask)
+                if pos.phase == BracketPhase.PHASE1_FILLED and self._cfg.phase2_enabled:
                     await self._check_phase2(pos, yes_ask, no_ask)
+
+    # ── Hard exit — cut losses mid-window ────────────────────────────────
+
+    async def _check_hard_exit(
+        self, pos: BracketPosition, yes_ask: float, no_ask: float
+    ) -> None:
+        """
+        Sell the Phase-1 leg mid-window to cap losses.
+
+        Triggers when either:
+          (a) The momentum-side mark drops to hard_exit_stop_price (default 0.50)
+              — we paid above 0.50, so the market now thinks we're losing.
+          (b) We're in the final hard_exit_final_seconds and still below entry
+              — don't hold to binary resolution without a bracket.
+
+        Uses the momentum-side ask as the mark (conservative proxy for bid).
+        Places a FOLLOW_TAKER sell at (mark − 2c) to ensure fill with slippage.
+        """
+        if pos.hard_exit_attempted:
+            return
+
+        mark = yes_ask if pos.momentum_side == "YES" else no_ask
+        if mark <= 0:
+            return
+
+        entry = pos.p1_fill_price or pos.p1_price
+        seconds_to_close = pos.window_close_ts - time.time()
+
+        stop_hit = mark <= self._cfg.hard_exit_stop_price
+        final_window_loss = (
+            seconds_to_close <= self._cfg.hard_exit_final_seconds
+            and mark < entry
+        )
+
+        if not (stop_hit or final_window_loss):
+            return
+
+        reason = "STOP_50C" if stop_hit else "FINAL_30S_LOSS"
+        pos.hard_exit_attempted = True   # block retries regardless of fill outcome
+
+        sell_price = round(max(0.01, mark - 0.02), 4)
+        logger.info(
+            "BracketExecutor: ⚠ HARD EXIT triggered  "
+            "asset={}  reason={}  mark={:.4f}  entry={:.4f}  "
+            "sell_price={:.4f}  seconds_to_close={:.1f}  position_id={}",
+            pos.asset, reason, mark, entry, sell_price, seconds_to_close, pos.position_id,
+        )
+
+        try:
+            await self._client.place_sell_order(
+                token_id=pos.p1_token_id,
+                price=sell_price,
+                size=pos.p1_shares,
+                entry_style="FOLLOW_TAKER",
+                client_order_id=f"{pos.position_id}-hard-exit",
+            )
+            pnl = round((sell_price - entry) * pos.p1_shares, 4)
+            pos.phase = BracketPhase.HARD_EXITED
+            pos.closed_at = time.time()
+            pos.actual_pnl_usd = pnl
+            logger.info(
+                "BracketExecutor: HARD EXIT filled  "
+                "asset={}  sell_price={:.4f}  pnl=${:.4f}  position_id={}",
+                pos.asset, sell_price, pnl, pos.position_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "BracketExecutor: HARD EXIT sell FAILED (will resolve at window close)  "
+                "asset={}  error={}  position_id={}",
+                pos.asset, exc, pos.position_id,
+            )
+
+        self._audit({
+            "type": "HARD_EXIT",
+            "position_id": pos.position_id,
+            "asset": pos.asset,
+            "reason": reason,
+            "mark": mark,
+            "sell_price": sell_price,
+            "entry_price": entry,
+            "phase_after": pos.phase.value,
+        })
 
     # ── Phase 1 fill polling (PASSIVE_LIMIT only) ────────────────────────
 
@@ -560,7 +647,11 @@ class BracketExecutor:
         for pos in list(self._positions.values()):
             if pos.window_ts != window_ts or pos.asset != asset:
                 continue
-            if pos.phase in (BracketPhase.PHASE1_ONLY_CLOSED, BracketPhase.CANCELLED):
+            if pos.phase in (
+                BracketPhase.PHASE1_ONLY_CLOSED,
+                BracketPhase.HARD_EXITED,
+                BracketPhase.CANCELLED,
+            ):
                 continue
 
             pos.closed_at = time.time()
