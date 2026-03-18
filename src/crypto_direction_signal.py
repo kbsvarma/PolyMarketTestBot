@@ -475,7 +475,9 @@ class DirectionSignalEvaluator:
         # ---- Gate 5: Chop filter ----
         # The asset must have moved CLEANLY in one direction — not oscillated.
         # We evaluate the :00-second checkpoint history for directional consistency.
-        chop_score = self._compute_chop_score(asset_move_pct)
+        # The current live price is included as a virtual endpoint so we get a real
+        # score even before the first minute-mark checkpoint arrives.
+        chop_score = self._compute_chop_score(asset_move_pct, asset_price)
         if chop_score < self._cfg.chop_min_score:
             return {
                 "result": GATE_CHOP,
@@ -531,7 +533,7 @@ class DirectionSignalEvaluator:
             "implied_momentum_price": round(implied_momentum_price, 4),
         }
 
-    def _compute_chop_score(self, asset_move_pct: float) -> float:
+    def _compute_chop_score(self, asset_move_pct: float, current_price: float) -> float:
         """
         Score how cleanly directional the asset's move has been.
 
@@ -539,18 +541,27 @@ class DirectionSignalEvaluator:
         many consecutive steps moved in the same direction as the overall move.
         Counter-moves larger than chop_max_reversal_pct are penalised.
 
+        The current live price is appended as a virtual endpoint so we always
+        have at least one step (window-open → now), eliminating the need for
+        a soft-pass placeholder. A real direction score is available immediately.
+
         Returns:
           1.0 = perfectly monotonic move in the right direction
-          0.5 = insufficient checkpoint data (soft pass — only 1 checkpoint)
+          0.5 = no seeded checkpoint (shouldn't happen after window open)
           0.0 = all steps are reversals
         """
         state = self._state
         assert state is not None
 
-        recent = state.checkpoints[-self._cfg.chop_window:]
+        recent = list(state.checkpoints[-self._cfg.chop_window:])
+        # Append current live price as a virtual endpoint for real-time scoring.
+        # This means even before the first :00-second checkpoint arrives we
+        # evaluate window-open → current as a real directional step.
+        if current_price > 0:
+            recent.append(WindowCheckpoint(ts=time.time(), price=current_price))
+
         if len(recent) < 2:
-            # Need ≥2 checkpoints (1 step) for a meaningful chop assessment.
-            # With 0 checkpoints we have no directional data — soft-pass.
+            # No seeded checkpoint at all — cannot assess direction.
             return 0.5
 
         direction = 1 if asset_move_pct > 0 else -1
