@@ -310,10 +310,13 @@ class DirectionSignalEvaluator:
         # y is the opposite side — the one we're watching for the second leg
         y_price = no_ask if momentum_side == "YES" else yes_ask
 
-        # Update momentum side peak (best unrealised gain on leg 1)
+        # Update momentum side peak and trough (for hard-exit loss modeling in paper P&L)
         momentum_now = yes_ask if momentum_side == "YES" else no_ask
         if momentum_now > obs.momentum_side_peak:
             obs.momentum_side_peak = momentum_now
+        # Track lowest momentum-side price (models the hard-exit stop trigger)
+        if 0 < momentum_now < obs.min_momentum_price:
+            obs.min_momentum_price = momentum_now
 
         # Bracket margin: how much profit is locked if we buy y right now?
         # margin > 0 means we're profitable; use actual Polymarket fee curve.
@@ -332,20 +335,23 @@ class DirectionSignalEvaluator:
             if y_price < obs.min_opposite_price:
                 obs.min_opposite_price = y_price
 
-            # Phase 2 reversal check: has y bounced from its floor by >= threshold?
-            # This is the trigger for buying the second leg in the real strategy.
+            # Phase 2 reversal check: has y bounced from its floor by >= threshold
+            # AND is the bracket margin still positive at the current y price?
+            # Both conditions must hold — the live bracket_executor requires net_margin>0
+            # before placing the Phase 2 order, so the observation must match.
             floor = obs.min_opposite_price
             if (
                 floor < 999.0
                 and y_price > floor + self._cfg.phase2_reversal_threshold
+                and net_bracket > 0   # CRITICAL: bracket must be profitable at trigger
                 and not obs.phase2_would_have_triggered
             ):
                 obs.phase2_would_have_triggered = True
                 obs.phase2_trigger_price = round(y_price, 6)
                 logger.info(
-                    "Phase 2 would have triggered asset={} y_floor={} y_now={} "
+                    "Phase 2 would have triggered asset={} y_floor={:.4f} y_now={:.4f} "
                     "bracket_margin={:.4f}",
-                    self.asset, floor, y_price, obs.peak_bracket_margin,
+                    self.asset, floor, y_price, net_bracket,
                 )
 
     # ------------------------------------------------------------------ #
@@ -844,8 +850,27 @@ async def run_bracket_signal_observer(
                     else:
                         yes_won = None
 
-                    # Record the closing window in the rolling report
+                    # Snapshot state before on_window_close() clears it
                     ev_state_snap = ev._state
+                    signal_fired_snap = ev_state_snap.signal_fired if ev_state_snap else False
+
+                    # IMPORTANT ORDER: close window FIRST so the observation
+                    # (phase2_would_have_triggered, bracket_would_have_formed, etc.)
+                    # is populated on ev._last_event BEFORE we serialise it for the
+                    # window report.  Previously record_window_close() was called first
+                    # and always saw observation=None → Phase 2 was never credited in
+                    # hyp_pnl and "Phase 2: Not triggered" always appeared.
+                    ev.on_window_close(asset_price_now, yes_won)
+
+                    # Settle any open bracket positions for this window
+                    if executor is not None and ev_state_snap:
+                        await executor.on_window_close(
+                            window_ts=ev_state_snap.window_open_ts,
+                            asset=asset,
+                            yes_won=yes_won,
+                        )
+
+                    # Now record the window — _last_event.observation is populated
                     if ev_state_snap:
                         last_event_dict = (
                             ev._last_event.model_dump()
@@ -863,22 +888,13 @@ async def run_bracket_signal_observer(
                             eval_log_path=cfg.evaluation_log_path,
                             yes_won=yes_won,  # pass directly — more reliable than ask-price inference
                         )
-                        if not ev_state_snap.signal_fired and report_writer._windows:
+                        if not signal_fired_snap and report_writer._windows:
                             gate = report_writer._windows[-1].primary_gate_fail
                             logger.info(
                                 "No signal this window asset={} — blocked at: {}",
                                 asset, gate or "NO_WINDOW_STATE",
                             )
 
-                    # Settle any open bracket positions for this window
-                    if executor is not None and ev_state_snap:
-                        await executor.on_window_close(
-                            window_ts=ev_state_snap.window_open_ts,
-                            asset=asset,
-                            yes_won=yes_won,
-                        )
-
-                    ev.on_window_close(asset_price_now, yes_won)
                     ev.on_window_open(new_ts, asset_price_now, mid_window=False)
 
                 # Also handle assets that didn't transition (e.g., market not resolved)

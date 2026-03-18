@@ -482,6 +482,9 @@ class PostSignalObservation(BaseModel):
     # Momentum side tracking: how far did it travel after signal?
     momentum_side_peak: float = 0.0       # highest momentum_side ask seen
     momentum_side_at_close: float = 0.0   # momentum_side ask at window close
+    # Lowest momentum-side ask seen (models the hard-exit stop trigger):
+    # if this dropped to hard_exit_stop_price (0.50), the stop would have fired.
+    min_momentum_price: float = 999.0
 
     # Resolution outcome (filled in when window resolves)
     outcome: str = ""                     # "YES_WINS", "NO_WINS", "UNKNOWN"

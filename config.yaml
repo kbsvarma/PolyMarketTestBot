@@ -226,8 +226,9 @@ crypto_direction:
   # Signal gate parameters (calibrated for 5-min windows)
   window_settle_seconds: 15           # was 45 — 5% of 300s; AMM settles fast in 5-min markets
   time_gate_minutes: 1.0              # was 2.0 — for 5-min windows, 1 min is enough for FOK fill
-  entry_range_low: 0.53               # Momentum-side ask must be in [53c, 65c] to enter
-  entry_range_high: 0.65              # Bracket economics unchanged: x+y+fees<1.00 holds regardless of window
+  entry_range_low: 0.57               # raised from 0.53 — at 0.53 opp.side starts at ~0.48 (2c from break-even);
+                                      # any BTC reversal kills the bracket. At 0.57+ opp.side ~0.43 (9c buffer to 0.34 target).
+  entry_range_high: 0.63              # tightened from 0.65 — above 0.63 bracket margin at target_y becomes very thin
   chop_window: 3                      # was 4 — 5-min window yields max 3 minute-mark checkpoints before time gate
   chop_max_reversal_pct: 0.001        # unchanged — same BTC noise band
   chop_min_score: 0.51                # was 0.25 — blocks soft passes (0.50) which fired before enough checkpoints existed

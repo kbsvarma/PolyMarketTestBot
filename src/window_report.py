@@ -77,6 +77,7 @@ class WindowSummary:
     resolved_yes: Optional[bool] = None   # True=YES won, False=NO won, None=unclear
     hyp_pnl_per_share: float = 0.0        # hypothetical PnL per $1 notional
     hyp_pnl_dollars: float = 0.0          # hypothetical PnL in dollars (bet_size scaled)
+    hard_exit_modeled: bool = False        # True if hard-exit stop (50¢) was modeled to have fired
 
     @property
     def move_pct(self) -> float:
@@ -211,8 +212,13 @@ class WindowReportWriter:
             resolved_yes = True      # NO near 0 AND YES higher → YES won
         # else: both near 0 and can't tell — leave None (ambiguous post-settlement)
 
+        # Pull observation fields (populated since timing-fix reorder)
+        obs = last_signal_event.get("observation") or {} if last_signal_event else {}
+        min_momentum_price: float = float(obs.get("min_momentum_price") or 999.0)
+
         # Compute hypothetical PnL
         hyp_pnl_per_share = 0.0
+        hard_exit_modeled = False
         if signal_fired and signal_price > 0 and resolved_yes is not None:
             # Phase 1 entry: bet momentum_side at signal_price
             # Payout $1.00 if momentum direction wins, $0.00 if it loses
@@ -220,7 +226,8 @@ class WindowReportWriter:
             phase1_cost = signal_price + fee
 
             if phase2_triggered and phase2_price > 0:
-                # Bracket complete: guaranteed profit regardless of outcome
+                # Bracket complete: guaranteed profit regardless of outcome.
+                # One side pays $1, the other $0 — net = 1 - total_cost.
                 opp_fee = _taker_fee(phase2_price)
                 total_cost = phase1_cost + phase2_price + opp_fee
                 hyp_pnl_per_share = 1.0 - total_cost
@@ -233,7 +240,19 @@ class WindowReportWriter:
                 if momentum_won:
                     hyp_pnl_per_share = 1.0 - phase1_cost
                 else:
-                    hyp_pnl_per_share = -phase1_cost
+                    # Lost — check if hard exit at 0.50 would have capped the loss.
+                    # Hard exit fires when momentum mark drops to hard_exit_stop_price.
+                    # In live mode bracket_executor sells at ~(mark - 2c); model at 0.50.
+                    _HARD_EXIT_STOP = 0.50
+                    if min_momentum_price <= _HARD_EXIT_STOP < signal_price:
+                        # The price DID drop to 0.50 during the window — hard exit fires.
+                        hard_exit_price = _HARD_EXIT_STOP
+                        hard_exit_fee = _taker_fee(hard_exit_price)
+                        # Net loss: paid phase1_cost, received hard_exit_price - exit_fee
+                        hyp_pnl_per_share = (hard_exit_price - hard_exit_fee) - signal_price - fee
+                        hard_exit_modeled = True
+                    else:
+                        hyp_pnl_per_share = -phase1_cost
 
         hyp_pnl_dollars = hyp_pnl_per_share * self._bet_size
 
@@ -255,6 +274,7 @@ class WindowReportWriter:
             resolved_yes=resolved_yes,
             hyp_pnl_per_share=hyp_pnl_per_share,
             hyp_pnl_dollars=hyp_pnl_dollars,
+            hard_exit_modeled=hard_exit_modeled,
         )
 
         self._windows.append(summary)
@@ -462,9 +482,10 @@ def _format_window(w: WindowSummary) -> list[str]:
     # --- PnL ---
     if w.signal_fired and w.resolved_yes is not None:
         pnl_icon = "🟢" if w.hyp_pnl_dollars > 0 else "🔴"
+        hard_exit_note = " ⚡ hard-exit capped (sold @ 50¢)" if w.hard_exit_modeled else ""
         lines.append(
             f"- **Hypothetical PnL:** {pnl_icon} ${w.hyp_pnl_dollars:+.2f} "
-            f"({w.hyp_pnl_per_share:+.4f}/share × ${10:.0f})"
+            f"({w.hyp_pnl_per_share:+.4f}/share × ${10:.0f}){hard_exit_note}"
         )
     elif w.signal_fired:
         lines.append("- **Hypothetical PnL:** ⏳ Pending resolution")
