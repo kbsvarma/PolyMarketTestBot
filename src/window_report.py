@@ -25,30 +25,32 @@ from loguru import logger
 # ---------------------------------------------------------------------------
 
 _GATE_LABELS: dict[str, str] = {
+    # Keys must match constants in crypto_direction_signal.py exactly
     "WINDOW_SETTLING":          "Settling (AMM noise)",
     "TIME_GATE_FAIL":           "Too late in window",
     "ASSET_MOVE_INSUFFICIENT":  "BTC/ETH move too small",
     "PRICE_RANGE_FAIL":         "Price outside entry range",
     "PRICES_STALE":             "Orderbook prices stale",
     "CHOP_FILTER_FAIL":         "Choppy / no clean direction",
-    "LAG_SIGNAL_FAIL":          "No GBM lag (market already priced in)",
-    "COOLDOWN_FAIL":            "Signal already fired this window",
-    "GATE_FIRED":               "✅ Signal fired",
-    "NO_STATE":                 "No window state",
+    "LAG_GAP_INSUFFICIENT":     "No GBM lag (market already priced in)",
+    "ALREADY_FIRED_THIS_WINDOW": "Signal already fired this window",
+    "SIGNAL_FIRED":             "✅ Signal fired",
+    "NO_WINDOW_STATE":          "No window state",
 }
 
 _GATE_RANK: dict[str, int] = {
     # Higher rank = further through the gate sequence = better signal quality
-    "NO_STATE":                 0,
+    # Keys must match gate result strings from crypto_direction_signal.py
+    "NO_WINDOW_STATE":          0,
     "WINDOW_SETTLING":          1,
     "TIME_GATE_FAIL":           2,
     "ASSET_MOVE_INSUFFICIENT":  3,
     "PRICE_RANGE_FAIL":         4,
     "PRICES_STALE":             5,
     "CHOP_FILTER_FAIL":         6,
-    "LAG_SIGNAL_FAIL":          7,
-    "COOLDOWN_FAIL":            8,
-    "GATE_FIRED":               9,
+    "LAG_GAP_INSUFFICIENT":     7,
+    "ALREADY_FIRED_THIS_WINDOW": 8,
+    "SIGNAL_FIRED":             9,
 }
 
 
@@ -125,10 +127,12 @@ class WindowReportWriter:
         report_path: str,
         hypothetical_bet_size: float = 10.0,
         max_windows: int = 200,
+        live_execution: bool = False,   # True when BracketExecutor is wired in
     ) -> None:
         self._report_path = Path(report_path)
         self._bet_size = hypothetical_bet_size
         self._max_windows = max_windows
+        self._live_execution = live_execution
         self._windows: list[WindowSummary] = []
         self._report_path.parent.mkdir(parents=True, exist_ok=True)
         # Seed with an empty report on startup
@@ -175,10 +179,12 @@ class WindowReportWriter:
             signal_side = last_signal_event.get("momentum_side", "")
             signal_price = float(last_signal_event.get("momentum_price", 0.0))
             # Check if phase2 was triggered (present in post-signal observations)
-            obs = last_signal_event.get("observation", {})
+            obs = last_signal_event.get("observation") or {}
             if obs and obs.get("phase2_would_have_triggered"):
                 phase2_triggered = True
-                phase2_price = float(last_signal_event.get("target_y_price", 0.0))
+                # phase2_trigger_price is the PostSignalObservation field for the
+                # actual y price at which Phase 2 would have triggered.
+                phase2_price = float(obs.get("phase2_trigger_price") or 0.0)
 
         # Infer resolution from final prices
         resolved_yes: Optional[bool] = None
@@ -305,10 +311,14 @@ class WindowReportWriter:
         lines: list[str] = []
 
         # ---- Header ----
+        if self._live_execution:
+            mode_line = "> **Mode:** 🔴 LIVE EXECUTION — real orders are being placed"
+        else:
+            mode_line = "> **Mode:** Observation Only — no real money is being spent"
         lines += [
             "# 📊 Bracket Observer — Live Window Report",
             "",
-            f"> **Mode:** Observation Only — no real money is being spent  ",
+            f"{mode_line}  ",
             f"> **Last Updated:** {now_et}  ",
             f"> **Hypothetical Bet Size:** ${self._bet_size:.2f} per signal  ",
             "",
@@ -349,7 +359,7 @@ class WindowReportWriter:
             for gate in [
                 "WINDOW_SETTLING", "TIME_GATE_FAIL", "ASSET_MOVE_INSUFFICIENT",
                 "PRICE_RANGE_FAIL", "PRICES_STALE", "CHOP_FILTER_FAIL",
-                "LAG_SIGNAL_FAIL", "COOLDOWN_FAIL", "GATE_FIRED",
+                "LAG_GAP_INSUFFICIENT", "ALREADY_FIRED_THIS_WINDOW", "SIGNAL_FIRED",
             ]:
                 count = all_gate_counts.get(gate, 0)
                 if count:

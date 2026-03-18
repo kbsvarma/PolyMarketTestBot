@@ -860,10 +860,11 @@ async def run_execute_crypto() -> None:
 
     logger.info(
         "🚀 Bracket executor LIVE mode — execute_enabled=true "
-        "max_concurrent={} phase1_bet=${} entry_style={}",
+        "max_concurrent={} phase1_bet=${} p1_style={} p2_style={}",
         cfg_d.max_concurrent_brackets,
         cfg_d.phase1_bet_size_usd,
-        cfg_d.bracket_entry_style,
+        cfg_d.phase1_entry_style,
+        cfg_d.phase2_entry_style,
     )
 
     executor = BracketExecutor(cfg=cfg_d, client=client)

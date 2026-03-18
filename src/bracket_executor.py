@@ -68,7 +68,8 @@ class BracketPhase(str, Enum):
     PHASE1_PENDING     = "PHASE1_PENDING"      # Phase 1 order submitted (PASSIVE_LIMIT waiting)
     PHASE1_FILLED      = "PHASE1_FILLED"       # Phase 1 confirmed filled; monitoring for Phase 2
     PHASE2_PENDING     = "PHASE2_PENDING"      # Phase 2 order submitted but not yet confirmed
-    BRACKET_COMPLETE   = "BRACKET_COMPLETE"    # Both legs filled — profit locked at window close
+    BRACKET_COMPLETE   = "BRACKET_COMPLETE"    # Both legs filled — profit locked, window still open
+    BRACKET_SETTLED    = "BRACKET_SETTLED"     # Bracket settled at window close — terminal state
     PHASE1_ONLY_CLOSED = "PHASE1_ONLY_CLOSED"  # Window closed with Phase 1 filled, no Phase 2
     CANCELLED          = "CANCELLED"           # Order failed, timed out, or window-close cancelled
 
@@ -596,6 +597,8 @@ class BracketExecutor:
                 )
                 # One token pays $1/share, other pays $0/share → net = $1/share
                 pos.actual_pnl_usd = round((1.0 - cost) * pos.p1_shares, 4)
+                # Terminal state — frees concurrency slot for next window
+                pos.phase = BracketPhase.BRACKET_SETTLED
                 logger.info(
                     "BracketExecutor: BRACKET SETTLED 🏆  asset={}  outcome={}  "
                     "pnl=${:.4f}  position_id={}",
@@ -631,7 +634,7 @@ class BracketExecutor:
                 "position_id": pos.position_id,
                 "asset": pos.asset,
                 "window_ts": window_ts,
-                "phase_at_close": pos.phase.value,
+                "phase_at_close": pos.phase.value,   # BRACKET_SETTLED or PHASE1_ONLY_CLOSED
                 "outcome": pos.outcome,
                 "actual_pnl_usd": pos.actual_pnl_usd,
                 "p1_price": pos.p1_price,
@@ -665,13 +668,14 @@ class BracketExecutor:
     # ================================================================== #
 
     def active_positions(self) -> list[BracketPosition]:
+        """Positions still open (orders live or awaiting window close)."""
         return [
             p for p in self._positions.values()
             if p.phase in (
                 BracketPhase.PHASE1_PENDING,
                 BracketPhase.PHASE1_FILLED,
                 BracketPhase.PHASE2_PENDING,
-                BracketPhase.BRACKET_COMPLETE,
+                BracketPhase.BRACKET_COMPLETE,   # both legs filled, window not yet closed
             )
         ]
 
@@ -681,11 +685,11 @@ class BracketExecutor:
     def session_summary(self) -> dict:
         all_p     = list(self._positions.values())
         settled   = [p for p in all_p if p.phase in (
-            BracketPhase.BRACKET_COMPLETE,
+            BracketPhase.BRACKET_SETTLED,
             BracketPhase.PHASE1_ONLY_CLOSED,
             BracketPhase.CANCELLED,
         )]
-        brackets  = [p for p in settled if p.phase == BracketPhase.BRACKET_COMPLETE]
+        brackets  = [p for p in settled if p.phase == BracketPhase.BRACKET_SETTLED]
         p1_only   = [p for p in settled if p.phase == BracketPhase.PHASE1_ONLY_CLOSED]
         wins      = [p for p in p1_only  if p.actual_pnl_usd > 0]
         return {
