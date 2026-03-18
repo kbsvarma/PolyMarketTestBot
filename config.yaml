@@ -222,15 +222,15 @@ crypto_direction:
   prefer_higher_liquidity: false      # Single asset (BTC), no need to compare liquidity
 
   # Signal gate parameters
-  window_settle_seconds: 75           # Wait 75s after window open before evaluating (AMM settling)
-  time_gate_minutes: 9.0              # Must have >= 9 minutes left in the 15m window
+  window_settle_seconds: 45           # was 75 — catch early clean moves (AMM settles faster in practice)
+  time_gate_minutes: 6.0              # was 9.0 — capture reversals; 6+ min is enough for FOK fill
   entry_range_low: 0.53               # Momentum-side ask must be in [53c, 65c] to enter
   entry_range_high: 0.65              # Bracket economics: 0.53*1.0086+0.34*1.0043=0.876<1.00 ✓
                                       #                    0.65*1.0086+0.34*1.0043=0.997<1.00 ✓
   chop_window: 4                      # Number of :00-second checkpoints to evaluate
-  chop_max_reversal_pct: 0.0005       # Steps < 0.05% in wrong direction are noise (neutral)
-  chop_min_score: 0.6                 # Reject if < 60% of checkpoint steps are directional
-  lag_threshold: 0.04                 # GBM implied price must exceed market price by >= 4c
+  chop_max_reversal_pct: 0.001        # was 0.0005 — wider noise band; BTC 0.05% steps are often noise
+  chop_min_score: 0.25                # was 0.6 — 1-in-3 directional steps is sufficient signal
+  lag_threshold: 0.01                 # was 0.04 — market is efficient; 1c lag is reliable confirmation
 
   # Bracket parameters
   target_y_price: 0.34                # Target entry for the second leg (opposite side)

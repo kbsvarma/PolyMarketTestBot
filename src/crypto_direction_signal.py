@@ -548,9 +548,10 @@ class DirectionSignalEvaluator:
         assert state is not None
 
         recent = state.checkpoints[-self._cfg.chop_window:]
-        if len(recent) < 2:
-            # Not enough :00-second data yet — give a soft pass so early-window
-            # signals aren't blocked purely by lack of checkpoint history.
+        if len(recent) < 3:
+            # Need ≥3 checkpoints (2 steps) for a meaningful chop assessment.
+            # With only 1 step, a single neutral move scores 0.0 and blocks a
+            # valid signal — soft-pass instead.
             return 0.5
 
         direction = 1 if asset_move_pct > 0 else -1
