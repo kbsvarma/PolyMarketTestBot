@@ -688,8 +688,18 @@ class PolymarketClient:
     async def get_orderbook(self, token_id: str) -> OrderbookSnapshot:
         try:
             payload = await self._get_json(f"{self.base_url}/book", params={"token_id": token_id})
-            bids = [OrderbookLevel(price=float(level["price"]), size=float(level["size"])) for level in payload.get("bids", [])]
-            asks = [OrderbookLevel(price=float(level["price"]), size=float(level["size"])) for level in payload.get("asks", [])]
+            # Polymarket CLOB returns asks descending (0.99→0.27) and bids
+            # ascending (0.01→0.26) — opposite of standard convention.
+            # Normalise to standard: asks ascending (best=lowest first),
+            # bids descending (best=highest first).
+            bids = sorted(
+                [OrderbookLevel(price=float(level["price"]), size=float(level["size"])) for level in payload.get("bids", [])],
+                key=lambda x: x.price, reverse=True,  # highest bid first
+            )
+            asks = sorted(
+                [OrderbookLevel(price=float(level["price"]), size=float(level["size"])) for level in payload.get("asks", [])],
+                key=lambda x: x.price,  # lowest ask first
+            )
             if bids or asks:
                 return OrderbookSnapshot(token_id=token_id, bids=bids, asks=asks)
             raise RuntimeError("Empty orderbook")

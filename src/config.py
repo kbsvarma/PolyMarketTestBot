@@ -242,6 +242,144 @@ class EnvConfig(BaseModel):
     operator_live_wallet_count: int | None = None
 
 
+class AssetVolConfig(BaseModel):
+    """
+    Per-asset parameters for the bracket direction signal.
+
+    Each tracked asset (BTC, ETH) has its own price feed URL, Polymarket
+    slug prefix, and volatility estimate. Volatility drives the GBM model
+    used to compute the 'implied fair value' of the momentum side — the
+    larger the lag between implied price and actual Polymarket price, the
+    stronger the entry signal.
+
+    Volatility calibration notes:
+      - BTC  ~69% annualized → 0.37% per 15m window std dev
+      - ETH ~103% annualized → 0.55% per 15m window std dev
+      These are starting estimates. Calibrate from observed data over time.
+
+    The vol_per_second used by _estimate_fair_p_up is derived as:
+      annual_vol_pct / sqrt(365 * 24 * 3600)
+    """
+    # Binance aggTrade WebSocket stream — RTDSClient connects here for live price
+    binance_ws_url: str = "wss://stream.binance.com/ws/btcusdt@aggTrade"
+
+    # Polymarket 15m market slug prefix.
+    # IMPORTANT: Verify the actual format on first run — the code will log the
+    # real market title so you can confirm the slug is correct.
+    # Common formats: "btc-15m-updown", "btc-15-minute-up-or-down", etc.
+    slug_prefix: str = "btc-15m-updown"
+
+    # Annualized volatility fraction (e.g. 0.69 = 69%).
+    # Used to compute vol_per_second for the GBM fair-probability model.
+    annual_vol_pct: float = 0.69
+
+    # Minimum asset price move (fraction) from window open before we consider
+    # the market "directional". Below this, the market is still too near 50/50.
+    min_asset_move_pct: float = 0.002   # 0.2% for BTC
+
+
+class CryptoDirectionConfig(BaseModel):
+    """
+    Configuration for the bracket strategy direction signal observer.
+
+    This module watches live 15m BTC/ETH Polymarket markets and fires signals
+    when all quality gates pass. It is OBSERVATION ONLY — no orders are placed.
+    Signals are logged to JSONL files for parameter calibration.
+
+    Gate summary (all must pass for a signal to fire):
+      1. Time gate:      >= time_gate_minutes remaining in window
+      2. Asset move:     asset moved >= min_asset_move_pct from window open
+      3. Price range:    momentum_side ask in [entry_range_low, entry_range_high]
+      4. Price sanity:   both YES and NO ask prices are non-zero
+      5. Chop filter:    :00-second checkpoints show a clean directional move
+      6. Lag gap:        GBM implied price exceeds actual price by >= lag_threshold
+      7. Cooldown:       same side hasn't already fired a signal this window
+    """
+    enabled: bool = False   # must be explicitly enabled in config.yaml
+
+    # ---- Asset configs ----
+    btc: AssetVolConfig = Field(default_factory=lambda: AssetVolConfig(
+        binance_ws_url="wss://stream.binance.com/ws/btcusdt@aggTrade",
+        slug_prefix="btc-15m-updown",   # VERIFY on first run
+        annual_vol_pct=0.69,
+        min_asset_move_pct=0.002,
+    ))
+    eth: AssetVolConfig = Field(default_factory=lambda: AssetVolConfig(
+        binance_ws_url="wss://stream.binance.com/ws/ethusdt@aggTrade",
+        slug_prefix="eth-15m-updown",   # VERIFY on first run
+        annual_vol_pct=1.03,
+        min_asset_move_pct=0.003,       # ETH is noisier, require slightly more move
+    ))
+
+    # Which assets to monitor
+    track_btc: bool = True
+    track_eth: bool = True
+
+    # Asset selection strategy when both assets are available:
+    #   True  → pick the asset with higher Polymarket liquidity each window
+    #   False → evaluate and emit signals for both independently
+    prefer_higher_liquidity: bool = True
+
+    # ---- Gate 0: Window settle gate ----
+    # Seconds to wait after window open before evaluating signals.
+    # The AMM seeds liquidity in the first ~60s; prices are noisy until
+    # real market makers enter and the BTC direction becomes clearer.
+    window_settle_seconds: float = 60.0
+
+    # ---- Gate 1: Time gate ----
+    # Minimum minutes remaining in the window to allow Phase 1 entry.
+    # Below this, there's not enough time for Phase 2 to develop.
+    time_gate_minutes: float = 9.0
+
+    # ---- Gate 3: Momentum side price range ----
+    # Signal only fires when the momentum_side ask is in this range.
+    # 57-60¢ = market has moved meaningfully but hasn't overshot.
+    entry_range_low: float = 0.57
+    entry_range_high: float = 0.60
+
+    # ---- Gate 5: Chop filter ----
+    # How many recent :00-second checkpoints to evaluate for directional cleanliness.
+    chop_window: int = 4
+    # Maximum allowed counter-move between consecutive checkpoints (as a price fraction).
+    # A reversal larger than this counts as "chop" and penalises the chop score.
+    chop_max_reversal_pct: float = 0.0005   # 0.05%
+    # Minimum chop score to pass the filter (0.0 = all reversals, 1.0 = perfectly clean)
+    chop_min_score: float = 0.6
+
+    # ---- Gate 6: Lag gap ----
+    # Minimum difference between GBM-implied fair value and actual Polymarket price.
+    # A larger lag_gap means the market hasn't priced in the BTC move yet — better entry.
+    lag_threshold: float = 0.04   # 4¢
+
+    # ---- Post-signal bracket tracking ----
+    # Target price for the opposite-side (second leg of the bracket).
+    # If x=0.58 is paid for leg 1, we want x+y+fees < $1.00.
+    # With fees ~1.5-2% total, y_target ~0.34 gives ~6% net bracket margin.
+    target_y_price: float = 0.34
+    # How much the opposite side must recover from its floor to confirm reversal.
+    # E.g., if NO bottoms at 0.30 and recovers to 0.31, that's a 1¢ reversal confirmation.
+    phase2_reversal_threshold: float = 0.01   # 1¢
+
+    # ---- Runtime ----
+    # How often to run the signal evaluation loop (seconds)
+    poll_interval_seconds: float = 2.0
+    # How often to refresh YES/NO orderbook prices (seconds)
+    # Can be slightly less frequent than the eval loop since prices change slowly
+    price_refresh_interval_seconds: float = 2.0
+    # Maximum age of YES/NO prices before they're considered stale (seconds)
+    price_staleness_max_seconds: float = 10.0
+
+    # ---- Logging ----
+    # Full signal events (one JSON line per signal fire + one per outcome)
+    signal_event_log_path: str = "logs/crypto_signal_events.jsonl"
+    # Compact evaluation log (one JSON line per eval cycle per asset)
+    evaluation_log_path: str = "logs/crypto_signal_evaluations.jsonl"
+    # Human-readable per-window Markdown report (updated every 15 min)
+    window_report_path: str = "logs/window_report.md"
+    # Notional bet size used for hypothetical PnL calculations in the report
+    hypothetical_bet_size: float = 10.0
+
+
 class AppConfig(BaseModel):
     mode: Mode = Mode.RESEARCH
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
@@ -262,6 +400,8 @@ class AppConfig(BaseModel):
     fees: FeeConfig = Field(default_factory=FeeConfig)
     lag_signal: LagSignalConfig = Field(default_factory=LagSignalConfig)
     completion_tracker: CompletionTrackerConfig = Field(default_factory=CompletionTrackerConfig)
+    # Bracket strategy direction signal observer (crypto 15m markets)
+    crypto_direction: CryptoDirectionConfig = Field(default_factory=CryptoDirectionConfig)
 
 
 RUNTIME_FILES: dict[str, str] = {
@@ -302,6 +442,9 @@ RUNTIME_FILES: dict[str, str] = {
     "data/shadow/strategy_signal_log.jsonl": "",
     "logs/system.log": "",
     "logs/errors.log": "",
+    # Bracket strategy direction signal observer logs
+    "logs/crypto_signal_events.jsonl": "",
+    "logs/crypto_signal_evaluations.jsonl": "",
 }
 
 

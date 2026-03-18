@@ -183,3 +183,66 @@ completion_tracker:
   abort_threshold: 0.40
   deadline_fraction: 0.60
   tick_interval_seconds: 5.0
+
+# ---------------------------------------------------------------------------
+# Bracket strategy — direction signal observer
+#
+# Run with:  python main.py --observe-crypto
+#
+# Phase 1: buy momentum_side (YES if BTC going up, NO if going down) at ~58c.
+# Phase 2: watch opposite_side fall to ~34c, wait for confirmed reversal, then
+#           lock the bracket (x + y + fees < $1.00 = guaranteed profit at close).
+#
+# The observer is READ-ONLY — it logs signals and post-window outcomes to JSONL
+# for calibration. Set enabled: true to activate.
+# ---------------------------------------------------------------------------
+crypto_direction:
+  enabled: true                       # Set to false to disable
+
+  # BTC configuration
+  btc:
+    binance_ws_url: "wss://stream.binance.com/ws/btcusdt@aggTrade"
+    slug_prefix: "btc-updown-15m"      # Confirmed from data/strategy_signal_log.jsonl
+    annual_vol_pct: 0.69              # ~69% annualised vol; used by the GBM lag model
+    min_asset_move_pct: 0.0004        # BTC must have moved >= 0.04% from window open
+                                      # (calibrated: 0.2% puts YES at 0.75+, outside entry range;
+                                      #  0.04% aligns with entry_range [0.57,0.60])
+
+  # ETH configuration
+  eth:
+    binance_ws_url: "wss://stream.binance.com/ws/ethusdt@aggTrade"
+    slug_prefix: "eth-updown-15m"      # Confirmed from data/strategy_signal_log.jsonl
+    annual_vol_pct: 1.03              # ~103% annualised vol (ETH is more volatile than BTC)
+    min_asset_move_pct: 0.0006        # ETH must have moved >= 0.06% from window open
+                                      # (proportional to BTC adjustment; ETH is more volatile)
+
+  # Asset selection
+  track_btc: true
+  track_eth: true
+  prefer_higher_liquidity: true       # Use whichever market (BTC/ETH) has more liquidity
+
+  # Signal gate parameters
+  window_settle_seconds: 75           # Wait 75s after window open before evaluating (AMM settling)
+  time_gate_minutes: 9.0              # Must have >= 9 minutes left in the 15m window
+  entry_range_low: 0.53               # Momentum-side ask must be in [53c, 65c] to enter
+  entry_range_high: 0.65              # Bracket economics: 0.53*1.0086+0.34*1.0043=0.876<1.00 ✓
+                                      #                    0.65*1.0086+0.34*1.0043=0.997<1.00 ✓
+  chop_window: 4                      # Number of :00-second checkpoints to evaluate
+  chop_max_reversal_pct: 0.0005       # Steps < 0.05% in wrong direction are noise (neutral)
+  chop_min_score: 0.6                 # Reject if < 60% of checkpoint steps are directional
+  lag_threshold: 0.04                 # GBM implied price must exceed market price by >= 4c
+
+  # Bracket parameters
+  target_y_price: 0.34                # Target entry for the second leg (opposite side)
+  phase2_reversal_threshold: 0.01     # Opposite side must bounce >= 1c from its floor
+
+  # Timing
+  poll_interval_seconds: 1.0          # How often the observer main loop runs (was 2.0)
+  price_refresh_interval_seconds: 1.0 # How often Polymarket YES/NO prices are fetched (was 2.0)
+  price_staleness_max_seconds: 10.0   # Reject evaluate() if prices haven't refreshed
+
+  # Log paths
+  signal_event_log_path: "logs/crypto_signal_events.jsonl"
+  evaluation_log_path: "logs/crypto_signal_evaluations.jsonl"
+  window_report_path: "logs/window_report.md"  # Human-readable per-window report
+  hypothetical_bet_size: 10.0                  # $ per signal for PnL simulation
