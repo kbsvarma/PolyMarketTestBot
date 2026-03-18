@@ -548,10 +548,9 @@ class DirectionSignalEvaluator:
         assert state is not None
 
         recent = state.checkpoints[-self._cfg.chop_window:]
-        if len(recent) < 3:
-            # Need ≥3 checkpoints (2 steps) for a meaningful chop assessment.
-            # With only 1 step, a single neutral move scores 0.0 and blocks a
-            # valid signal — soft-pass instead.
+        if len(recent) < 2:
+            # Need ≥2 checkpoints (1 step) for a meaningful chop assessment.
+            # With 0 checkpoints we have no directional data — soft-pass.
             return 0.5
 
         direction = 1 if asset_move_pct > 0 else -1
@@ -851,6 +850,12 @@ async def run_bracket_signal_observer(
                             eval_log_path=cfg.evaluation_log_path,
                             yes_won=yes_won,  # pass directly — more reliable than ask-price inference
                         )
+                        if not ev_state_snap.signal_fired and report_writer._windows:
+                            gate = report_writer._windows[-1].primary_gate_fail
+                            logger.info(
+                                "No signal this window asset={} — blocked at: {}",
+                                asset, gate or "NO_WINDOW_STATE",
+                            )
 
                     # Settle any open bracket positions for this window
                     if executor is not None and ev_state_snap:
