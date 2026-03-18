@@ -230,6 +230,13 @@ class DirectionSignalEvaluator:
         peak_price = obs.momentum_side_peak
         obs.estimated_phase1_exit_pnl = round((peak_price - entry_price) * 10.0, 4)
 
+        # CRITICAL: populate the observation on the in-memory event object so that
+        # when the observer loop calls ev._last_event.model_dump() immediately after
+        # ev.on_window_close(), the observation dict is present.  Previously this was
+        # only written to the JSONL outcome entry (below), leaving _last_event.observation
+        # as None and causing window_report to see no observation data.
+        self._last_event.observation = obs
+
         # Append outcome record to the signal event log
         _append_jsonl(
             self._cfg.signal_event_log_path,
