@@ -850,7 +850,7 @@ async def run_bracket_signal_observer(
 
                     # Settle any open bracket positions for this window
                     if executor is not None and ev_state_snap:
-                        executor.on_window_close(
+                        await executor.on_window_close(
                             window_ts=ev_state_snap.window_open_ts,
                             asset=asset,
                             yes_won=yes_won,
