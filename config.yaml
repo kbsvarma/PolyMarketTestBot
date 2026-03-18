@@ -246,3 +246,16 @@ crypto_direction:
   evaluation_log_path: "logs/crypto_signal_evaluations.jsonl"
   window_report_path: "logs/window_report.md"  # Human-readable per-window report
   hypothetical_bet_size: 10.0                  # $ per signal for PnL simulation
+
+  # ---------------------------------------------------------------------------
+  # Live execution (bracket_executor.py)
+  # SAFETY: set execute_enabled: true ONLY when ready to trade real money.
+  # Also requires LIVE_TRADING_ENABLED=true in .env and valid wallet credentials.
+  # Run with:  python main.py --execute-crypto
+  # ---------------------------------------------------------------------------
+  execute_enabled: false              # flip to true when ready to go live
+  max_concurrent_brackets: 1         # max open bracket positions across all assets
+  phase1_bet_size_usd: 5.0           # USD notional per Phase 1 leg
+  min_bracket_shares: 1.0            # minimum shares per order
+  bracket_entry_style: PASSIVE_LIMIT # PASSIVE_LIMIT or FOLLOW_TAKER
+  bracket_audit_log_path: "logs/bracket_trades.jsonl"

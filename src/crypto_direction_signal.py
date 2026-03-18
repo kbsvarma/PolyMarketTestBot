@@ -727,6 +727,7 @@ async def run_bracket_signal_observer(
     *,
     config: Any,   # AppConfig — typed as Any to avoid circular import at module level
     client: Any,   # PolymarketClient
+    executor: Any = None,   # BracketExecutor | None — if provided, places real orders
 ) -> None:
     """
     Run the bracket strategy direction signal observer indefinitely.
@@ -847,6 +848,14 @@ async def run_bracket_signal_observer(
                             eval_log_path=cfg.evaluation_log_path,
                         )
 
+                    # Settle any open bracket positions for this window
+                    if executor is not None and ev_state_snap:
+                        executor.on_window_close(
+                            window_ts=ev_state_snap.window_open_ts,
+                            asset=asset,
+                            yes_won=yes_won,
+                        )
+
                     ev.on_window_close(asset_price_now, yes_won)
                     ev.on_window_open(new_ts, asset_price_now, mid_window=False)
 
@@ -880,6 +889,10 @@ async def run_bracket_signal_observer(
                 # Update bracket tracking if a signal already fired this window
                 ev.update_post_signal(yes_ask, no_ask)
 
+                # Phase 2 monitoring — check for bracket entry conditions
+                if executor is not None:
+                    await executor.tick(asset, yes_ask, no_ask)
+
                 # Check if all signal gates pass
                 if not w.is_ready():
                     _log_evaluation(
@@ -894,11 +907,18 @@ async def run_bracket_signal_observer(
                 )
 
                 if signal:
-                    logger.info(
-                        "Signal logged — observation only, no orders placed. "
-                        "event_id={}",
-                        signal.event_id,
-                    )
+                    if executor is not None:
+                        await executor.on_signal(signal)
+                        logger.info(
+                            "Signal fired — Phase 1 order submitted. event_id={}",
+                            signal.event_id,
+                        )
+                    else:
+                        logger.info(
+                            "Signal logged — observation only, no orders placed. "
+                            "event_id={}",
+                            signal.event_id,
+                        )
 
         except asyncio.CancelledError:
             logger.info("Bracket signal observer shutting down.")

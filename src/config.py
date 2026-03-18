@@ -379,6 +379,16 @@ class CryptoDirectionConfig(BaseModel):
     # Notional bet size used for hypothetical PnL calculations in the report
     hypothetical_bet_size: float = 10.0
 
+    # ---- Live execution (bracket_executor.py) ----
+    # SAFETY: execute_enabled MUST be set true in config AND LIVE_TRADING_ENABLED
+    # must be set in .env before any real orders are placed.
+    execute_enabled: bool = False              # flip to true to go live
+    max_concurrent_brackets: int = 1           # max open positions across all assets
+    phase1_bet_size_usd: float = 5.0           # USD notional for the Phase 1 leg
+    min_bracket_shares: float = 1.0            # minimum shares per order
+    bracket_entry_style: str = "PASSIVE_LIMIT" # PASSIVE_LIMIT | FOLLOW_TAKER
+    bracket_audit_log_path: str = "logs/bracket_trades.jsonl"
+
 
 class AppConfig(BaseModel):
     mode: Mode = Mode.RESEARCH

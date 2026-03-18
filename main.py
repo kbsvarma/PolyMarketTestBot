@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -771,5 +772,108 @@ async def run() -> None:
             break
 
 
+async def run_observe_crypto() -> None:
+    """
+    Entry point for the bracket strategy direction signal observer.
+
+    Runs observation-only mode: watches Binance BTC/ETH price feeds and
+    Polymarket 15m markets, fires direction signals when all gates pass,
+    and logs post-signal bracket/Phase-2 data to JSONL for calibration.
+
+    No orders are placed. Start with:
+        python main.py --observe-crypto
+
+    Logs written to:
+        logs/crypto_signal_events.jsonl
+        logs/crypto_signal_evaluations.jsonl
+        logs/window_report.md
+    """
+    # Import here to avoid polluting the main bot startup path
+    from src.crypto_direction_signal import run_bracket_signal_observer
+
+    root = Path(__file__).resolve().parent
+    config_path_value = os.getenv("POLYBOT_CONFIG_PATH", "config.yaml")
+    config_path = Path(config_path_value)
+    if not config_path.is_absolute():
+        config_path = root / config_path
+
+    config: AppConfig = load_config(config_path, root / ".env")
+    ensure_runtime_files(root, config)
+    setup_logging(root / "logs")
+
+    # Build a minimal Polymarket client (needed for market resolution)
+    from src.polymarket_client import PolymarketClient
+    client = PolymarketClient(config)
+
+    await run_bracket_signal_observer(config=config, client=client)
+
+
+async def run_execute_crypto() -> None:
+    """
+    Entry point for the bracket strategy LIVE EXECUTION mode.
+
+    Identical to --observe-crypto, but with a BracketExecutor wired in so
+    that when a signal fires, real Polymarket orders are placed.
+
+    Requirements before running:
+      1. Set `crypto_direction.execute_enabled: true` in config.yaml
+      2. Set `LIVE_TRADING_ENABLED=true` in .env
+      3. Ensure POLYMARKET_PRIVATE_KEY and API credentials are set in .env
+
+    Start with:
+        python main.py --execute-crypto
+
+    Additional logs written to:
+        logs/bracket_trades.jsonl    ← every order, fill, and settlement
+    """
+    from src.bracket_executor import BracketExecutor
+    from src.crypto_direction_signal import run_bracket_signal_observer
+    from src.polymarket_client import PolymarketClient
+
+    root = Path(__file__).resolve().parent
+    config_path_value = os.getenv("POLYBOT_CONFIG_PATH", "config.yaml")
+    config_path = Path(config_path_value)
+    if not config_path.is_absolute():
+        config_path = root / config_path
+
+    config: AppConfig = load_config(config_path, root / ".env")
+    ensure_runtime_files(root, config)
+    setup_logging(root / "logs")
+
+    client = PolymarketClient(config)
+    cfg_d = config.crypto_direction
+
+    if not cfg_d.execute_enabled:
+        logger.warning(
+            "⚠  crypto_direction.execute_enabled is false — running in "
+            "OBSERVATION mode. Set execute_enabled: true in config.yaml to trade."
+        )
+        await run_bracket_signal_observer(config=config, client=client)
+        return
+
+    if not config.env.live_trading_enabled:
+        logger.error(
+            "❌ LIVE_TRADING_ENABLED is not set in .env — cannot place orders. "
+            "Set LIVE_TRADING_ENABLED=true and restart with --execute-crypto."
+        )
+        return
+
+    logger.info(
+        "🚀 Bracket executor LIVE mode — execute_enabled=true "
+        "max_concurrent={} phase1_bet=${} entry_style={}",
+        cfg_d.max_concurrent_brackets,
+        cfg_d.phase1_bet_size_usd,
+        cfg_d.bracket_entry_style,
+    )
+
+    executor = BracketExecutor(cfg=cfg_d, client=client)
+    await run_bracket_signal_observer(config=config, client=client, executor=executor)
+
+
 if __name__ == "__main__":
-    asyncio.run(run())
+    if "--observe-crypto" in sys.argv:
+        asyncio.run(run_observe_crypto())
+    elif "--execute-crypto" in sys.argv:
+        asyncio.run(run_execute_crypto())
+    else:
+        asyncio.run(run())
