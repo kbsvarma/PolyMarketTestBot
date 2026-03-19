@@ -233,21 +233,44 @@ crypto_direction:
   chop_max_reversal_pct: 0.001        # unchanged — same BTC noise band
   chop_min_score: 0.51                # was 0.25 — blocks soft passes (0.50) which fired before enough checkpoints existed
   lag_threshold: 0.015                # raised from 0.005 — weak-lag signals (0.014) were losing; winners had 0.115+
+  continuation_enabled: true          # second path: clean continuation when classic lag capture says no
+  continuation_min_minutes_remaining: 1.5
+  continuation_min_asset_move_pct: 0.0004   # require at least a 0.04% real move before continuation can fire
+  continuation_min_chop_score: 0.66
+  continuation_max_momentum_price: 0.59
+  continuation_max_opposite_price: 0.44
+  continuation_max_negative_lag_gap: 0.03
+  continuation_ignore_lag_veto: false
+  continuation_hard_exit_grace_seconds: 30.0
+  continuation_catastrophic_stop_price: 0.0
+  safe_arm_suspend_stop: true        # once the safe opposite price is armed, stop treating it like a plain leg-1 bet
+  safe_arm_catastrophic_stop_price: 0.0
 
   # Bracket parameters
   target_y_price: 0.34                # Target entry for the second leg (opposite side)
   phase2_reversal_threshold: 0.01     # Opposite side must bounce >= 1c from its floor
 
   # Timing
-  poll_interval_seconds: 1.0          # How often the observer main loop runs (was 2.0)
-  price_refresh_interval_seconds: 1.0 # How often Polymarket YES/NO prices are fetched (was 2.0)
+  poll_interval_seconds: 0.5          # Faster sampling helps catch 57-63c entries before they overshoot
+  price_refresh_interval_seconds: 0.5 # Match the observer cadence so 5m windows don't skip through range
+  market_resolve_retry_seconds: 5.0   # Retry unresolved current-window markets instead of waiting a full rollover
   price_staleness_max_seconds: 10.0   # Reject evaluate() if prices haven't refreshed
 
   # Log paths
   signal_event_log_path: "logs/crypto_signal_events.jsonl"
   evaluation_log_path: "logs/crypto_signal_evaluations.jsonl"
   window_report_path: "logs/window_report.md"  # Human-readable per-window report
-  hypothetical_bet_size: 10.0                  # $ per signal for PnL simulation
+  report_shares: 5.0                           # keep report/live parity at 5 shares per signal
+
+  # Shadow-live mode: run the same bracket executor without touching the wallet.
+  # Orders are simulated against fresh live orderbooks at submission time so the
+  # report is much closer to what --execute-crypto would have done.
+  shadow_execute_enabled: true
+  shadow_execution_log_path: "logs/bracket_trades.jsonl"
+
+  # FOLLOW_TAKER/FOK orders must be explicitly confirmed, not just submitted.
+  fill_confirmation_attempts: 2
+  fill_confirmation_delay_seconds: 0.05
 
   # ---------------------------------------------------------------------------
   # Live execution (bracket_executor.py)
@@ -259,19 +282,24 @@ crypto_direction:
   #   2. Run: python main.py --execute-crypto
   #
   # Both phases run together. Phase 1 fires on signal; Phase 2 fires automatically
-  # when the bracket equation locks guaranteed profit. Both use FOLLOW_TAKER (FOK)
-  # for immediate fills. All trades logged to logs/bracket_trades.jsonl.
+  # only after the opposite side first reaches a safe level, extends below it,
+  # and then reclaims that remembered safe level on reversal. Both use
+  # FOLLOW_TAKER (FOK) for immediate fills. All trades logged to logs/bracket_trades.jsonl.
   # ---------------------------------------------------------------------------
-  execute_enabled: false              # flip to true when ready to trade
+  execute_enabled: true               # live enabled — current sizing remains fixed at 5 shares
   phase2_enabled: true                # both phases active — set false to test P1 only
   max_concurrent_brackets: 1         # max open bracket positions across all assets
-  phase1_bet_size_usd: 5.0           # USD notional per Phase 1 leg ($5 to start)
+  phase1_shares: 5.0                 # fixed Phase 1 share count (Phase 2 mirrors this)
   min_bracket_shares: 1.0            # minimum shares per order
   phase1_entry_style: FOLLOW_TAKER   # FOK — immediate fill, captures Binance lag
-  phase2_entry_style: FOLLOW_TAKER   # FOK — locks bracket the moment margin turns positive
+  phase1_max_chase_cents: 0.01       # keep Phase 1 tight: signal 0.57 submits at 0.57/0.58, not 0.59+
+  phase2_entry_style: FOLLOW_TAKER   # FOK — locks bracket on reclaim of remembered safe_y
   bracket_audit_log_path: "logs/bracket_trades.jsonl"
   # Hard exit: sell Phase-1 position to cut losses mid-window
   # Triggers if (a) momentum-side mark drops to stop_price, OR
   # (b) we're in the final hard_exit_final_seconds AND still losing.
   hard_exit_stop_price: 0.50         # sell if mark drops to 50c (bought above this)
+  hard_exit_trigger_buffer_cents: 0.02   # start trying a little early so we can still get the 50c stop if the book is there
+  hard_exit_market_through_cents: 0.0    # stay anchored at the intended 50c stop; do not auto-chase lower
+  hard_exit_retry_cooldown_seconds: 2.0  # if a stop order misses, retry instead of giving up forever
   hard_exit_final_seconds: 30        # also sell in last 30s if mark < entry price

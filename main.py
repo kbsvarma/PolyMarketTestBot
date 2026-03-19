@@ -776,11 +776,13 @@ async def run_observe_crypto() -> None:
     """
     Entry point for the bracket strategy direction signal observer.
 
-    Runs observation-only mode: watches Binance BTC/ETH price feeds and
-    Polymarket 15m markets, fires direction signals when all gates pass,
-    and logs post-signal bracket/Phase-2 data to JSONL for calibration.
+    Runs the crypto bracket module without touching the wallet.
 
-    No orders are placed. Start with:
+    By default this now uses SHADOW-LIVE mode: the same BracketExecutor state
+    machine as live, but with simulated fills against fresh live orderbooks.
+    If shadow_execute_enabled is false, it falls back to pure observation mode.
+
+    Start with:
         python main.py --observe-crypto
 
     Logs written to:
@@ -803,9 +805,30 @@ async def run_observe_crypto() -> None:
 
     # Build a minimal Polymarket client (needed for market resolution)
     from src.polymarket_client import PolymarketClient
+    from src.bracket_executor import BracketExecutor
+    from src.shadow_execution_client import ShadowExecutionClient
     client = PolymarketClient(config)
+    cfg_d = config.crypto_direction
 
-    await run_bracket_signal_observer(config=config, client=client)
+    executor = None
+    if cfg_d.shadow_execute_enabled:
+        shadow_cfg = cfg_d.model_copy(
+            update={
+                "execute_enabled": True,
+                "bracket_audit_log_path": cfg_d.shadow_execution_log_path,
+            }
+        )
+        executor = BracketExecutor(
+            cfg=shadow_cfg,
+            client=ShadowExecutionClient(client),
+        )
+        logger.info(
+            "Crypto observer running in SHADOW-LIVE mode — same executor, no wallet orders."
+        )
+    else:
+        logger.info("Crypto observer running in pure observation mode.")
+
+    await run_bracket_signal_observer(config=config, client=client, executor=executor)
 
 
 async def run_execute_crypto() -> None:
@@ -860,9 +883,9 @@ async def run_execute_crypto() -> None:
 
     logger.info(
         "🚀 Bracket executor LIVE mode — execute_enabled=true "
-        "max_concurrent={} phase1_bet=${} p1_style={} p2_style={}",
+        "max_concurrent={} phase1_shares={} p1_style={} p2_style={}",
         cfg_d.max_concurrent_brackets,
-        cfg_d.phase1_bet_size_usd,
+        cfg_d.phase1_shares,
         cfg_d.phase1_entry_style,
         cfg_d.phase2_entry_style,
     )

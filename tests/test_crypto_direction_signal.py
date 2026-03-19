@@ -58,6 +58,8 @@ SAMPLE_MARKET_META = {
     "no_token_id": "no-token-001",
     "liquidity": 5_000.0,
     "volume": 1_200.0,
+    "yes_ask_size": 25.0,
+    "no_ask_size": 25.0,
 }
 
 
@@ -93,8 +95,10 @@ def make_asset_vol_cfg(**overrides) -> AssetVolConfig:
 
 def make_evaluator(tmp_path, **cfg_overrides) -> DirectionSignalEvaluator:
     """Build a DirectionSignalEvaluator with a window already opened at WINDOW_OPEN_TS."""
+    cfg_overrides = dict(cfg_overrides)
+    asset_vol_overrides = cfg_overrides.pop("asset_vol_overrides", {})
     cfg = make_config(tmp_path, **cfg_overrides)
-    asset_vol_cfg = make_asset_vol_cfg()
+    asset_vol_cfg = make_asset_vol_cfg(**asset_vol_overrides)
     ev = DirectionSignalEvaluator("BTC", cfg, asset_vol_cfg)
     ev.on_window_open(WINDOW_OPEN_TS, ASSET_OPEN, mid_window=False)
     return ev
@@ -141,19 +145,19 @@ class TestComputeChopScore:
         ev = make_evaluator(tmp_path)
         # on_window_open seeds exactly 1 checkpoint
         ev._state.checkpoints = [WindowCheckpoint(ts=float(WINDOW_OPEN_TS), price=ASSET_OPEN)]
-        assert ev._compute_chop_score(0.005) == 0.5
+        assert ev._compute_chop_score(0.005, current_price=0.0) == 0.5
 
     def test_perfectly_monotonic_up_returns_one(self, tmp_path):
         """All steps in the up direction → 1.0."""
         ev = make_evaluator(tmp_path)
         seed_clean_checkpoints_up(ev)
-        assert ev._compute_chop_score(asset_move_pct=0.003) == 1.0
+        assert ev._compute_chop_score(asset_move_pct=0.003, current_price=0.0) == 1.0
 
     def test_perfectly_monotonic_down_returns_one(self, tmp_path):
         """All steps in the down direction → 1.0 (direction is aligned)."""
         ev = make_evaluator(tmp_path)
         seed_clean_checkpoints_down(ev)
-        assert ev._compute_chop_score(asset_move_pct=-0.003) == 1.0
+        assert ev._compute_chop_score(asset_move_pct=-0.003, current_price=0.0) == 1.0
 
     def test_all_meaningful_reversals_returns_zero(self, tmp_path):
         """Steps all go opposite to claimed direction (each big reversal) → 0.0."""
@@ -164,7 +168,7 @@ class TestComputeChopScore:
             WindowCheckpoint(ts=float(WINDOW_OPEN_TS + i * 60), price=p)
             for i, p in enumerate(prices)
         ]
-        score = ev._compute_chop_score(asset_move_pct=0.003)  # UP direction
+        score = ev._compute_chop_score(asset_move_pct=0.003, current_price=0.0)  # UP direction
         assert score == 0.0
 
     def test_mixed_steps_partial_score(self, tmp_path):
@@ -177,7 +181,7 @@ class TestComputeChopScore:
             for i, p in enumerate(prices)
         ]
         # clean_steps: +1 (up step) -1 (reversal) +1 (up step) = 1; total=3 → score=1/3
-        score = ev._compute_chop_score(asset_move_pct=0.003)
+        score = ev._compute_chop_score(asset_move_pct=0.003, current_price=0.0)
         assert 0.0 < score < 1.0
         assert score == pytest.approx(1 / 3, abs=0.01)
 
@@ -189,7 +193,7 @@ class TestComputeChopScore:
             WindowCheckpoint(ts=float(WINDOW_OPEN_TS + i * 60), price=p)
             for i, p in enumerate(prices)
         ]
-        score = ev._compute_chop_score(asset_move_pct=0.003)  # claims UP
+        score = ev._compute_chop_score(asset_move_pct=0.003, current_price=0.0)  # claims UP
         assert 0.0 <= score <= 1.0
 
 
@@ -287,6 +291,113 @@ class TestGateFailures:
         assert result["lag_gap"] == pytest.approx(0.02, abs=0.001)
         assert result["lag_gap"] < 0.04
 
+    def test_continuation_override_fires_when_lag_is_only_mildly_negative(self, tmp_path):
+        """Clean in-range momentum can still fire through the continuation path."""
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=1.0,
+            continuation_enabled=True,
+            continuation_min_minutes_remaining=1.5,
+            continuation_min_asset_move_pct=0.0004,
+            continuation_min_chop_score=0.6,
+            continuation_max_momentum_price=0.61,
+            continuation_max_opposite_price=0.44,
+            continuation_max_negative_lag_gap=0.04,
+            lag_threshold=0.015,
+        )
+        seed_clean_checkpoints_up(ev, n=3)
+        # implied 0.5797 vs yes ask 0.58 => lag_gap ~= -0.0003
+        with _patch_time(WINDOW_OPEN_TS + 791), _patch_gbm(0.5797):
+            result = ev._run_gates(ASSET_PRICE_UP, YES_ASK_IN_RANGE, 0.43)
+        assert result["result"] == GATE_FIRED
+        assert result["entry_model"] == "continuation"
+
+    def test_continuation_override_still_blocks_when_lag_is_too_negative(self, tmp_path):
+        """Continuation must not paper over a genuinely overextended market."""
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=1.0,
+            continuation_enabled=True,
+            continuation_min_minutes_remaining=1.5,
+            continuation_min_asset_move_pct=0.0004,
+            continuation_min_chop_score=0.6,
+            continuation_max_momentum_price=0.61,
+            continuation_max_opposite_price=0.44,
+            continuation_max_negative_lag_gap=0.04,
+            lag_threshold=0.015,
+        )
+        seed_clean_checkpoints_up(ev, n=3)
+        # implied 0.52 vs yes ask 0.58 => lag_gap = -0.06, beyond continuation limit
+        with _patch_time(WINDOW_OPEN_TS + 791), _patch_gbm(0.52):
+            result = ev._run_gates(ASSET_PRICE_UP, YES_ASK_IN_RANGE, 0.43)
+        assert result["result"] == GATE_LAG
+
+    def test_continuation_can_ignore_lag_veto_in_experiment_mode(self, tmp_path):
+        """Shadow experiment mode can take clean continuation entries despite very negative lag."""
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=1.0,
+            continuation_enabled=True,
+            continuation_min_minutes_remaining=1.5,
+            continuation_min_asset_move_pct=0.0004,
+            continuation_min_chop_score=0.6,
+            continuation_max_momentum_price=0.61,
+            continuation_max_opposite_price=0.44,
+            continuation_max_negative_lag_gap=0.04,
+            continuation_ignore_lag_veto=True,
+            lag_threshold=0.015,
+        )
+        seed_clean_checkpoints_up(ev, n=3)
+        with _patch_time(WINDOW_OPEN_TS + 791), _patch_gbm(0.52):
+            result = ev._run_gates(ASSET_PRICE_UP, YES_ASK_IN_RANGE, 0.43)
+        assert result["result"] == GATE_FIRED
+        assert result["entry_model"] == "continuation"
+
+    def test_cooldown_also_blocks_continuation_path(self, tmp_path):
+        """Continuation must not bypass the one-signal-per-window cooldown."""
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=1.0,
+            continuation_enabled=True,
+            continuation_min_minutes_remaining=1.5,
+            continuation_min_asset_move_pct=0.0004,
+            continuation_min_chop_score=0.6,
+            continuation_max_momentum_price=0.61,
+            continuation_max_opposite_price=0.44,
+            continuation_max_negative_lag_gap=0.04,
+            continuation_ignore_lag_veto=True,
+            lag_threshold=0.015,
+        )
+        seed_clean_checkpoints_up(ev, n=3)
+        ev._state.signal_fired = True
+        ev._state.signal_fired_side = "YES"
+        with _patch_time(WINDOW_OPEN_TS + 791), _patch_gbm(0.52):
+            result = ev._run_gates(ASSET_PRICE_UP, YES_ASK_IN_RANGE, 0.43)
+        assert result["result"] == GATE_COOLDOWN
+
+    def test_continuation_blocks_when_move_is_too_small_even_if_other_gates_pass(self, tmp_path):
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=1.0,
+            continuation_enabled=True,
+            continuation_min_minutes_remaining=1.5,
+            continuation_min_asset_move_pct=0.0004,
+            continuation_min_chop_score=0.6,
+            continuation_max_momentum_price=0.61,
+            continuation_max_opposite_price=0.44,
+            continuation_max_negative_lag_gap=0.04,
+            lag_threshold=0.015,
+            asset_vol_overrides={"min_asset_move_pct": 0.0002},
+        )
+        ev._state.checkpoints = [
+            WindowCheckpoint(ts=float(WINDOW_OPEN_TS + i * 60), price=ASSET_OPEN + i * 10.0)
+            for i in range(3)
+        ]
+        tiny_move_price = ASSET_OPEN * 1.0003  # 0.03% move: above global gate, below continuation floor
+        with _patch_time(WINDOW_OPEN_TS + 791), _patch_gbm(0.5797):
+            result = ev._run_gates(tiny_move_price, YES_ASK_IN_RANGE, 0.43)
+        assert result["result"] == GATE_LAG
+
     def test_cooldown_blocks_same_side_in_same_window(self, tmp_path):
         """Second YES signal in same window is blocked by cooldown gate."""
         ev = make_evaluator(tmp_path)
@@ -298,18 +409,16 @@ class TestGateFailures:
         assert result["result"] == GATE_COOLDOWN
         assert result["fired_side"] == "YES"
 
-    def test_cooldown_does_not_block_opposite_side(self, tmp_path):
-        """YES cooldown does NOT block a NO signal (different momentum direction)."""
+    def test_cooldown_blocks_opposite_side_too(self, tmp_path):
+        """Once a signal fires, the window is locked out even if direction flips."""
         ev = make_evaluator(tmp_path)
         seed_clean_checkpoints_down(ev)
         ev._state.signal_fired = True
         ev._state.signal_fired_side = "YES"   # YES already fired
         # Now BTC going DOWN → momentum_side = "NO", different from "YES"
-        # P(up) = 0.30 → implied_NO = 0.70, no_ask = 0.58 → lag_gap = 0.12 ✓
         with _patch_time(NOW_IN_WINDOW), _patch_gbm(0.30):
             result = ev._run_gates(ASSET_PRICE_DOWN, YES_ASK_OPPOSITE, NO_ASK_IN_RANGE)
-        # Should pass all gates (GATE_FIRED), not be blocked by cooldown
-        assert result["result"] == GATE_FIRED
+        assert result["result"] == GATE_COOLDOWN
 
 
 # ---------------------------------------------------------------------------
@@ -355,6 +464,7 @@ class TestSignalFires:
             )
         assert event is not None
         assert event.asset == "BTC"
+        assert event.entry_model == "lag"
         assert event.momentum_side == "YES"
         assert event.momentum_price == YES_ASK_IN_RANGE
         assert event.market_id == SAMPLE_MARKET_META["market_id"]
@@ -362,6 +472,9 @@ class TestSignalFires:
         assert event.lag_gap > 0.04
         assert event.chop_score == 1.0
         assert event.mid_window_start is False
+        assert event.required_shares == pytest.approx(5.0)
+        assert event.momentum_ask_size == pytest.approx(25.0)
+        assert event.phase1_would_fill is True
         # State updated
         assert ev._state.signal_fired is True
         assert ev._state.signal_fired_side == "YES"
@@ -494,42 +607,80 @@ class TestPostSignalTracking:
         ev.update_post_signal(yes_ask=0.63, no_ask=0.36)  # bouncing up
         assert obs.min_opposite_price == pytest.approx(0.34)
 
-    def test_phase2_triggers_on_reversal_above_threshold(self, tmp_path):
-        """phase2_would_have_triggered fires when y bounces > reversal_threshold from floor."""
+    def test_safe_opposite_price_arms_at_first_safe_touch(self, tmp_path):
+        """The first observed profitable safe price is remembered but not executed."""
         ev = self._fire_yes_signal(tmp_path)
         obs = ev._state.observation
 
-        # y drops to 0.34 (floor), then bounces to 0.352 (> 0.34 + 0.01 = 0.35 threshold)
-        # The condition is strictly greater-than: y_price > floor + threshold
-        ev.update_post_signal(yes_ask=0.60, no_ask=0.34)
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.34, yes_ask_size=25.0, no_ask_size=25.0)
+        assert obs.safe_opposite_price == pytest.approx(0.34)
+        assert obs.phase2_would_have_triggered is False
+        assert obs.dipped_below_safe_price is False
+
+    def test_phase2_triggers_only_after_safe_level_dips_and_reclaims(self, tmp_path):
+        """Phase 2 requires y_safe discovery, extension below it, then reclaim back to it."""
+        ev = self._fire_yes_signal(tmp_path)
+        obs = ev._state.observation
+
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.34, yes_ask_size=25.0, no_ask_size=25.0)   # arm y_safe
         assert obs.phase2_would_have_triggered is False
 
-        ev.update_post_signal(yes_ask=0.60, no_ask=0.352)
-        assert obs.phase2_would_have_triggered is True
-        assert obs.phase2_trigger_price == pytest.approx(0.352)
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.32, yes_ask_size=25.0, no_ask_size=25.0)   # extension below safe
+        assert obs.dipped_below_safe_price is True
+        assert obs.phase2_would_have_triggered is False
 
-    def test_phase2_does_not_trigger_below_threshold(self, tmp_path):
-        """Bounce smaller than reversal_threshold does not trigger Phase 2."""
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.345, yes_ask_size=25.0, no_ask_size=25.0)  # reclaim into safe band
+        assert obs.phase2_reclaim_seen is True
+        assert obs.phase2_would_fill is True
+        assert obs.phase2_would_have_triggered is True
+        assert obs.phase2_trigger_price == pytest.approx(0.345)
+
+    def test_phase2_does_not_trigger_without_extension_below_safe(self, tmp_path):
+        """Touching y_safe and bouncing around it is not enough on its own."""
         ev = self._fire_yes_signal(tmp_path)
         obs = ev._state.observation
 
-        ev.update_post_signal(yes_ask=0.60, no_ask=0.34)
-        ev.update_post_signal(yes_ask=0.60, no_ask=0.345)  # only +0.005 < 0.01
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.34, yes_ask_size=25.0, no_ask_size=25.0)   # arm safe
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.345, yes_ask_size=25.0, no_ask_size=25.0)  # reclaim-like move without lower extension
+        assert obs.phase2_would_have_triggered is False
+
+    def test_phase2_does_not_trigger_if_reclaim_never_reaches_safe(self, tmp_path):
+        """A rebound that stays below y_safe is still just continuation noise."""
+        ev = self._fire_yes_signal(tmp_path)
+        obs = ev._state.observation
+
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.34, yes_ask_size=25.0, no_ask_size=25.0)   # arm safe
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.31, yes_ask_size=25.0, no_ask_size=25.0)   # extension
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.335, yes_ask_size=25.0, no_ask_size=25.0)  # still below safe=0.34
         assert obs.phase2_would_have_triggered is False
 
     def test_phase2_does_not_trigger_twice(self, tmp_path):
-        """Phase 2 trigger is one-shot; subsequent bounces don't overwrite."""
+        """Phase 2 trigger is one-shot; later moves don't overwrite the first reclaim."""
         ev = self._fire_yes_signal(tmp_path)
         obs = ev._state.observation
 
-        ev.update_post_signal(yes_ask=0.60, no_ask=0.34)
-        ev.update_post_signal(yes_ask=0.60, no_ask=0.36)  # first trigger
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.34, yes_ask_size=25.0, no_ask_size=25.0)   # arm safe
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.32, yes_ask_size=25.0, no_ask_size=25.0)   # extension
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.345, yes_ask_size=25.0, no_ask_size=25.0)  # first reclaim trigger
         first_trigger_price = obs.phase2_trigger_price
         assert obs.phase2_would_have_triggered is True
 
-        ev.update_post_signal(yes_ask=0.60, no_ask=0.40)  # more bouncing
-        # trigger_price should NOT have changed
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.35, yes_ask_size=25.0, no_ask_size=25.0)   # more bouncing
         assert obs.phase2_trigger_price == first_trigger_price
+
+    def test_phase2_reclaim_seen_but_not_executable_with_insufficient_size(self, tmp_path):
+        """Price-only reclaim should not count as a live trigger if top ask size is too thin."""
+        ev = self._fire_yes_signal(tmp_path)
+        obs = ev._state.observation
+
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.34, yes_ask_size=25.0, no_ask_size=25.0)
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.32, yes_ask_size=25.0, no_ask_size=25.0)
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.345, yes_ask_size=25.0, no_ask_size=4.0)
+
+        assert obs.phase2_reclaim_seen is True
+        assert obs.phase2_would_fill is False
+        assert obs.phase2_would_have_triggered is False
+        assert obs.phase2_trigger_ask_size == pytest.approx(4.0)
 
     def test_opposite_tracked_correctly_for_no_momentum(self, tmp_path):
         """When NO is momentum, YES is the opposite side being tracked."""

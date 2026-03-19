@@ -38,8 +38,12 @@ Usage:
   evaluator.on_window_open(window_ts, asset_price)
   # ... each poll cycle:
   evaluator.maybe_record_checkpoint(asset_price)
-  evaluator.update_post_signal(yes_ask, no_ask)
+  evaluator.update_post_signal(yes_ask, no_ask, yes_ask_size, no_ask_size)
   signal = evaluator.evaluate(asset_price, yes_ask, no_ask, market_meta)
+
+The evaluator itself never places orders. In shadow/live mode the surrounding
+observer loop hands the emitted BracketSignalEvent to BracketExecutor so the
+same signal path is used in every mode.
 """
 from __future__ import annotations
 
@@ -153,10 +157,15 @@ class DirectionSignalEvaluator:
 
         logger.info(
             "DirectionSignalEvaluator init asset={} vol_per_second={:.8f} "
-            "entry_range=[{}, {}] lag_threshold={} time_gate_minutes={}",
+            "entry_range=[{}, {}] lag_threshold={} time_gate_minutes={} "
+            "continuation={} cont_min_mins={} cont_min_chop={} cont_ignore_lag={}",
             asset, self._vol_per_second,
             cfg.entry_range_low, cfg.entry_range_high,
             cfg.lag_threshold, cfg.time_gate_minutes,
+            cfg.continuation_enabled,
+            cfg.continuation_min_minutes_remaining,
+            cfg.continuation_min_chop_score,
+            cfg.continuation_ignore_lag_veto,
         )
 
     # ------------------------------------------------------------------ #
@@ -198,6 +207,7 @@ class DirectionSignalEvaluator:
         self,
         asset_close: float,
         yes_won: bool | None,
+        outcome_source: str = "asset_price_proxy",
     ) -> None:
         """
         Record the window outcome and write post-signal observation to the log.
@@ -216,6 +226,7 @@ class DirectionSignalEvaluator:
 
         obs = self._state.observation
         obs.asset_close_price = asset_close
+        obs.outcome_source = outcome_source
 
         if yes_won is True:
             obs.outcome = "YES_WINS"
@@ -228,7 +239,10 @@ class DirectionSignalEvaluator:
         # sell momentum_side at its peak price vs. what we paid (momentum_price at signal)
         entry_price = self._last_event.momentum_price
         peak_price = obs.momentum_side_peak
-        obs.estimated_phase1_exit_pnl = round((peak_price - entry_price) * 10.0, 4)
+        obs.estimated_phase1_exit_pnl = round(
+            (peak_price - entry_price) * self._required_shares(),
+            4,
+        )
 
         # CRITICAL: populate the observation on the in-memory event object so that
         # when the observer loop calls ev._last_event.model_dump() immediately after
@@ -246,13 +260,14 @@ class DirectionSignalEvaluator:
                 "asset": self.asset,
                 "window_close_ts": self._state.window_close_ts,
                 "asset_close": asset_close,
+                "outcome_source": outcome_source,
                 "observation": obs.model_dump(),
             },
         )
         logger.info(
-            "Window closed asset={} outcome={} bracket_formed={} "
+            "Window closed asset={} outcome={} source={} bracket_formed={} "
             "phase2_triggered={} phase1_exit_pnl={:.4f}",
-            self.asset, obs.outcome, obs.bracket_would_have_formed,
+            self.asset, obs.outcome, outcome_source, obs.bracket_would_have_formed,
             obs.phase2_would_have_triggered, obs.estimated_phase1_exit_pnl,
         )
 
@@ -294,13 +309,23 @@ class DirectionSignalEvaluator:
     # Post-signal tracking
     # ------------------------------------------------------------------ #
 
-    def update_post_signal(self, yes_ask: float, no_ask: float) -> None:
+    def _required_shares(self) -> float:
+        return max(round(self._cfg.phase1_shares, 1), self._cfg.min_bracket_shares)
+
+    def update_post_signal(
+        self,
+        yes_ask: float,
+        no_ask: float,
+        yes_ask_size: float = 0.0,
+        no_ask_size: float = 0.0,
+    ) -> None:
         """
         Update post-signal observation metrics on each poll cycle.
 
         After a signal fires, we keep watching to answer:
           - Did the bracket become achievable (x + y + fees < $1.00)?
-          - Did the opposite side bottom and start reversing (Phase 2 trigger)?
+          - When did we first see a safe opposite-side price (y_safe)?
+          - Did price extend below y_safe and later reclaim it on reversal?
           - What was the best unrealised gain on the momentum side?
 
         This data is the primary calibration input before live trading.
@@ -314,8 +339,12 @@ class DirectionSignalEvaluator:
         x_price = self._last_event.momentum_price  # what we "paid" for the first leg
         momentum_side = self._last_event.momentum_side
 
-        # y is the opposite side — the one we're watching for the second leg
+        # y is the opposite side — the one we're watching for the second leg.
+        # We also track the top-of-book ask size so the paper report can tell
+        # whether this would actually have been executable for the configured
+        # live share size.
         y_price = no_ask if momentum_side == "YES" else yes_ask
+        y_ask_size = no_ask_size if momentum_side == "YES" else yes_ask_size
 
         # Update momentum side peak and trough (for hard-exit loss modeling in paper P&L)
         momentum_now = yes_ask if momentum_side == "YES" else no_ask
@@ -338,28 +367,70 @@ class DirectionSignalEvaluator:
             if net_bracket > 0:
                 obs.bracket_would_have_formed = True
 
-            # Track the floor of y (lowest price seen — best possible entry for leg 2)
+            # Track the floor of y (lowest price seen after the signal).
             if y_price < obs.min_opposite_price:
                 obs.min_opposite_price = y_price
 
-            # Phase 2 reversal check: has y bounced from its floor by >= threshold
-            # AND is the bracket margin still positive at the current y price?
-            # Both conditions must hold — the live bracket_executor requires net_margin>0
-            # before placing the Phase 2 order, so the observation must match.
-            floor = obs.min_opposite_price
+            # y_safe discovery:
+            # save the FIRST observed opposite-side price that reaches the
+            # configured safe zone and is still profitable after fees.
             if (
-                floor < 999.0
-                and y_price > floor + self._cfg.phase2_reversal_threshold
-                and net_bracket > 0   # CRITICAL: bracket must be profitable at trigger
-                and not obs.phase2_would_have_triggered
+                obs.safe_opposite_price is None
+                and y_price <= self._cfg.target_y_price
+                and net_bracket > 0
             ):
-                obs.phase2_would_have_triggered = True
-                obs.phase2_trigger_price = round(y_price, 6)
+                obs.safe_opposite_price = round(y_price, 6)
                 logger.info(
-                    "Phase 2 would have triggered asset={} y_floor={:.4f} y_now={:.4f} "
-                    "bracket_margin={:.4f}",
-                    self.asset, floor, y_price, net_bracket,
+                    "Safe opposite price armed asset={} safe_y={:.4f} bracket_margin={:.4f}",
+                    self.asset, y_price, net_bracket,
                 )
+
+            safe_price = obs.safe_opposite_price
+
+            # Once y_safe exists, require the move to extend below it before
+            # we credit a reclaim. This avoids buying the second leg the instant
+            # the equation merely becomes safe.
+            if (
+                safe_price is not None
+                and y_price <= safe_price - self._cfg.phase2_reversal_threshold
+            ):
+                obs.dipped_below_safe_price = True
+
+            # Phase 2 reclaim check:
+            #   1. y_safe was armed
+            #   2. price extended below y_safe
+            #   3. the opposite ask later reclaimed y_safe on reversal
+            #   4. the bracket is still profitable at the observed reclaim price
+            if (
+                safe_price is not None
+                and obs.dipped_below_safe_price
+                and y_price >= safe_price
+                and y_price <= safe_price + self._cfg.phase2_reversal_threshold
+                and net_bracket > 0
+            ):
+                required_shares = self._required_shares()
+                phase2_would_fill = y_ask_size >= required_shares
+
+                if not obs.phase2_reclaim_seen:
+                    obs.phase2_reclaim_seen = True
+                    obs.phase2_trigger_price = round(y_price, 6)
+                    obs.phase2_trigger_ask_size = round(y_ask_size, 6)
+                    obs.phase2_would_fill = phase2_would_fill
+                    logger.info(
+                        "Phase 2 reclaim seen asset={} safe_y={:.4f} y_now={:.4f} "
+                        "y_floor={:.4f} ask_size={:.2f} required_shares={:.1f} "
+                        "bracket_margin={:.4f}",
+                        self.asset, safe_price, y_price, obs.min_opposite_price,
+                        y_ask_size, required_shares, net_bracket,
+                    )
+
+                if phase2_would_fill and not obs.phase2_would_have_triggered:
+                    obs.phase2_would_have_triggered = True
+                    logger.info(
+                        "Phase 2 would have triggered asset={} safe_y={:.4f} y_now={:.4f} "
+                        "y_floor={:.4f} bracket_margin={:.4f}",
+                        self.asset, safe_price, y_price, obs.min_opposite_price, net_bracket,
+                    )
 
     # ------------------------------------------------------------------ #
     # Signal evaluation — the main entry point every poll cycle
@@ -387,7 +458,19 @@ class DirectionSignalEvaluator:
         """
         # Run all gates sequentially — first failure short-circuits and logs
         gate = self._run_gates(asset_price, yes_ask, no_ask)
-        _log_evaluation(self._cfg, self.asset, self._state, gate, yes_ask, no_ask, asset_price)
+        _log_evaluation(
+            self._cfg,
+            self._asset_vol_cfg,
+            self._vol_per_second,
+            self.asset,
+            self._state,
+            gate,
+            yes_ask,
+            no_ask,
+            asset_price,
+            market_meta.get("yes_ask_size", 0.0),
+            market_meta.get("no_ask_size", 0.0),
+        )
 
         if gate["result"] != GATE_FIRED:
             return None
@@ -499,7 +582,18 @@ class DirectionSignalEvaluator:
                 "checkpoints_used": len(state.checkpoints[-self._cfg.chop_window:]),
             }
 
-        # ---- Gate 6: Lag gap ----
+        # ---- Gate 6: Cooldown ----
+        # Once a window has fired, the executor and report should treat later
+        # evaluations as cooldown rather than emitting duplicate signals. This
+        # applies before lag/continuation selection so continuation cannot
+        # bypass the one-signal-per-window rule.
+        if state.signal_fired:
+            return {
+                "result": GATE_COOLDOWN,
+                "fired_side": state.signal_fired_side,
+            }
+
+        # ---- Gate 7: Lag gap ----
         # The GBM fair-value estimate for momentum_side must exceed the actual
         # Polymarket price by >= lag_threshold. This means the market hasn't
         # fully priced in the BTC/ETH move yet — we have a better entry.
@@ -517,6 +611,26 @@ class DirectionSignalEvaluator:
         lag_gap = implied_momentum_price - momentum_price
 
         if lag_gap < self._cfg.lag_threshold:
+            if self._continuation_entry_ok(
+                asset_move_pct=asset_move_pct,
+                minutes_remaining=minutes_remaining,
+                momentum_price=momentum_price,
+                opposite_price=opposite_price,
+                chop_score=chop_score,
+                lag_gap=lag_gap,
+            ):
+                return {
+                    "result": GATE_FIRED,
+                    "entry_model": "continuation",
+                    "minutes_remaining": round(minutes_remaining, 2),
+                    "asset_move_pct": round(asset_move_pct, 6),
+                    "momentum_side": momentum_side,
+                    "momentum_price": round(momentum_price, 4),
+                    "opposite_price": round(opposite_price, 4),
+                    "chop_score": round(chop_score, 3),
+                    "lag_gap": round(lag_gap, 4),
+                    "implied_momentum_price": round(implied_momentum_price, 4),
+                }
             return {
                 "result": GATE_LAG,
                 "lag_gap": round(lag_gap, 4),
@@ -525,19 +639,10 @@ class DirectionSignalEvaluator:
                 "min_required": self._cfg.lag_threshold,
             }
 
-        # ---- Gate 7: Cooldown ----
-        # Block ALL second signals in one window — even opposite side.
-        # Allowing NO then YES (or vice versa) in the same window would buy
-        # both sides for total cost > $1.00, guaranteeing a loss.
-        if state.signal_fired:
-            return {
-                "result": GATE_COOLDOWN,
-                "fired_side": state.signal_fired_side,
-            }
-
         # ---- All gates passed ----
         return {
             "result": GATE_FIRED,
+            "entry_model": "lag",
             "minutes_remaining": round(minutes_remaining, 2),
             "asset_move_pct": round(asset_move_pct, 6),
             "momentum_side": momentum_side,
@@ -597,6 +702,43 @@ class DirectionSignalEvaluator:
 
         return max(0.0, min(1.0, clean_steps / total_steps))
 
+    def _continuation_entry_ok(
+        self,
+        *,
+        asset_move_pct: float,
+        minutes_remaining: float,
+        momentum_price: float,
+        opposite_price: float,
+        chop_score: float,
+        lag_gap: float,
+    ) -> bool:
+        """
+        Allow a narrow continuation-style entry when classic lag is absent.
+
+        This is deliberately strict so we only capture very clean early moves
+        that still fit the bracket thesis, rather than broadly loosening the
+        main signal band.
+        """
+        cfg = self._cfg
+        if not cfg.continuation_enabled:
+            return False
+        if minutes_remaining < cfg.continuation_min_minutes_remaining:
+            return False
+        if abs(asset_move_pct) < cfg.continuation_min_asset_move_pct:
+            return False
+        if chop_score < cfg.continuation_min_chop_score:
+            return False
+        if momentum_price > cfg.continuation_max_momentum_price:
+            return False
+        if opposite_price > cfg.continuation_max_opposite_price:
+            return False
+        if (
+            not cfg.continuation_ignore_lag_veto
+            and lag_gap < -cfg.continuation_max_negative_lag_gap
+        ):
+            return False
+        return True
+
     # ------------------------------------------------------------------ #
     # Internal: signal event construction
     # ------------------------------------------------------------------ #
@@ -641,9 +783,28 @@ class DirectionSignalEvaluator:
             asset_open=state.asset_open,
             asset_current=asset_price,
             asset_move_pct=gate["asset_move_pct"],
+            entry_model=str(gate.get("entry_model") or "lag"),
             momentum_side=momentum_side,
             momentum_price=momentum_price,
             opposite_price=gate["opposite_price"],
+            momentum_ask_size=float(
+                market_meta.get("yes_ask_size", 0.0)
+                if momentum_side == "YES"
+                else market_meta.get("no_ask_size", 0.0)
+            ),
+            opposite_ask_size=float(
+                market_meta.get("no_ask_size", 0.0)
+                if momentum_side == "YES"
+                else market_meta.get("yes_ask_size", 0.0)
+            ),
+            required_shares=self._required_shares(),
+            phase1_would_fill=(
+                float(
+                    market_meta.get("yes_ask_size", 0.0)
+                    if momentum_side == "YES"
+                    else market_meta.get("no_ask_size", 0.0)
+                ) >= self._required_shares()
+            ),
             implied_momentum_price=gate["implied_momentum_price"],
             lag_gap=gate["lag_gap"],
             chop_score=gate["chop_score"],
@@ -675,10 +836,10 @@ class DirectionSignalEvaluator:
         })
 
         logger.info(
-            "BRACKET SIGNAL FIRED | asset={} side={} price={} lag_gap={:.3f} "
+            "BRACKET SIGNAL FIRED | asset={} model={} side={} price={} lag_gap={:.3f} "
             "chop={:.2f} net_bracket_target={:.4f} mins_left={:.1f} "
             "market_id={}",
-            self.asset, momentum_side, momentum_price, gate["lag_gap"],
+            self.asset, event.entry_model, momentum_side, momentum_price, gate["lag_gap"],
             gate["chop_score"], net_bracket_at_target, gate["minutes_remaining"],
             market_meta.get("market_id", "?"),
         )
@@ -698,14 +859,135 @@ def _append_jsonl(path: str, record: dict[str, Any]) -> None:
         logger.warning("Failed to write to JSONL log path={} error={}", path, exc)
 
 
+def _build_live_snapshot(
+    cfg: CryptoDirectionConfig,
+    asset_vol_cfg: AssetVolConfig,
+    vol_per_second: float,
+    state: _WindowState | None,
+    yes_ask: float,
+    no_ask: float,
+    asset_price: float,
+    yes_ask_size: float,
+    no_ask_size: float,
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
+        "yes_ask_size": round(float(yes_ask_size or 0.0), 4),
+        "no_ask_size": round(float(no_ask_size or 0.0), 4),
+        "required_shares": round(max(cfg.phase1_shares, cfg.min_bracket_shares), 4),
+        "time_gate_minutes_cfg": cfg.time_gate_minutes,
+        "move_threshold_cfg": asset_vol_cfg.min_asset_move_pct,
+        "entry_range_low_cfg": cfg.entry_range_low,
+        "entry_range_high_cfg": cfg.entry_range_high,
+        "chop_min_score_cfg": cfg.chop_min_score,
+        "lag_threshold_cfg": cfg.lag_threshold,
+    }
+
+    if not state:
+        return snapshot
+
+    snapshot["window_open_ts"] = state.window_open_ts
+    snapshot["asset_open"] = round(state.asset_open, 2)
+    snapshot["minutes_remaining"] = round(
+        (state.window_close_ts - time.time()) / 60.0,
+        2,
+    )
+    snapshot["mid_window_start"] = state.mid_window_start
+    snapshot["signal_already_fired"] = state.signal_fired
+
+    if state.asset_open <= 0 or asset_price <= 0:
+        return snapshot
+
+    asset_move_pct = (asset_price - state.asset_open) / state.asset_open
+    snapshot["asset_move_pct"] = round(asset_move_pct, 6)
+    snapshot["move_pass_live"] = abs(asset_move_pct) >= asset_vol_cfg.min_asset_move_pct
+
+    if asset_move_pct > 0:
+        momentum_side = "YES"
+        momentum_price = yes_ask
+        opposite_price = no_ask
+        momentum_ask_size = yes_ask_size
+        opposite_ask_size = no_ask_size
+    elif asset_move_pct < 0:
+        momentum_side = "NO"
+        momentum_price = no_ask
+        opposite_price = yes_ask
+        momentum_ask_size = no_ask_size
+        opposite_ask_size = yes_ask_size
+    else:
+        momentum_side = ""
+        momentum_price = 0.0
+        opposite_price = 0.0
+        momentum_ask_size = 0.0
+        opposite_ask_size = 0.0
+
+    if momentum_side:
+        snapshot["momentum_side_live"] = momentum_side
+        snapshot["momentum_price_live"] = round(momentum_price, 4)
+        snapshot["opposite_price_live"] = round(opposite_price, 4)
+        snapshot["momentum_ask_size_live"] = round(float(momentum_ask_size or 0.0), 4)
+        snapshot["opposite_ask_size_live"] = round(float(opposite_ask_size or 0.0), 4)
+        snapshot["phase1_would_fill_live"] = momentum_ask_size >= snapshot["required_shares"]
+        snapshot["range_pass_live"] = cfg.entry_range_low <= momentum_price <= cfg.entry_range_high
+        if momentum_price > cfg.entry_range_high:
+            snapshot["range_side"] = "HIGH"
+            snapshot["range_distance"] = round(momentum_price - cfg.entry_range_high, 4)
+        elif 0 < momentum_price < cfg.entry_range_low:
+            snapshot["range_side"] = "LOW"
+            snapshot["range_distance"] = round(cfg.entry_range_low - momentum_price, 4)
+
+    prices_pass = yes_ask > 0 and no_ask > 0
+    snapshot["prices_pass_live"] = prices_pass
+    chop_score = 0.0
+    if momentum_side and prices_pass:
+        recent = list(state.checkpoints[-cfg.chop_window:])
+        if asset_price > 0:
+            recent.append(WindowCheckpoint(ts=time.time(), price=asset_price))
+        if len(recent) < 2:
+            chop_score = 0.5
+        else:
+            direction = 1 if asset_move_pct > 0 else -1
+            total_steps = len(recent) - 1
+            clean_steps = 0
+            for i in range(total_steps):
+                step = recent[i + 1].price - recent[i].price
+                step_pct = step / recent[i].price if recent[i].price > 0 else 0.0
+                if step * direction > 0:
+                    clean_steps += 1
+                elif abs(step_pct) > cfg.chop_max_reversal_pct:
+                    clean_steps -= 1
+            chop_score = max(0.0, min(1.0, clean_steps / total_steps))
+        snapshot["chop_score_live"] = round(chop_score, 4)
+        snapshot["chop_pass_live"] = chop_score >= cfg.chop_min_score
+
+        time_remaining_seconds = float(state.window_close_ts) - time.time()
+        if time_remaining_seconds > 0:
+            implied_p_up = _estimate_fair_p_up(
+                chainlink_price=asset_price,
+                start_price=state.asset_open,
+                time_remaining_seconds=time_remaining_seconds,
+                realized_vol_per_second=vol_per_second,
+            )
+            implied_momentum_price = implied_p_up if momentum_side == "YES" else (1.0 - implied_p_up)
+            lag_gap = implied_momentum_price - momentum_price
+            snapshot["implied_momentum_price_live"] = round(implied_momentum_price, 4)
+            snapshot["lag_gap_live"] = round(lag_gap, 4)
+            snapshot["lag_pass_live"] = lag_gap >= cfg.lag_threshold
+
+    return snapshot
+
+
 def _log_evaluation(
     cfg: CryptoDirectionConfig,
+    asset_vol_cfg: AssetVolConfig,
+    vol_per_second: float,
     asset: str,
     state: _WindowState | None,
     gate: dict[str, Any],
     yes_ask: float,
     no_ask: float,
     asset_price: float,
+    yes_ask_size: float = 0.0,
+    no_ask_size: float = 0.0,
 ) -> None:
     """
     Write a compact evaluation record to the evaluation JSONL log.
@@ -722,27 +1004,73 @@ def _log_evaluation(
         "no_ask": round(no_ask, 4),
         "result": gate.get("result", "UNKNOWN"),
     }
-
-    if state:
-        record["window_open_ts"] = state.window_open_ts
-        record["asset_open"] = round(state.asset_open, 2)
-        record["minutes_remaining"] = round(
-            (state.window_close_ts - time.time()) / 60.0, 2
+    record.update(
+        _build_live_snapshot(
+            cfg,
+            asset_vol_cfg,
+            vol_per_second,
+            state,
+            yes_ask,
+            no_ask,
+            asset_price,
+            yes_ask_size,
+            no_ask_size,
         )
-        asset_move_pct = (
-            (asset_price - state.asset_open) / state.asset_open
-            if state.asset_open > 0 else 0.0
-        )
-        record["asset_move_pct"] = round(asset_move_pct, 6)
-        record["mid_window_start"] = state.mid_window_start
-        record["signal_already_fired"] = state.signal_fired
+    )
 
     # Include all diagnostic fields from the gate result
     for k, v in gate.items():
         if k != "result":
             record[k] = v
 
+    result = record["result"]
+    if result == GATE_RANGE:
+        low, high = cfg.entry_range_low, cfg.entry_range_high
+        momentum_price = float(record.get("momentum_price", 0.0) or 0.0)
+        if momentum_price > high:
+            record["range_side"] = "HIGH"
+            record["range_distance"] = round(momentum_price - high, 4)
+        elif momentum_price < low:
+            record["range_side"] = "LOW"
+            record["range_distance"] = round(low - momentum_price, 4)
+    elif result == GATE_MOVE:
+        move = abs(float(record.get("asset_move_pct", 0.0) or 0.0))
+        required = float(record.get("min_required", 0.0) or 0.0)
+        if required > 0:
+            record["move_shortfall"] = round(max(required - move, 0.0), 6)
+    elif result == GATE_CHOP:
+        score = float(record.get("chop_score", 0.0) or 0.0)
+        required = float(record.get("min_required", 0.0) or 0.0)
+        if required > 0:
+            record["chop_shortfall"] = round(max(required - score, 0.0), 4)
+    elif result == GATE_LAG:
+        lag_gap = float(record.get("lag_gap", 0.0) or 0.0)
+        required = float(record.get("min_required", 0.0) or 0.0)
+        if required > 0:
+            record["lag_shortfall"] = round(max(required - lag_gap, 0.0), 4)
+
     _append_jsonl(cfg.evaluation_log_path, record)
+
+
+async def _resolve_market_outcome(
+    *,
+    client: Any,
+    asset_slug_prefix: str,
+    window_ts: int,
+) -> dict[str, Any] | None:
+    """
+    Ask the market metadata for the closing window who won.
+
+    This is the best available non-wallet source for post-close outcome
+    labeling. If the market endpoint still doesn't expose a resolved binary
+    winner, the caller should fall back to the Binance price proxy.
+    """
+    slug = f"{asset_slug_prefix}-{window_ts}"
+    try:
+        return await client.fetch_market_resolution(market_slug=slug)
+    except Exception as exc:
+        logger.debug("Market outcome lookup failed slug={} error={}", slug, exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -787,10 +1115,15 @@ async def run_bracket_signal_observer(
 
     logger.info(
         "Starting bracket signal observer track_btc={} track_eth={} "
-        "entry_range=[{}, {}] lag_threshold={} time_gate_minutes={}",
+        "entry_range=[{}, {}] lag_threshold={} time_gate_minutes={} "
+        "continuation={} cont_min_mins={} cont_min_chop={} cont_ignore_lag={}",
         cfg.track_btc, cfg.track_eth,
         cfg.entry_range_low, cfg.entry_range_high,
         cfg.lag_threshold, cfg.time_gate_minutes,
+        cfg.continuation_enabled,
+        cfg.continuation_min_minutes_remaining,
+        cfg.continuation_min_chop_score,
+        cfg.continuation_ignore_lag_veto,
     )
 
     # ---- Startup diagnostics ----
@@ -815,8 +1148,9 @@ async def run_bracket_signal_observer(
     # ---- Window report writer ----
     report_writer = WindowReportWriter(
         report_path=cfg.window_report_path,
-        hypothetical_bet_size=cfg.hypothetical_bet_size,
-        live_execution=(executor is not None),   # flag live mode in the report header
+        report_shares=cfg.report_shares,
+        live_execution=(executor is not None),   # backward-compatible flag
+        execution_mode=str(getattr(executor, "execution_mode", "observe")).lower(),
         window_duration_seconds=cfg.window_duration_seconds,
     )
 
@@ -828,8 +1162,8 @@ async def run_bracket_signal_observer(
     await _initialise_window(watcher, evaluators, init_window_ts, mid_window=True)
 
     logger.info(
-        "Observer running — watching {} window cycles. Press Ctrl+C to stop.",
-        "15-minute",
+        "Observer running — watching {}-minute window cycles. Press Ctrl+C to stop.",
+        int(cfg.window_duration_seconds / 60),
     )
 
     # ---- Main poll loop ----
@@ -849,13 +1183,38 @@ async def run_bracket_signal_observer(
                     if not w or not ev:
                         continue
 
-                    # Determine outcome: did YES win? (asset ended above open?)
+                    # Determine outcome: prefer actual market metadata for the
+                    # closing window, then fall back to the asset-price proxy.
                     asset_price_now = w.asset_price()
                     ev_state = ev._state
-                    if ev_state and ev_state.asset_open > 0:
-                        yes_won = asset_price_now > ev_state.asset_open
-                    else:
-                        yes_won = None
+                    yes_won: bool | None = None
+                    outcome_source = "asset_price_proxy"
+                    if ev_state:
+                        resolution = await _resolve_market_outcome(
+                            client=client,
+                            asset_slug_prefix=ev._asset_vol_cfg.slug_prefix,
+                            window_ts=ev_state.window_open_ts,
+                        )
+                        if resolution and resolution.get("resolved_yes") is not None:
+                            yes_won = bool(resolution.get("resolved_yes"))
+                            outcome_source = str(resolution.get("source") or "market_metadata")
+                            logger.info(
+                                "Window outcome sourced from market metadata asset={} window_ts={} source={} prices={}",
+                                asset,
+                                ev_state.window_open_ts,
+                                outcome_source,
+                                resolution.get("outcome_prices"),
+                            )
+                        elif ev_state.asset_open > 0:
+                            yes_won = asset_price_now > ev_state.asset_open
+                            outcome_source = "asset_price_proxy"
+                            logger.info(
+                                "Window outcome fell back to asset-price proxy asset={} window_ts={} asset_open={:.2f} asset_close={:.2f}",
+                                asset,
+                                ev_state.window_open_ts,
+                                ev_state.asset_open,
+                                asset_price_now,
+                            )
 
                     # Snapshot state before on_window_close() clears it
                     ev_state_snap = ev._state
@@ -867,7 +1226,9 @@ async def run_bracket_signal_observer(
                     # window report.  Previously record_window_close() was called first
                     # and always saw observation=None → Phase 2 was never credited in
                     # hyp_pnl and "Phase 2: Not triggered" always appeared.
-                    ev.on_window_close(asset_price_now, yes_won)
+                    ev.on_window_close(asset_price_now, yes_won, outcome_source=outcome_source)
+
+                    execution_summary = None
 
                     # Settle any open bracket positions for this window
                     if executor is not None and ev_state_snap:
@@ -875,6 +1236,10 @@ async def run_bracket_signal_observer(
                             window_ts=ev_state_snap.window_open_ts,
                             asset=asset,
                             yes_won=yes_won,
+                        )
+                        execution_summary = executor.take_window_summary(
+                            window_ts=ev_state_snap.window_open_ts,
+                            asset=asset,
                         )
 
                     # Now record the window — _last_event.observation is populated
@@ -893,10 +1258,16 @@ async def run_bracket_signal_observer(
                             no_ask_final=w.no_ask(),
                             last_signal_event=last_event_dict,
                             eval_log_path=cfg.evaluation_log_path,
+                            signal_log_path=cfg.signal_event_log_path,
                             yes_won=yes_won,  # pass directly — more reliable than ask-price inference
+                            outcome_source=outcome_source,
+                            execution_summary=execution_summary,
                         )
                         if not signal_fired_snap and report_writer._windows:
-                            gate = report_writer._windows[-1].primary_gate_fail
+                            gate = (
+                                report_writer._windows[-1].dominant_gate_fail
+                                or report_writer._windows[-1].primary_gate_fail
+                            )
                             logger.info(
                                 "No signal this window asset={} — blocked at: {}",
                                 asset, gate or "NO_WINDOW_STATE",
@@ -927,23 +1298,32 @@ async def run_bracket_signal_observer(
                 asset_price = w.asset_price()
                 yes_ask = w.yes_ask()
                 no_ask = w.no_ask()
+                yes_bid = w.yes_bid()
+                no_bid = w.no_bid()
 
                 # Record :00-second Chainlink-aligned price checkpoint
                 ev.maybe_record_checkpoint(asset_price)
 
                 # Update bracket tracking if a signal already fired this window
-                ev.update_post_signal(yes_ask, no_ask)
+                yes_ask_size = w.yes_ask_size()
+                no_ask_size = w.no_ask_size()
+                ev.update_post_signal(yes_ask, no_ask, yes_ask_size, no_ask_size)
 
                 # Phase 2 monitoring — check for bracket entry conditions
                 if executor is not None:
-                    await executor.tick(asset, yes_ask, no_ask)
+                    await executor.tick(asset, yes_ask, no_ask, yes_bid=yes_bid, no_bid=no_bid)
 
                 # Check if all signal gates pass
                 if not w.is_ready():
+                    readiness_reason = (
+                        w.readiness_reason()
+                        if hasattr(w, "readiness_reason")
+                        else "watcher_not_ready"
+                    )
                     _log_evaluation(
-                        cfg, asset, ev._state,
-                        {"result": GATE_STALE, "reason": "watcher_not_ready"},
-                        yes_ask, no_ask, asset_price,
+                        cfg, ev._asset_vol_cfg, ev._vol_per_second, asset, ev._state,
+                        {"result": GATE_STALE, "reason": readiness_reason},
+                        yes_ask, no_ask, asset_price, yes_ask_size, no_ask_size,
                     )
                     continue
 
@@ -953,11 +1333,19 @@ async def run_bracket_signal_observer(
 
                 if signal:
                     if executor is not None:
-                        await executor.on_signal(signal)
-                        logger.info(
-                            "Signal fired — Phase 1 order submitted. event_id={}",
-                            signal.event_id,
-                        )
+                        submitted = await executor.on_signal(signal)
+                        if submitted:
+                            logger.info(
+                                "Signal fired — Phase 1 order submitted mode={}. event_id={}",
+                                str(getattr(executor, "execution_mode", "observe")).lower(),
+                                signal.event_id,
+                            )
+                        else:
+                            logger.info(
+                                "Signal fired — executor did not open a position mode={}. event_id={}",
+                                str(getattr(executor, "execution_mode", "observe")).lower(),
+                                signal.event_id,
+                            )
                     else:
                         logger.info(
                             "Signal logged — observation only, no orders placed. "

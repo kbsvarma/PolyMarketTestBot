@@ -68,16 +68,40 @@ class WindowSummary:
     yes_ask_final: float        # YES ask at window close (0.99 → YES likely won)
     no_ask_final: float         # NO ask at window close
     primary_gate_fail: str      # deepest gate reached (furthest in sequence)
+    dominant_gate_fail: str     # most frequent blocker across the window
+    dominant_gate_count: int    # number of eval cycles blocked there
+    total_eval_cycles: int      # total eval cycles captured for the window
     gate_counts: dict           # {gate: count} — how often each gate fired
+    near_miss_counts: dict      # compact near-miss diagnostics for this window
+    counterfactual_counts: dict # single-guardrail loosening diagnostics
     signal_fired: bool          # did a Phase 1 signal fire?
     signal_side: str            # "YES" or "NO" if fired, else ""
+    signal_entry_model: str     # "lag" or "continuation" when fired
     signal_price: float         # momentum-side entry ask price
-    phase2_triggered: bool      # did Phase 2 (bracket leg 2) trigger?
-    phase2_price: float         # opposite-side entry price for leg 2
+    phase1_would_fill: bool = True
+    phase1_ask_size: float = 0.0
+    required_shares: float = 0.0
+    safe_opposite_price: float = 0.0   # remembered y_safe level, if armed
+    dipped_below_safe_price: bool = False
+    phase2_reclaim_seen: bool = False
+    phase2_triggered: bool = False     # did Phase 2 (bracket leg 2) trigger?
+    phase2_price: float = 0.0          # opposite-side entry price for leg 2
+    phase2_trigger_ask_size: float = 0.0
+    phase2_would_fill: bool = False
     resolved_yes: Optional[bool] = None   # True=YES won, False=NO won, None=unclear
-    hyp_pnl_per_share: float = 0.0        # hypothetical PnL per $1 notional
-    hyp_pnl_dollars: float = 0.0          # hypothetical PnL in dollars (bet_size scaled)
+    share_count: float = 0.0              # configured or actual shares for this window
+    hyp_pnl_per_share: float = 0.0        # PnL per share
+    hyp_pnl_dollars: float = 0.0          # total PnL in dollars (share_count scaled)
     hard_exit_modeled: bool = False        # True if hard-exit stop (50¢) was modeled to have fired
+    used_actual_execution: bool = False
+    execution_mode: str = "observe"
+    execution_phase: str = ""
+    execution_phase1_filled: bool = False
+    execution_phase2_filled: bool = False
+    execution_p1_fill_price: float = 0.0
+    execution_hard_exit_reason: str = ""
+    execution_hard_exit_fill_price: float = 0.0
+    outcome_source: str = "asset_price_proxy"
 
     @property
     def move_pct(self) -> float:
@@ -126,15 +150,17 @@ class WindowReportWriter:
     def __init__(
         self,
         report_path: str,
-        hypothetical_bet_size: float = 10.0,
+        report_shares: float = 10.0,
         max_windows: int = 200,
-        live_execution: bool = False,   # True when BracketExecutor is wired in
+        live_execution: bool = False,   # backward-compatible flag
+        execution_mode: str = "observe",
         window_duration_seconds: int = 900,
     ) -> None:
         self._report_path = Path(report_path)
-        self._bet_size = hypothetical_bet_size
+        self._share_count = report_shares
         self._max_windows = max_windows
-        self._live_execution = live_execution
+        self._execution_mode = "live" if live_execution and execution_mode == "observe" else execution_mode
+        self._live_execution = live_execution or execution_mode in {"shadow", "live"}
         self._window_duration_seconds = window_duration_seconds
         self._windows: list[WindowSummary] = []
         self._report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,7 +181,10 @@ class WindowReportWriter:
         no_ask_final: float,
         last_signal_event: dict | None,
         eval_log_path: str,
+        signal_log_path: str | None = None,
         yes_won: bool | None = None,
+        outcome_source: str = "asset_price_proxy",
+        execution_summary: dict | None = None,
     ) -> None:
         """
         Called when a window transition is detected. Reads the evaluation log
@@ -166,7 +195,8 @@ class WindowReportWriter:
           Preferred over inferring from ask prices, which are unreliable at
           settlement time (both tokens go near 0, making inference ambiguous).
         """
-        gate_counts = self._scan_eval_log(eval_log_path, window_ts, asset)
+        eval_records = self._scan_eval_log(eval_log_path, window_ts, asset)
+        gate_counts = Counter(rec.get("result", "UNKNOWN") for rec in eval_records)
 
         # Determine the deepest gate reached (furthest in sequence)
         primary_gate = max(
@@ -174,25 +204,61 @@ class WindowReportWriter:
             key=lambda g: _GATE_RANK.get(g, 0),
             default="NO_STATE",
         )
+        dominant_gate = max(
+            gate_counts.keys(),
+            key=lambda g: gate_counts.get(g, 0),
+            default="NO_STATE",
+        )
+        dominant_gate_count = int(gate_counts.get(dominant_gate, 0))
+        total_eval_cycles = int(sum(gate_counts.values()))
+        near_miss_counts = self._summarize_near_misses(eval_records)
+        counterfactual_counts = self._summarize_counterfactuals(eval_records)
+
+        # After a restart, the in-memory last_signal_event may be gone even when
+        # the eval log already shows SIGNAL_FIRED for this window. Recover the
+        # signal from the persisted signal log so the report doesn't falsely say
+        # "no signal" for windows that really fired.
+        if (
+            last_signal_event is None
+            and gate_counts.get("SIGNAL_FIRED", 0) > 0
+            and signal_log_path
+        ):
+            last_signal_event = self._find_signal_event(signal_log_path, window_ts, asset)
 
         # Signal details from the last signal event (if any)
         signal_fired = False
         signal_side = ""
+        signal_entry_model = ""
         signal_price = 0.0
+        phase1_would_fill = True
+        phase1_ask_size = 0.0
+        required_shares = self._share_count
+        safe_opposite_price = 0.0
+        dipped_below_safe_price = False
+        phase2_reclaim_seen = False
         phase2_triggered = False
         phase2_price = 0.0
+        phase2_trigger_ask_size = 0.0
+        phase2_would_fill = False
 
         if last_signal_event:
             signal_fired = True
             signal_side = last_signal_event.get("momentum_side", "")
+            signal_entry_model = str(last_signal_event.get("entry_model") or "lag")
             signal_price = float(last_signal_event.get("momentum_price", 0.0))
+            phase1_would_fill = bool(last_signal_event.get("phase1_would_fill", True))
+            phase1_ask_size = float(last_signal_event.get("momentum_ask_size") or 0.0)
+            required_shares = float(last_signal_event.get("required_shares") or self._share_count)
             # Check if phase2 was triggered (present in post-signal observations)
             obs = last_signal_event.get("observation") or {}
+            safe_opposite_price = float(obs.get("safe_opposite_price") or 0.0)
+            dipped_below_safe_price = bool(obs.get("dipped_below_safe_price"))
+            phase2_reclaim_seen = bool(obs.get("phase2_reclaim_seen"))
+            phase2_price = float(obs.get("phase2_trigger_price") or 0.0)
+            phase2_trigger_ask_size = float(obs.get("phase2_trigger_ask_size") or 0.0)
+            phase2_would_fill = bool(obs.get("phase2_would_fill"))
             if obs and obs.get("phase2_would_have_triggered"):
                 phase2_triggered = True
-                # phase2_trigger_price is the PostSignalObservation field for the
-                # actual y price at which Phase 2 would have triggered.
-                phase2_price = float(obs.get("phase2_trigger_price") or 0.0)
 
         # Resolve outcome — prefer the directly-passed yes_won flag (most reliable).
         # Post-settlement ask prices are unreliable: after market close both tokens
@@ -219,7 +285,9 @@ class WindowReportWriter:
         # Compute hypothetical PnL
         hyp_pnl_per_share = 0.0
         hard_exit_modeled = False
-        if signal_fired and signal_price > 0 and resolved_yes is not None:
+        if signal_fired and not phase1_would_fill:
+            hyp_pnl_per_share = 0.0
+        elif signal_fired and signal_price > 0 and resolved_yes is not None:
             # Phase 1 entry: bet momentum_side at signal_price
             # Payout $1.00 if momentum direction wins, $0.00 if it loses
             fee = _taker_fee(signal_price)
@@ -254,7 +322,64 @@ class WindowReportWriter:
                     else:
                         hyp_pnl_per_share = -phase1_cost
 
-        hyp_pnl_dollars = hyp_pnl_per_share * self._bet_size
+        share_count = self._share_count
+        hyp_pnl_dollars = hyp_pnl_per_share * share_count
+        used_actual_execution = False
+        execution_mode = self._execution_mode
+        execution_phase = ""
+        execution_phase1_filled = False
+        execution_phase2_filled = False
+        execution_p1_fill_price = 0.0
+        execution_hard_exit_reason = ""
+        execution_hard_exit_fill_price = 0.0
+
+        if self._live_execution and execution_summary:
+            used_actual_execution = True
+            execution_mode = str(
+                execution_summary.get("execution_mode")
+                or ("live" if self._execution_mode == "observe" else self._execution_mode)
+            )
+            if execution_summary.get("signal_side"):
+                signal_fired = True
+                signal_side = str(execution_summary.get("signal_side") or signal_side)
+            if execution_summary.get("signal_entry_model"):
+                signal_entry_model = str(
+                    execution_summary.get("signal_entry_model") or signal_entry_model
+                )
+            if execution_summary.get("signal_price"):
+                signal_price = float(execution_summary.get("signal_price") or signal_price)
+            execution_phase = str(execution_summary.get("phase") or "")
+            execution_phase1_filled = bool(execution_summary.get("phase1_filled"))
+            execution_phase2_filled = bool(execution_summary.get("phase2_filled"))
+            execution_p1_fill_price = float(execution_summary.get("p1_fill_price") or 0.0)
+            execution_hard_exit_reason = str(execution_summary.get("hard_exit_reason") or "")
+            execution_hard_exit_fill_price = float(
+                execution_summary.get("hard_exit_fill_price") or 0.0
+            )
+            if execution_summary.get("outcome_source"):
+                outcome_source = str(execution_summary.get("outcome_source") or outcome_source)
+            if "safe_opposite_price" in execution_summary:
+                safe_opposite_price = float(execution_summary.get("safe_opposite_price") or 0.0)
+            if "dipped_below_safe_price" in execution_summary:
+                dipped_below_safe_price = bool(
+                    execution_summary.get("dipped_below_safe_price")
+                )
+            elif safe_opposite_price > 0:
+                min_exec_price = float(execution_summary.get("min_opposite_price") or 0.0)
+                if min_exec_price > 0:
+                    dipped_below_safe_price = min_exec_price < safe_opposite_price
+            if "phase2_reclaim_seen" in execution_summary:
+                phase2_reclaim_seen = bool(execution_summary.get("phase2_reclaim_seen"))
+            if execution_summary.get("p2_fill_price"):
+                phase2_price = float(execution_summary.get("p2_fill_price") or 0.0)
+            phase2_triggered = execution_phase2_filled
+
+            actual_pnl_dollars = float(execution_summary.get("actual_pnl_usd") or 0.0)
+            shares = float(execution_summary.get("p1_shares") or 0.0)
+            if shares > 0:
+                share_count = shares
+            hyp_pnl_dollars = actual_pnl_dollars
+            hyp_pnl_per_share = (actual_pnl_dollars / shares) if shares > 0 else 0.0
 
         summary = WindowSummary(
             window_ts=window_ts,
@@ -265,16 +390,40 @@ class WindowReportWriter:
             yes_ask_final=yes_ask_final,
             no_ask_final=no_ask_final,
             primary_gate_fail=primary_gate,
-            gate_counts=gate_counts,
+            dominant_gate_fail=dominant_gate,
+            dominant_gate_count=dominant_gate_count,
+            total_eval_cycles=total_eval_cycles,
+            gate_counts=dict(gate_counts),
+            near_miss_counts=near_miss_counts,
+            counterfactual_counts=counterfactual_counts,
             signal_fired=signal_fired,
             signal_side=signal_side,
+            signal_entry_model=signal_entry_model,
             signal_price=signal_price,
+            phase1_would_fill=phase1_would_fill,
+            phase1_ask_size=phase1_ask_size,
+            required_shares=required_shares,
+            safe_opposite_price=safe_opposite_price,
+            dipped_below_safe_price=dipped_below_safe_price,
+            phase2_reclaim_seen=phase2_reclaim_seen,
             phase2_triggered=phase2_triggered,
             phase2_price=phase2_price,
+            phase2_trigger_ask_size=phase2_trigger_ask_size,
+            phase2_would_fill=phase2_would_fill,
             resolved_yes=resolved_yes,
+            share_count=share_count,
             hyp_pnl_per_share=hyp_pnl_per_share,
             hyp_pnl_dollars=hyp_pnl_dollars,
             hard_exit_modeled=hard_exit_modeled,
+            used_actual_execution=used_actual_execution,
+            execution_mode=execution_mode,
+            execution_phase=execution_phase,
+            execution_phase1_filled=execution_phase1_filled,
+            execution_phase2_filled=execution_phase2_filled,
+            execution_p1_fill_price=execution_p1_fill_price,
+            execution_hard_exit_reason=execution_hard_exit_reason,
+            execution_hard_exit_fill_price=execution_hard_exit_fill_price,
+            outcome_source=outcome_source,
         )
 
         self._windows.append(summary)
@@ -284,9 +433,10 @@ class WindowReportWriter:
 
         self._write_report()
         logger.info(
-            "Window report updated window={} asset={} signal={} gate={} hyp_pnl=${:.2f}",
+            "Window report updated window={} asset={} signal={} dominant_gate={} furthest_gate={} hyp_pnl=${:.2f}",
             summary.window_label, asset,
             "FIRED" if signal_fired else "none",
+            dominant_gate,
             primary_gate,
             hyp_pnl_dollars,
         )
@@ -300,12 +450,12 @@ class WindowReportWriter:
         eval_log_path: str,
         window_ts: int,
         asset: str,
-    ) -> dict[str, int]:
-        """Read the evaluation log and count gate results for this window."""
-        counts: Counter = Counter()
+    ) -> list[dict]:
+        """Read evaluation records for one asset/window."""
+        records: list[dict] = []
         path = Path(eval_log_path)
         if not path.exists():
-            return {}
+            return []
         try:
             with path.open() as f:
                 for line in f:
@@ -318,35 +468,138 @@ class WindowReportWriter:
                             rec.get("asset") == asset
                             and rec.get("window_open_ts") == window_ts
                         ):
-                            result = rec.get("result", "UNKNOWN")
-                            counts[result] += 1
+                            records.append(rec)
                     except Exception:
                         continue
         except Exception as exc:
             logger.debug("Could not scan eval log: {}", exc)
-        return dict(counts)
+        return records
+
+    def _find_signal_event(
+        self,
+        signal_log_path: str,
+        window_ts: int,
+        asset: str,
+    ) -> dict | None:
+        """Find the latest persisted signal event for one asset/window."""
+        path = Path(signal_log_path)
+        if not path.exists():
+            return None
+        match: dict | None = None
+        try:
+            with path.open() as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if (
+                        rec.get("type") == "signal"
+                        and rec.get("asset") == asset
+                        and rec.get("window_open_ts") == window_ts
+                    ):
+                        match = rec
+        except Exception as exc:
+            logger.debug("Could not scan signal log: {}", exc)
+        return match
+
+    def _summarize_near_misses(self, records: list[dict]) -> dict[str, int]:
+        summary: Counter = Counter()
+        for rec in records:
+            result = rec.get("result")
+            if result == "PRICE_RANGE_FAIL":
+                range_side = rec.get("range_side")
+                distance = float(rec.get("range_distance", 999.0) or 999.0)
+                if range_side == "HIGH" and distance <= 0.02:
+                    summary["price_high_within_2c"] += 1
+                elif range_side == "LOW" and distance <= 0.02:
+                    summary["price_low_within_2c"] += 1
+            elif result == "ASSET_MOVE_INSUFFICIENT":
+                shortfall = float(rec.get("move_shortfall", 999.0) or 999.0)
+                required = float(rec.get("min_required", 0.0) or 0.0)
+                if required > 0 and shortfall <= required * 0.25:
+                    summary["move_within_25pct"] += 1
+            elif result == "CHOP_FILTER_FAIL":
+                shortfall = float(rec.get("chop_shortfall", 999.0) or 999.0)
+                if shortfall <= 0.15:
+                    summary["chop_within_0_15"] += 1
+            elif result == "LAG_GAP_INSUFFICIENT":
+                shortfall = float(rec.get("lag_shortfall", 999.0) or 999.0)
+                required = float(rec.get("min_required", 0.0) or 0.0)
+                if required > 0 and shortfall <= required * 0.25:
+                    summary["lag_within_25pct"] += 1
+        return dict(summary)
+
+    def _summarize_counterfactuals(self, records: list[dict]) -> dict[str, int]:
+        summary: Counter = Counter()
+        for rec in records:
+            if rec.get("result") in ("SIGNAL_FIRED", "ALREADY_FIRED_THIS_WINDOW"):
+                continue
+            if _would_fire_with_counterfactual(rec, range_relax_cents=0.02):
+                summary["range_plus_2c_would_fire"] += 1
+            if _would_fire_with_counterfactual(rec, move_relax_frac=0.25):
+                summary["move_25pct_looser_would_fire"] += 1
+            if _would_fire_with_counterfactual(rec, chop_relax=0.15):
+                summary["chop_minus_0_15_would_fire"] += 1
+            if _would_fire_with_counterfactual(rec, lag_relax_frac=0.25):
+                summary["lag_25pct_looser_would_fire"] += 1
+        return dict(summary)
 
     def _write_report(self) -> None:
         """Overwrite the Markdown report file with current state."""
         now_et = _now_et()
         total_windows = len(self._windows)
         windows_with_signal = sum(1 for w in self._windows if w.signal_fired)
-        brackets_complete = sum(1 for w in self._windows if w.phase2_triggered)
-        total_hyp_pnl = sum(w.hyp_pnl_dollars for w in self._windows)
-        wins = sum(
-            1 for w in self._windows
-            if w.signal_fired and w.hyp_pnl_dollars > 0
-        )
-        losses = sum(
-            1 for w in self._windows
-            if w.signal_fired and w.hyp_pnl_dollars < 0
-        )
+        if self._live_execution:
+            live_executable_entries = sum(
+                1
+                for w in self._windows
+                if w.used_actual_execution and w.execution_phase1_filled
+            )
+            brackets_complete = sum(
+                1 for w in self._windows
+                if w.used_actual_execution and w.execution_phase2_filled
+            )
+            total_hyp_pnl = sum(
+                w.hyp_pnl_dollars for w in self._windows if w.used_actual_execution
+            )
+            wins = sum(
+                1
+                for w in self._windows
+                if w.used_actual_execution and w.execution_phase1_filled and w.hyp_pnl_dollars > 0
+            )
+            losses = sum(
+                1
+                for w in self._windows
+                if w.used_actual_execution and w.execution_phase1_filled and w.hyp_pnl_dollars < 0
+            )
+        else:
+            live_executable_entries = sum(
+                1
+                for w in self._windows
+                if w.signal_fired and w.phase1_would_fill
+            )
+            brackets_complete = sum(1 for w in self._windows if w.phase2_triggered)
+            total_hyp_pnl = sum(w.hyp_pnl_dollars for w in self._windows)
+            wins = sum(
+                1 for w in self._windows
+                if w.signal_fired and w.phase1_would_fill and w.hyp_pnl_dollars > 0
+            )
+            losses = sum(
+                1 for w in self._windows
+                if w.signal_fired and w.phase1_would_fill and w.hyp_pnl_dollars < 0
+            )
 
         lines: list[str] = []
 
         # ---- Header ----
-        if self._live_execution:
+        if self._execution_mode == "live":
             mode_line = "> **Mode:** 🔴 LIVE EXECUTION — real orders are being placed"
+        elif self._execution_mode == "shadow":
+            mode_line = "> **Mode:** 🟠 SHADOW-LIVE — same executor and order rules, simulated against live books"
         else:
             mode_line = "> **Mode:** Observation Only — no real money is being spent"
         lines += [
@@ -354,7 +607,8 @@ class WindowReportWriter:
             "",
             f"{mode_line}  ",
             f"> **Last Updated:** {now_et}  ",
-            f"> **Hypothetical Bet Size:** ${self._bet_size:.2f} per signal  ",
+            f"> **Configured Share Size:** {self._share_count:.1f} shares per signal  ",
+            "> **Outcome Source:** Best available market metadata winner; falls back to Binance price proxy when unresolved  ",
             "",
             "---",
             "",
@@ -362,6 +616,7 @@ class WindowReportWriter:
 
         # ---- Running totals ----
         pnl_color = "🟢" if total_hyp_pnl > 0 else ("🔴" if total_hyp_pnl < 0 else "⚪")
+        pnl_label = "Executed PnL" if self._live_execution else "Hypothetical PnL"
         win_rate_str = f"{wins}/{windows_with_signal}" if windows_with_signal else "—"
         lines += [
             "## 💰 Running Totals",
@@ -370,9 +625,10 @@ class WindowReportWriter:
             f"|--------|-------|",
             f"| Windows observed | **{total_windows}** |",
             f"| Signals fired | **{windows_with_signal}** ({_pct(windows_with_signal, total_windows)}) |",
+            f"| Phase 1 live-executable | **{live_executable_entries}** |",
             f"| Brackets completed | **{brackets_complete}** |",
             f"| Win / Loss (Phase 1) | **{win_rate_str}** |",
-            f"| Hypothetical PnL | {pnl_color} **${total_hyp_pnl:+.2f}** |",
+            f"| {pnl_label} | {pnl_color} **${total_hyp_pnl:+.2f}** |",
             "",
             "---",
             "",
@@ -381,8 +637,12 @@ class WindowReportWriter:
         # ---- Gate funnel stats ----
         if self._windows:
             all_gate_counts: Counter = Counter()
+            all_near_misses: Counter = Counter()
+            all_counterfactuals: Counter = Counter()
             for w in self._windows:
                 all_gate_counts.update(w.gate_counts)
+                all_near_misses.update(w.near_miss_counts)
+                all_counterfactuals.update(w.counterfactual_counts)
             total_evals = sum(all_gate_counts.values()) or 1
             lines += [
                 "## 🔬 Signal Gate Funnel (all windows)",
@@ -401,6 +661,56 @@ class WindowReportWriter:
                     lines.append(
                         f"| {label} | {count:,} | {count/total_evals*100:.1f}% |"
                     )
+            if all_near_misses:
+                lines += [
+                    "",
+                    "### Near Misses",
+                    "",
+                    "| Near miss | Count |",
+                    "|-----------|-------|",
+                ]
+                near_labels = {
+                    "price_high_within_2c": "Price just above range (<= +2c)",
+                    "price_low_within_2c": "Price just below range (<= -2c)",
+                    "move_within_25pct": "Asset move within 25% of threshold",
+                    "chop_within_0_15": "Chop score within 0.15 of pass",
+                    "lag_within_25pct": "Lag gap within 25% of threshold",
+                }
+                for key in [
+                    "price_high_within_2c",
+                    "price_low_within_2c",
+                    "move_within_25pct",
+                    "chop_within_0_15",
+                    "lag_within_25pct",
+                ]:
+                    count = all_near_misses.get(key, 0)
+                    if count:
+                        lines.append(f"| {near_labels.get(key, key)} | {count:,} |")
+            if all_counterfactuals:
+                lines += [
+                    "",
+                    "### Single-Guardrail Counterfactual Fires",
+                    "",
+                    "_Eval cycles that would have fully passed if only this one guardrail were loosened, with the others kept unchanged._",
+                    "",
+                    "| Counterfactual | Count |",
+                    "|----------------|-------|",
+                ]
+                counterfactual_labels = {
+                    "range_plus_2c_would_fire": "Entry range widened by 2c",
+                    "move_25pct_looser_would_fire": "Move threshold loosened by 25%",
+                    "chop_minus_0_15_would_fire": "Chop minimum lowered by 0.15",
+                    "lag_25pct_looser_would_fire": "Lag threshold loosened by 25%",
+                }
+                for key in [
+                    "range_plus_2c_would_fire",
+                    "move_25pct_looser_would_fire",
+                    "chop_minus_0_15_would_fire",
+                    "lag_25pct_looser_would_fire",
+                ]:
+                    count = all_counterfactuals.get(key, 0)
+                    if count:
+                        lines.append(f"| {counterfactual_labels.get(key, key)} | {count:,} |")
             lines += ["", "---", ""]
 
         # ---- Per-window log (newest first) ----
@@ -410,7 +720,9 @@ class WindowReportWriter:
         ]
 
         if not self._windows:
-            lines.append("*No windows completed yet. Waiting for first 15-minute cycle...*")
+            lines.append(
+                f"*No windows completed yet. Waiting for first {int(self._window_duration_seconds / 60)}-minute cycle...*"
+            )
             lines.append("")
         else:
             for w in reversed(self._windows):
@@ -430,6 +742,11 @@ class WindowReportWriter:
 def _format_window(w: WindowSummary) -> list[str]:
     """Format a single window as a Markdown section."""
     lines: list[str] = []
+    pnl_label = (
+        "Actual PnL" if (w.used_actual_execution and w.execution_mode == "live")
+        else "Shadow PnL" if w.used_actual_execution
+        else "Hypothetical PnL"
+    )
 
     # --- Section heading ---
     signal_badge = "🔔 SIGNAL FIRED" if w.signal_fired else "— no signal"
@@ -456,39 +773,144 @@ def _format_window(w: WindowSummary) -> list[str]:
         lines.append(
             f"- **Final prices:** YES {w.yes_ask_final:.3f} / NO {w.no_ask_final:.3f}{resolution_hint}"
         )
+    if w.outcome_source:
+        lines.append(f"- **Outcome source:** `{w.outcome_source}`")
 
     # --- Gate result ---
     if w.signal_fired:
         lines.append(f"- **Signal:** {w.signal_side} @ {w.signal_price:.3f}")
-        if w.phase2_triggered:
+        if w.signal_entry_model:
+            lines.append(f"- **Signal path:** `{w.signal_entry_model}`")
+        if w.used_actual_execution:
+            if not w.execution_phase1_filled:
+                lines.append("- **Phase 1 execution:** ❌ Signal fired but no live fill")
+            else:
+                lines.append(
+                    f"- **Phase 1 execution:** ✅ {w.execution_mode.title()} fill @ "
+                    f"{w.execution_p1_fill_price:.3f} for {w.share_count:.1f} shares"
+                )
+        elif w.execution_mode == "live":
+            lines.append("- **Phase 1 execution:** ⚠ No confirmed live execution summary for this signal")
+        elif not w.phase1_would_fill:
             lines.append(
-                f"- **Phase 2:** ✅ Bracket leg triggered — {_opp(w.signal_side)} @ {w.phase2_price:.3f}"
+                f"- **Phase 1 execution:** ⚠ Non-executable for live size — top ask "
+                f"{w.phase1_ask_size:.1f} shares < required {w.required_shares:.1f}"
             )
         else:
-            lines.append("- **Phase 2:** ⏳ Not triggered (opposite side never fell to target)")
-    else:
-        gate_label = _GATE_LABELS.get(w.primary_gate_fail, w.primary_gate_fail)
-        lines.append(f"- **Could not place bet:** {gate_label}")
-
-        # Show the gate count breakdown if interesting
-        if w.gate_counts:
-            dominated = max(w.gate_counts, key=lambda g: w.gate_counts[g])
-            count = w.gate_counts[dominated]
-            total = sum(w.gate_counts.values())
             lines.append(
-                f"  - *(deepest gate: `{dominated}`, {count}/{total} eval cycles)*"
+                f"- **Phase 1 execution:** ✅ Top ask supported {w.required_shares:.1f} shares "
+                f"(saw {w.phase1_ask_size:.1f})"
             )
+        if w.phase2_triggered:
+            if w.safe_opposite_price > 0:
+                lines.append(
+                    f"- **Phase 2:** ✅ Safe level reclaimed — {_opp(w.signal_side)} "
+                    f"armed @ {w.safe_opposite_price:.3f}, executed @ {w.phase2_price:.3f}"
+                )
+            else:
+                lines.append(
+                    f"- **Phase 2:** ✅ Bracket leg triggered — {_opp(w.signal_side)} @ {w.phase2_price:.3f}"
+                )
+        else:
+            if w.phase2_reclaim_seen and not w.phase2_would_fill:
+                lines.append(
+                    f"- **Phase 2:** ⚠ Reclaim seen @ {w.phase2_price:.3f}, but top ask "
+                    f"{w.phase2_trigger_ask_size:.1f} shares < required {w.required_shares:.1f}"
+                )
+            elif w.safe_opposite_price > 0 and w.dipped_below_safe_price:
+                lines.append(
+                    f"- **Phase 2:** ⏳ Safe level armed @ {w.safe_opposite_price:.3f}, "
+                    "extension confirmed, but reclaim never completed"
+                )
+            elif w.safe_opposite_price > 0:
+                lines.append(
+                    f"- **Phase 2:** ⏳ Safe level armed @ {w.safe_opposite_price:.3f}, "
+                    "but price never extended lower first"
+                )
+            else:
+                lines.append("- **Phase 2:** ⏳ Opposite side never reached the safe level")
+
+        if w.used_actual_execution:
+            lines.append(
+                f"- **Execution:** mode=`{w.execution_mode}` phase=`{w.execution_phase}` "
+                f"shares={w.share_count:.1f} "
+                f"phase1_filled={w.execution_phase1_filled} "
+                f"phase2_filled={w.execution_phase2_filled}"
+            )
+            if w.execution_phase == "HARD_EXITED":
+                extra: list[str] = []
+                if w.execution_hard_exit_reason:
+                    extra.append(f"reason=`{w.execution_hard_exit_reason}`")
+                if w.execution_hard_exit_fill_price > 0:
+                    extra.append(f"fill={w.execution_hard_exit_fill_price:.3f}")
+                if extra:
+                    lines.append(f"- **Hard exit:** {' '.join(extra)}")
+    else:
+        dominant_label = _GATE_LABELS.get(w.dominant_gate_fail, w.dominant_gate_fail)
+        lines.append(f"- **Could not place bet:** {dominant_label}")
+
+        if w.total_eval_cycles:
+            lines.append(
+                f"  - *(dominant blocker: `{w.dominant_gate_fail}` "
+                f"{w.dominant_gate_count}/{w.total_eval_cycles} eval cycles; "
+                f"furthest gate reached: `{w.primary_gate_fail}`)*"
+            )
+        if w.near_miss_counts:
+            parts: list[str] = []
+            if w.near_miss_counts.get("price_high_within_2c"):
+                parts.append(f"range high <= +2c: {w.near_miss_counts['price_high_within_2c']}")
+            if w.near_miss_counts.get("price_low_within_2c"):
+                parts.append(f"range low <= -2c: {w.near_miss_counts['price_low_within_2c']}")
+            if w.near_miss_counts.get("move_within_25pct"):
+                parts.append(f"move near-threshold: {w.near_miss_counts['move_within_25pct']}")
+            if w.near_miss_counts.get("chop_within_0_15"):
+                parts.append(f"chop near-pass: {w.near_miss_counts['chop_within_0_15']}")
+            if w.near_miss_counts.get("lag_within_25pct"):
+                parts.append(f"lag near-pass: {w.near_miss_counts['lag_within_25pct']}")
+            if parts:
+                lines.append(f"  - *(near misses: {'; '.join(parts)})*")
+        if w.counterfactual_counts:
+            parts = []
+            if w.counterfactual_counts.get("range_plus_2c_would_fire"):
+                parts.append(
+                    f"range +2c => fire: {w.counterfactual_counts['range_plus_2c_would_fire']}"
+                )
+            if w.counterfactual_counts.get("move_25pct_looser_would_fire"):
+                parts.append(
+                    f"move -25% => fire: {w.counterfactual_counts['move_25pct_looser_would_fire']}"
+                )
+            if w.counterfactual_counts.get("chop_minus_0_15_would_fire"):
+                parts.append(
+                    f"chop -0.15 => fire: {w.counterfactual_counts['chop_minus_0_15_would_fire']}"
+                )
+            if w.counterfactual_counts.get("lag_25pct_looser_would_fire"):
+                parts.append(
+                    f"lag -25% => fire: {w.counterfactual_counts['lag_25pct_looser_would_fire']}"
+                )
+            if parts:
+                lines.append(f"  - *(single-guardrail counterfactuals: {'; '.join(parts)})*")
 
     # --- PnL ---
-    if w.signal_fired and w.resolved_yes is not None:
+    trade_live_executable = (
+        w.execution_phase1_filled if w.used_actual_execution else w.phase1_would_fill
+    )
+
+    if w.signal_fired and not trade_live_executable:
+        lines.append(f"- **{pnl_label}:** $0.00 (signal not executable for the configured live size)")
+    elif w.signal_fired and w.resolved_yes is not None:
         pnl_icon = "🟢" if w.hyp_pnl_dollars > 0 else "🔴"
-        hard_exit_note = " ⚡ hard-exit capped (sold @ 50¢)" if w.hard_exit_modeled else ""
+        hard_exit_note = (
+            " ⚡ hard-exit capped (sold @ 50¢)"
+            if w.hard_exit_modeled and not w.used_actual_execution
+            else ""
+        )
+        share_suffix = f" × {w.share_count:.1f} shares"
         lines.append(
-            f"- **Hypothetical PnL:** {pnl_icon} ${w.hyp_pnl_dollars:+.2f} "
-            f"({w.hyp_pnl_per_share:+.4f}/share × ${10:.0f}){hard_exit_note}"
+            f"- **{pnl_label}:** {pnl_icon} ${w.hyp_pnl_dollars:+.2f} "
+            f"({w.hyp_pnl_per_share:+.4f}/share{share_suffix}){hard_exit_note}"
         )
     elif w.signal_fired:
-        lines.append("- **Hypothetical PnL:** ⏳ Pending resolution")
+        lines.append(f"- **{pnl_label}:** ⏳ Pending resolution")
     else:
         lines.append("- **Hypothetical PnL:** $0.00 (no bet placed)")
 
@@ -513,6 +935,50 @@ def _pct(n: int, d: int) -> str:
 
 def _opp(side: str) -> str:
     return "NO" if side == "YES" else "YES"
+
+
+def _would_fire_with_counterfactual(
+    rec: dict,
+    *,
+    range_relax_cents: float = 0.0,
+    move_relax_frac: float = 0.0,
+    chop_relax: float = 0.0,
+    lag_relax_frac: float = 0.0,
+) -> bool:
+    try:
+        minutes_remaining = float(rec.get("minutes_remaining") or 0.0)
+        time_gate = float(rec.get("time_gate_minutes_cfg") or 0.0)
+        move = abs(float(rec.get("asset_move_pct") or 0.0))
+        move_threshold = float(rec.get("move_threshold_cfg") or 0.0)
+        momentum_price = float(rec.get("momentum_price_live") or 0.0)
+        low = float(rec.get("entry_range_low_cfg") or 0.0)
+        high = float(rec.get("entry_range_high_cfg") or 0.0)
+        prices_pass = bool(rec.get("prices_pass_live"))
+        chop_score = float(rec.get("chop_score_live") or 0.0)
+        chop_min = float(rec.get("chop_min_score_cfg") or 0.0)
+        lag_gap = float(rec.get("lag_gap_live") or -999.0)
+        lag_threshold = float(rec.get("lag_threshold_cfg") or 0.0)
+        signal_already_fired = bool(rec.get("signal_already_fired"))
+    except (TypeError, ValueError):
+        return False
+
+    if signal_already_fired:
+        return False
+    if minutes_remaining < time_gate:
+        return False
+    if move < move_threshold * (1.0 - move_relax_frac):
+        return False
+    if momentum_price <= 0:
+        return False
+    if not (low - range_relax_cents <= momentum_price <= high + range_relax_cents):
+        return False
+    if not prices_pass:
+        return False
+    if chop_score < max(chop_min - chop_relax, 0.0):
+        return False
+    if lag_gap < lag_threshold * (1.0 - lag_relax_frac):
+        return False
+    return True
 
 
 def _now_et() -> str:

@@ -282,9 +282,13 @@ class CryptoDirectionConfig(BaseModel):
     """
     Configuration for the bracket strategy direction signal observer.
 
-    This module watches live 15m BTC/ETH Polymarket markets and fires signals
-    when all quality gates pass. It is OBSERVATION ONLY — no orders are placed.
-    Signals are logged to JSONL files for parameter calibration.
+    This module watches live BTC/ETH Polymarket markets and fires signals
+    when all quality gates pass.
+
+    It supports three practical modes using the same signal logic:
+      1. Observe-only      → no order state machine
+      2. Shadow execution  → same bracket executor, simulated fills from live books
+      3. Live execution    → same bracket executor, real wallet + exchange orders
 
     Gate summary (all must pass for a signal to fire):
       1. Time gate:      >= time_gate_minutes remaining in window
@@ -356,6 +360,22 @@ class CryptoDirectionConfig(BaseModel):
     # A larger lag_gap means the market hasn't priced in the BTC move yet — better entry.
     lag_threshold: float = 0.04   # 4¢
 
+    # ---- Controlled continuation override ----
+    # Optional second entry family for clean, early momentum windows where the
+    # market is no longer lagging but the bracket structure is still attractive.
+    continuation_enabled: bool = False
+    continuation_min_minutes_remaining: float = 1.5
+    continuation_min_asset_move_pct: float = 0.0004
+    continuation_min_chop_score: float = 0.66
+    continuation_max_momentum_price: float = 0.59
+    continuation_max_opposite_price: float = 0.44
+    continuation_max_negative_lag_gap: float = 0.03
+    continuation_ignore_lag_veto: bool = False
+    continuation_hard_exit_grace_seconds: float = 30.0
+    continuation_catastrophic_stop_price: float = 0.0
+    safe_arm_suspend_stop: bool = True
+    safe_arm_catastrophic_stop_price: float = 0.0
+
     # ---- Post-signal bracket tracking ----
     # Target price for the opposite-side (second leg of the bracket).
     # If x=0.58 is paid for leg 1, we want x+y+fees < $1.00.
@@ -367,10 +387,13 @@ class CryptoDirectionConfig(BaseModel):
 
     # ---- Runtime ----
     # How often to run the signal evaluation loop (seconds)
-    poll_interval_seconds: float = 2.0
+    poll_interval_seconds: float = 0.5
     # How often to refresh YES/NO orderbook prices (seconds)
     # Can be slightly less frequent than the eval loop since prices change slowly
-    price_refresh_interval_seconds: float = 2.0
+    price_refresh_interval_seconds: float = 0.5
+    # If market resolution fails at a window rollover, keep retrying within the
+    # same window instead of staying unresolved until the next rollover.
+    market_resolve_retry_seconds: float = 5.0
     # Maximum age of YES/NO prices before they're considered stale (seconds)
     price_staleness_max_seconds: float = 10.0
 
@@ -381,8 +404,24 @@ class CryptoDirectionConfig(BaseModel):
     evaluation_log_path: str = "logs/crypto_signal_evaluations.jsonl"
     # Human-readable per-window Markdown report (updated every 15 min)
     window_report_path: str = "logs/window_report.md"
-    # Notional bet size used for hypothetical PnL calculations in the report
-    hypothetical_bet_size: float = 10.0
+    # Fixed share count used by the observer report for hypothetical PnL.
+    # A value of 10.0 means "pretend each window used 10 shares", not "$10 notional".
+    report_shares: float = 5.0
+
+    # ---- Shadow-live execution ----
+    # When true, --observe-crypto still runs without touching the wallet, but it
+    # uses the same BracketExecutor state machine as live mode. Orders are
+    # simulated against fresh live orderbooks at submission time, so the report
+    # is much closer to what --execute-crypto would have done.
+    shadow_execute_enabled: bool = True
+    shadow_execution_log_path: str = "logs/bracket_trades.jsonl"
+
+    # ---- Immediate fill confirmation ----
+    # FOLLOW_TAKER/FOK orders should not be credited as filled just because the
+    # submission succeeded. Confirm the fill via placement payload or order
+    # status polling before marking a leg complete.
+    fill_confirmation_attempts: int = 2
+    fill_confirmation_delay_seconds: float = 0.05
 
     # ---- Live execution (bracket_executor.py) ----
     # SAFETY: execute_enabled MUST be set true in config AND LIVE_TRADING_ENABLED
@@ -392,15 +431,25 @@ class CryptoDirectionConfig(BaseModel):
     execute_enabled: bool = False               # master switch — must be explicit
     phase2_enabled: bool = True                 # both phases run together by default
     max_concurrent_brackets: int = 1            # max open positions across all assets
-    phase1_bet_size_usd: float = 5.0            # USD notional for the Phase 1 leg
+    # Fixed Phase 1 share count. The live executor uses the same share count
+    # for Phase 2 so the bracket stays symmetric.
+    phase1_shares: float = 5.0
     min_bracket_shares: float = 1.0             # minimum shares per order
     # FOLLOW_TAKER (FOK) for both phases — immediate fill, locks bracket in real-time
+    # after the safe-y reclaim condition has been satisfied.
     phase1_entry_style: str = "FOLLOW_TAKER"
+    # Phase 1 catch-up window for FOLLOW_TAKER. Keep this tight so execution
+    # stays faithful to the signal band rather than drifting into a materially
+    # worse x cost after the signal has already fired.
+    phase1_max_chase_cents: float = 0.01
     phase2_entry_style: str = "FOLLOW_TAKER"
     bracket_audit_log_path: str = "logs/bracket_trades.jsonl"
     # Hard exit: sell Phase-1 leg mid-window to cap losses.
     # Triggers if mark drops to stop_price OR we're in the final N seconds losing.
     hard_exit_stop_price: float = 0.50
+    hard_exit_trigger_buffer_cents: float = 0.02
+    hard_exit_market_through_cents: float = 0.0
+    hard_exit_retry_cooldown_seconds: float = 2.0
     hard_exit_final_seconds: int = 30
 
 

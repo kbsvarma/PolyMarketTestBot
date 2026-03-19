@@ -55,6 +55,7 @@ class PolymarketClient:
         self._sdk_init_error = ""
         self._preferred_signature_type: int | None = config.env.polymarket_signature_type
         self._sdk_client = self._build_sdk_client()
+        self._bootstrap_live_order_signature_preferences()
 
     def _build_sdk_client(self) -> Any:
         if ClobClient is None:
@@ -293,6 +294,13 @@ class PolymarketClient:
         if not token_ids:
             token_ids = self._parse_listish(item.get("tokenId") or item.get("clobTokenId") or item.get("asset_id"))
         outcomes = self._parse_listish(item.get("outcomes") or item.get("outcomeNames") or item.get("outcome"))
+        raw_outcome_prices = self._parse_listish(item.get("outcomePrices") or item.get("outcome_prices") or item.get("prices"))
+        outcome_prices: list[float] = []
+        for value in raw_outcome_prices:
+            try:
+                outcome_prices.append(float(value))
+            except (TypeError, ValueError):
+                continue
         rows: list[MarketInfo] = []
         for idx, token_id in enumerate(token_ids):
             outcome_suffix = f" [{outcomes[idx]}]" if idx < len(outcomes) and outcomes[idx] else ""
@@ -302,16 +310,65 @@ class PolymarketClient:
                 title=f"{title}{outcome_suffix}",
                 slug=slug,
                 category=category,
+                outcome_name=str(outcomes[idx]) if idx < len(outcomes) else "",
+                outcome_index=idx,
+                outcome_prices=outcome_prices,
                 active=bool(item.get("active", True)),
                 closed=bool(item.get("closed", False)),
+                accepting_orders=bool(item.get("acceptingOrders", item.get("accepting_orders", True))),
                 liquidity=float(item.get("liquidity") or 0.0),
                 volume=float(item.get("volume") or item.get("volumeNum") or 0.0),
                 end_date_iso=item.get("endDate") or item.get("end_date_iso"),
+                resolution_source=item.get("resolutionSource"),
+                resolved_by=item.get("resolvedBy"),
+                uma_resolution_status=item.get("umaResolutionStatus"),
                 source_quality=SourceQuality.REAL_PUBLIC_DATA,
             )
             if row.market_id and row.token_id:
                 rows.append(row)
         return rows
+
+    def _infer_binary_market_winner(self, item: dict[str, Any]) -> dict[str, Any]:
+        outcomes = [str(name).strip().lower() for name in self._parse_listish(item.get("outcomes") or item.get("outcomeNames") or item.get("outcome"))]
+        raw_prices = self._parse_listish(item.get("outcomePrices") or item.get("outcome_prices") or item.get("prices"))
+        prices: list[float] = []
+        for value in raw_prices:
+            try:
+                prices.append(float(value))
+            except (TypeError, ValueError):
+                prices.append(0.0)
+
+        closed = bool(item.get("closed", False))
+        active = bool(item.get("active", True))
+        accepting_orders = bool(item.get("acceptingOrders", item.get("accepting_orders", True)))
+        resolution_status = str(item.get("umaResolutionStatus") or "").strip()
+
+        yes_idx = next((i for i, name in enumerate(outcomes) if name in {"yes", "up"}), None)
+        no_idx = next((i for i, name in enumerate(outcomes) if name in {"no", "down"}), None)
+
+        resolved_yes: bool | None = None
+        source = "market_metadata_unresolved"
+
+        if yes_idx is not None and no_idx is not None and len(prices) > max(yes_idx, no_idx):
+            yes_price = prices[yes_idx]
+            no_price = prices[no_idx]
+            if yes_price >= 0.99 and no_price <= 0.01:
+                resolved_yes = True
+                source = "market_outcome_prices"
+            elif no_price >= 0.99 and yes_price <= 0.01:
+                resolved_yes = False
+                source = "market_outcome_prices"
+
+        return {
+            "resolved_yes": resolved_yes,
+            "source": source,
+            "closed": closed,
+            "active": active,
+            "accepting_orders": accepting_orders,
+            "uma_resolution_status": resolution_status,
+            "outcomes": outcomes,
+            "outcome_prices": prices,
+        }
 
     def _extract_market_rows(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
@@ -386,6 +443,34 @@ class PolymarketClient:
             return self.config.env.polymarket_signature_type
         return int(signature_type)
 
+    def _extract_sdk_signer_address(self) -> str:
+        builder = getattr(self._sdk_client, "builder", None)
+        signer = getattr(builder, "signer", None)
+        address = getattr(signer, "address", None)
+        if callable(address):
+            try:
+                return str(address())
+            except Exception:
+                return ""
+        if address is None:
+            return ""
+        return str(address)
+
+    def _uses_proxy_wallet_signing(self) -> bool:
+        builder = getattr(self._sdk_client, "builder", None)
+        funder = getattr(builder, "funder", None) or self.config.env.polymarket_funder
+        signer = self._extract_sdk_signer_address()
+        if not signer or not funder:
+            return False
+        return signer.lower() != str(funder).lower()
+
+    def _bootstrap_live_order_signature_preferences(self) -> None:
+        if self._sdk_client is None:
+            return
+        if self._preferred_signature_type is None and self._uses_proxy_wallet_signing():
+            # Proxy-wallet live order flow historically succeeds with sig type 1.
+            self._set_order_signature_type(1)
+
     def _set_order_signature_type(self, signature_type: int | None) -> None:
         builder = getattr(self._sdk_client, "builder", None)
         if builder is not None and signature_type is not None:
@@ -395,7 +480,10 @@ class PolymarketClient:
     def _order_signature_type_candidates(self) -> list[int | None]:
         current = self._extract_sdk_signature_type()
         configured = self.config.env.polymarket_signature_type
-        candidates = [self._preferred_signature_type, configured, current, 1, 0]
+        if self._uses_proxy_wallet_signing():
+            candidates = [self._preferred_signature_type, configured, 1, current, 0, None]
+        else:
+            candidates = [self._preferred_signature_type, configured, current, 0, 1, None]
         deduped: list[int | None] = []
         for item in candidates:
             if item in deduped:
@@ -585,6 +673,48 @@ class PolymarketClient:
                 return exact_match
             if fallback_match is not None:
                 return fallback_match
+        return None
+
+    async def fetch_market_resolution(self, market_id: str = "", market_slug: str = "") -> dict[str, Any] | None:
+        candidates: list[tuple[str, dict[str, Any] | None]] = []
+        if market_slug:
+            candidates.extend(
+                [
+                    (f"{self.gamma_url}/markets/slug/{market_slug}", None),
+                    (f"{self.gamma_url}/markets", {"slug": market_slug}),
+                    (f"{self.gamma_url}/markets", {"marketSlug": market_slug}),
+                ]
+            )
+        if market_id:
+            candidates.extend(
+                [
+                    (f"{self.gamma_url}/markets/{market_id}", None),
+                    (f"{self.gamma_url}/markets", {"conditionId": market_id}),
+                    (f"{self.gamma_url}/markets", {"id": market_id}),
+                ]
+            )
+
+        for url, params in candidates:
+            try:
+                payload = await self._get_json(url, params=params)
+            except Exception:
+                continue
+            rows = self._extract_market_rows(payload)
+            if not rows and isinstance(payload, dict):
+                rows = [payload]
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                slug = str(item.get("slug") or item.get("marketSlug") or "")
+                condition_id = str(item.get("conditionId") or item.get("id") or "")
+                if market_slug and slug and slug != market_slug:
+                    continue
+                if market_id and condition_id and condition_id != market_id:
+                    continue
+                result = self._infer_binary_market_winner(item)
+                result["market_slug"] = slug
+                result["market_id"] = condition_id
+                return result
         return None
 
     @retry(
@@ -934,6 +1064,9 @@ class PolymarketClient:
                 return {
                     "exchange_order_id": exchange_order_id,
                     "status": status,
+                    "filled_size": self._extract_order_filled_size(result),
+                    "average_fill_price": self._extract_order_average_fill_price(result),
+                    "remaining_size": self._extract_order_remaining_size(result),
                     "client_order_id": echoed_client_order_id,
                     "raw": result,
                     "signature_type_used": self._extract_sdk_signature_type(),

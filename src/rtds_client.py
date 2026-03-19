@@ -30,6 +30,7 @@ Usage (in an async context):
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import json
 import time
 from dataclasses import dataclass, field
@@ -333,7 +334,7 @@ class RTDSClient:
                         )
             finally:
                 ping_task.cancel()
-                with asyncio.suppress(asyncio.CancelledError):
+                with suppress(asyncio.CancelledError):
                     await ping_task
                 self._connected = False
 

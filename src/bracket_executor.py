@@ -5,14 +5,16 @@ Full lifecycle, both phases, end-to-end:
 
   Phase 1  ─ Buy momentum_side (YES if BTC up, NO if BTC down) when the
               direction signal fires.  Entry style: FOLLOW_TAKER (FOK).
-              A successful placement response means the order filled immediately.
-              On failure the position is not created; the window continues.
+              A successful placement response is not enough — we explicitly
+              confirm the fill before the position is opened. On failure the
+              position is not created; the window continues.
 
-  Phase 2  ─ Buy opposite_side once the bracket equation locks profit:
-                  x_cost*(1+fee_x) + y_cost*(1+fee_y) < 1.00
-              Watches every poll cycle for the opposite side to bottom and
-              bounce by phase2_reversal_threshold.  Entry style: FOLLOW_TAKER.
-              On placement success, BRACKET_COMPLETE is set immediately.
+  Phase 2  ─ Arm a remembered safe opposite-side level (y_safe) once the
+              opposite ask first reaches the configured profitable zone.
+              Then wait for the move to continue below y_safe and only buy
+              when price later reclaims y_safe on reversal. Entry style:
+              FOLLOW_TAKER. We only mark BRACKET_COMPLETE after the second leg
+              is explicitly confirmed filled.
 
   Close    ─ Binary markets auto-resolve at window close.  Both legs pay
               $1 or $0 per share; net receipt = $1 regardless of direction.
@@ -33,14 +35,15 @@ ENTRY STYLE
 Both phases use FOLLOW_TAKER (Fill-Or-Kill):
   - Phase 1: Speed matters — we're capturing a Binance-to-Polymarket lag that
     closes in seconds.  FOLLOW_TAKER fills instantly or fails cleanly.
-  - Phase 2: We want immediate lock-in the moment the bracket equation turns
-    positive.  A resting PASSIVE_LIMIT bid at the reversal price could miss the
-    fill window if the opposite side quickly bounces back above our bid.
+  - Phase 2: We still use immediate execution, but only AFTER the opposite side
+    has first reached a remembered safe level, extended lower, and then
+    reclaimed that safe level on reversal.
 
 All actions written to logs/bracket_trades.jsonl.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import uuid
@@ -87,6 +90,8 @@ class BracketPosition:
     window_ts:       int          # 15-minute window start (Unix epoch seconds)
     window_close_ts: int          # window_ts + 900
     momentum_side:   str          # "YES" (BTC/ETH up) or "NO" (BTC/ETH down)
+    entry_model:     str          # "lag" or "continuation"
+    signal_price:    float        # original signal price before execution chase
 
     # ── Phase 1 ──────────────────────────────────────────────────────────
     p1_token_id:     str
@@ -107,11 +112,17 @@ class BracketPosition:
     # ── Runtime monitoring ───────────────────────────────────────────────
     phase:                BracketPhase = BracketPhase.PHASE1_PENDING
     min_opposite_price:   float = 999.0  # running floor of opposite-side ask
+    safe_opposite_price:  float = 0.0    # first observed safe y price
+    dipped_below_safe_price: bool = False  # y later extended below safe_opposite_price
     opened_at:            float = field(default_factory=time.time)
+    p1_filled_at:         float = 0.0
     closed_at:            float = 0.0
     fill_check_attempts:  int = 0        # poll counter for PASSIVE_LIMIT P1
     p2_last_attempt_ts:   float = 0.0   # last Phase 2 placement attempt time
     hard_exit_attempted:  bool = False   # prevents repeated hard-exit attempts
+    hard_exit_last_attempt_ts: float = 0.0
+    hard_exit_reason:     str = ""
+    hard_exit_fill_price: float = 0.0
 
     # ── Outcome (filled at window close) ─────────────────────────────────
     outcome:        str   = ""    # "YES_WINS" | "NO_WINS" | "UNKNOWN"
@@ -139,24 +150,82 @@ class BracketExecutor:
     def __init__(self, cfg: Any, client: Any) -> None:
         self._cfg = cfg
         self._client = client
+        self.execution_mode = str(getattr(client, "execution_mode", "live")).lower()
         self._positions: dict[str, BracketPosition] = {}  # position_id → pos
         self._window_pos: dict[str, str] = {}             # "BTC_{ts}" → position_id
+        self._closed_window_summaries: dict[tuple[int, str], dict[str, Any]] = {}
 
         audit_path = Path(cfg.bracket_audit_log_path)
         audit_path.parent.mkdir(parents=True, exist_ok=True)
         self._audit_path = audit_path
 
         logger.info(
-            "BracketExecutor ready  "
+            "BracketExecutor ready  mode={}  "
             "execute={} phase2={} max_concurrent={}  "
-            "p1_style={} p2_style={}  bet=${}/leg",
+            "p1_style={} p2_style={}  shares={}/leg",
+            self.execution_mode,
             cfg.execute_enabled,
             cfg.phase2_enabled,
             cfg.max_concurrent_brackets,
             cfg.phase1_entry_style,
             cfg.phase2_entry_style,
-            cfg.phase1_bet_size_usd,
+            cfg.phase1_shares,
         )
+
+    @staticmethod
+    def _filled_enough(filled_size: float, expected_size: float) -> bool:
+        return filled_size >= max(expected_size - 1e-6, expected_size * 0.999)
+
+    @staticmethod
+    def _normalized_status(payload: dict[str, Any]) -> str:
+        return str(payload.get("status") or payload.get("state") or "").upper()
+
+    async def _confirm_follow_taker_fill(
+        self,
+        *,
+        order_result: dict[str, Any],
+        order_id: str,
+        expected_size: float,
+        fallback_price: float,
+    ) -> tuple[bool, float, dict[str, Any]]:
+        """
+        Confirm that a FOLLOW_TAKER / FOK submission actually filled.
+
+        Submission success alone is not enough. We first inspect the immediate
+        placement payload, then poll order status briefly if needed.
+        """
+        last_payload = dict(order_result)
+        attempts = max(int(self._cfg.fill_confirmation_attempts), 1)
+        delay_seconds = max(float(self._cfg.fill_confirmation_delay_seconds), 0.0)
+
+        for attempt in range(attempts):
+            status = self._normalized_status(last_payload)
+            filled_size = float(last_payload.get("filled_size") or 0.0)
+            avg_fill = float(last_payload.get("average_fill_price") or 0.0) or fallback_price
+            remaining = float(last_payload.get("remaining_size") or 0.0)
+
+            if self._filled_enough(filled_size, expected_size):
+                return True, avg_fill, last_payload
+            if status in {"FILLED", "MATCHED"} and remaining <= 1e-6:
+                return True, avg_fill, last_payload
+            if status in {"CANCELLED", "EXPIRED", "FAILED", "REJECTED"}:
+                return False, 0.0, last_payload
+
+            if attempt + 1 >= attempts or not order_id or not hasattr(self._client, "get_order_status"):
+                break
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+            try:
+                last_payload = await self._client.get_order_status(order_id)
+            except Exception as exc:
+                last_payload = {
+                    "status": "UNKNOWN",
+                    "error": str(exc),
+                    "exchange_order_id": order_id,
+                }
+                break
+
+        return False, 0.0, last_payload
 
     # ================================================================== #
     # PHASE 1 — entry on signal fire
@@ -220,20 +289,36 @@ class BracketExecutor:
             )
             return False
 
-        # ── Size: USD notional ÷ unit price ──────────────────────────────
-        entry_price = round(event.momentum_price, 4)
+        # ── Size: fixed share count for parity with the observer report ──
+        signal_price = round(event.momentum_price, 4)
         shares = max(
-            round(self._cfg.phase1_bet_size_usd / entry_price, 1),
+            round(self._cfg.phase1_shares, 1),
             self._cfg.min_bracket_shares,
         )
         position_id = str(uuid.uuid4())[:12]
         entry_style = self._cfg.phase1_entry_style
+        chase_cents = max(float(getattr(self._cfg, "phase1_max_chase_cents", 0.0) or 0.0), 0.0)
+        entry_price = signal_price
+        if entry_style == "FOLLOW_TAKER" and chase_cents > 0:
+            # Small controlled chase so we can still lock x when the book lifts
+            # by a tick between signal snapshot and order submission, but never
+            # above the strategy's own entry band ceiling.
+            entry_price = round(
+                min(
+                    0.99,
+                    float(getattr(self._cfg, "entry_range_high", 0.99) or 0.99),
+                    signal_price + chase_cents,
+                ),
+                4,
+            )
 
         logger.info(
             "BracketExecutor: ▶ Phase 1  asset={} side={} style={} "
-            "price={:.4f} shares={:.1f} notional=${:.2f}",
+            "signal_price={:.4f} submit_limit={:.4f} chase={:.4f} "
+            "shares={:.1f} notional=${:.2f}",
             event.asset, event.momentum_side, entry_style,
-            entry_price, shares, entry_price * shares,
+            signal_price, entry_price, entry_price - signal_price,
+            shares, entry_price * shares,
         )
 
         # ── Place order ──────────────────────────────────────────────────
@@ -256,6 +341,13 @@ class BracketExecutor:
                 "shares": shares,
                 "error": str(exc),
             })
+            self._cache_signal_attempt_summary(
+                event=event,
+                position_id=position_id,
+                phase="PHASE1_ORDER_FAILED",
+                shares=shares,
+                requested_price=entry_price,
+            )
             return False
 
         order_id = result.get("exchange_order_id", "")
@@ -273,6 +365,8 @@ class BracketExecutor:
             window_ts=event.window_open_ts,
             window_close_ts=event.window_close_ts,
             momentum_side=event.momentum_side,
+            entry_model=event.entry_model,
+            signal_price=signal_price,
             p1_token_id=momentum_token_id,
             p1_price=entry_price,
             p1_shares=shares,
@@ -281,16 +375,53 @@ class BracketExecutor:
             p2_token_id=opposite_token_id,
         )
 
-        # FIX #3: FOLLOW_TAKER = FOK.  No exception → order matched and filled.
-        # Do not gate on raw_status — Polymarket may return "LIVE", "MATCHED",
-        # or any other string.  The absence of an exception is the fill signal.
+        # FOLLOW_TAKER = FOK. Submission success is not enough; explicitly
+        # confirm that the order filled before we credit the position.
         if entry_style == "FOLLOW_TAKER":
+            filled, fill_price, fill_payload = await self._confirm_follow_taker_fill(
+                order_result=result,
+                order_id=order_id,
+                expected_size=shares,
+                fallback_price=entry_price,
+            )
+            if not filled:
+                logger.warning(
+                    "BracketExecutor: Phase 1 not filled after submission  "
+                    "asset={} status={} order_id={} position_id={}",
+                    event.asset,
+                    self._normalized_status(fill_payload),
+                    order_id,
+                    position_id,
+                )
+                self._audit({
+                    "type": "PHASE1_NOT_FILLED",
+                    "position_id": position_id,
+                    "event_id": event.event_id,
+                    "asset": event.asset,
+                    "signal_price": signal_price,
+                    "submit_limit_price": entry_price,
+                    "order_id": order_id,
+                    "status": self._normalized_status(fill_payload),
+                    "fill_payload": fill_payload,
+                })
+                self._cache_signal_attempt_summary(
+                    event=event,
+                    position_id=position_id,
+                    phase="PHASE1_NOT_FILLED",
+                    shares=shares,
+                    requested_price=entry_price,
+                )
+                return False
+
             pos.phase = BracketPhase.PHASE1_FILLED
-            pos.p1_fill_price = entry_price   # FOK fills at ≤ limit price
+            pos.p1_fill_price = fill_price
+            pos.p1_filled_at = time.time()
+            pos.p1_notional_usd = round(pos.p1_fill_price * shares, 4)
             logger.info(
                 "BracketExecutor: Phase 1 FILLED (FOLLOW_TAKER)  "
-                "asset={}  fill_price={:.4f}  position_id={}",
-                event.asset, pos.p1_fill_price, position_id,
+                "asset={}  fill_price={:.4f}  signal_price={:.4f} "
+                "submit_limit={:.4f}  position_id={}",
+                event.asset, pos.p1_fill_price, signal_price, entry_price, position_id,
             )
             self._audit({
                 "type": "PHASE1_FILLED",
@@ -298,7 +429,10 @@ class BracketExecutor:
                 "event_id": event.event_id,
                 "asset": event.asset,
                 "fill_price": pos.p1_fill_price,
+                "signal_price": signal_price,
+                "submit_limit_price": entry_price,
                 "style": "FOLLOW_TAKER",
+                "execution_mode": self.execution_mode,
             })
         # PASSIVE_LIMIT: stays PHASE1_PENDING; tick() polls for fill.
 
@@ -313,19 +447,70 @@ class BracketExecutor:
             "momentum_side": event.momentum_side,
             "entry_style": entry_style,
             "p1_token_id": momentum_token_id,
+            "signal_price": signal_price,
             "p1_price": entry_price,
             "p1_shares": shares,
             "p1_order_id": order_id,
             "window_ts": event.window_open_ts,
             "window_close_ts": event.window_close_ts,
+            "execution_mode": self.execution_mode,
         })
         return True
+
+    def _cache_signal_attempt_summary(
+        self,
+        *,
+        event: BracketSignalEvent,
+        position_id: str,
+        phase: str,
+        shares: float,
+        requested_price: float,
+    ) -> None:
+        """
+        Cache a compact per-window summary even when Phase 1 never fills.
+
+        Without this, the report falls back to the optimistic signal snapshot
+        and can over-credit shadow/live windows where the executor correctly
+        rejected the order as unfilled.
+        """
+        self._closed_window_summaries[(event.window_open_ts, event.asset)] = {
+            "execution_mode": self.execution_mode,
+            "position_id": position_id,
+            "event_id": event.event_id,
+            "asset": event.asset,
+            "window_ts": event.window_open_ts,
+            "phase": phase,
+            "signal_side": event.momentum_side,
+            "signal_price": event.momentum_price,
+            "signal_entry_model": event.entry_model,
+            "phase1_filled": False,
+            "phase2_filled": False,
+            "hard_exited": False,
+            "hard_exit_reason": "",
+            "hard_exit_fill_price": 0.0,
+            "cancelled": phase in {"PHASE1_NOT_FILLED", "CANCELLED"},
+            "actual_pnl_usd": 0.0,
+            "p1_shares": shares,
+            "p1_fill_price": 0.0,
+            "p1_requested_price": requested_price,
+            "p2_fill_price": 0.0,
+            "safe_opposite_price": 0.0,
+            "min_opposite_price": 999.0,
+        }
 
     # ================================================================== #
     # Per-poll hook — Phase 1 fill polling + Phase 2 trigger
     # ================================================================== #
 
-    async def tick(self, asset: str, yes_ask: float, no_ask: float) -> None:
+    async def tick(
+        self,
+        asset: str,
+        yes_ask: float,
+        no_ask: float,
+        *,
+        yes_bid: float = 0.0,
+        no_bid: float = 0.0,
+    ) -> None:
         """
         Called every poll cycle (~1 s) per asset.
 
@@ -340,14 +525,20 @@ class BracketExecutor:
             elif pos.phase == BracketPhase.PHASE1_FILLED:
                 # Hard exit check takes priority over Phase 2.
                 # If it fires, phase becomes HARD_EXITED and Phase 2 is skipped.
-                await self._check_hard_exit(pos, yes_ask, no_ask)
+                await self._check_hard_exit(pos, yes_ask, no_ask, yes_bid=yes_bid, no_bid=no_bid)
                 if pos.phase == BracketPhase.PHASE1_FILLED and self._cfg.phase2_enabled:
                     await self._check_phase2(pos, yes_ask, no_ask)
 
     # ── Hard exit — cut losses mid-window ────────────────────────────────
 
     async def _check_hard_exit(
-        self, pos: BracketPosition, yes_ask: float, no_ask: float
+        self,
+        pos: BracketPosition,
+        yes_ask: float,
+        no_ask: float,
+        *,
+        yes_bid: float = 0.0,
+        no_bid: float = 0.0,
     ) -> None:
         """
         Sell the Phase-1 leg mid-window to cap losses.
@@ -358,55 +549,178 @@ class BracketExecutor:
           (b) We're in the final hard_exit_final_seconds and still below entry
               — don't hold to binary resolution without a bracket.
 
-        Uses the momentum-side ask as the mark (conservative proxy for bid).
-        Places a FOLLOW_TAKER sell at (mark − 2c) to ensure fill with slippage.
+        Uses the momentum-side best bid when available, because that's the
+        executable sell-side price. Falls back to ask only if bid data is
+        unavailable.
         """
-        if pos.hard_exit_attempted:
+        if pos.phase == BracketPhase.HARD_EXITED:
             return
 
-        mark = yes_ask if pos.momentum_side == "YES" else no_ask
+        now_ts = time.time()
+        retry_cooldown = float(
+            getattr(self._cfg, "hard_exit_retry_cooldown_seconds", 0.0) or 0.0
+        )
+        if (
+            pos.hard_exit_last_attempt_ts > 0
+            and retry_cooldown > 0
+            and (now_ts - pos.hard_exit_last_attempt_ts) < retry_cooldown
+        ):
+            return
+
+        sellable_bid = yes_bid if pos.momentum_side == "YES" else no_bid
+        ask_fallback = yes_ask if pos.momentum_side == "YES" else no_ask
+        mark = sellable_bid if sellable_bid > 0 else ask_fallback
         if mark <= 0:
             return
 
         entry = pos.p1_fill_price or pos.p1_price
-        seconds_to_close = pos.window_close_ts - time.time()
+        seconds_to_close = pos.window_close_ts - now_ts
+        # Once the window has ended, let settlement own the position. The
+        # orderbook can collapse to closeout prices around rollover and should
+        # not trigger fresh hard-exit logic.
+        if seconds_to_close <= 0:
+            return
+        seconds_since_fill = max(0.0, now_ts - (pos.p1_filled_at or pos.opened_at))
 
-        stop_hit = mark <= self._cfg.hard_exit_stop_price
+        stop_trigger_price = float(self._cfg.hard_exit_stop_price) + float(
+            getattr(self._cfg, "hard_exit_trigger_buffer_cents", 0.0) or 0.0
+        )
+        stop_hit = mark <= stop_trigger_price
         final_window_loss = (
             seconds_to_close <= self._cfg.hard_exit_final_seconds
             and mark < entry
         )
 
+        continuation_grace_active = (
+            pos.entry_model == "continuation"
+            and seconds_since_fill < float(
+                getattr(self._cfg, "continuation_hard_exit_grace_seconds", 0.0) or 0.0
+            )
+        )
+        safe_arm_stop_protection = (
+            bool(getattr(self._cfg, "safe_arm_suspend_stop", True))
+            and pos.safe_opposite_price > 0
+        )
+        catastrophic_floor = 0.0
+        if continuation_grace_active:
+            catastrophic_floor = max(
+                catastrophic_floor,
+                float(getattr(self._cfg, "continuation_catastrophic_stop_price", 0.0) or 0.0),
+            )
+        if safe_arm_stop_protection:
+            catastrophic_floor = max(
+                catastrophic_floor,
+                float(getattr(self._cfg, "safe_arm_catastrophic_stop_price", 0.0) or 0.0),
+            )
+        catastrophic_stop = catastrophic_floor > 0 and mark <= catastrophic_floor
+
+        if (continuation_grace_active or safe_arm_stop_protection) and stop_hit and not catastrophic_stop and not final_window_loss:
+            logger.info(
+                "BracketExecutor: protected from ordinary hard stop  asset={} mark={:.4f} "
+                "entry={:.4f} elapsed={:.1f}s continuation_grace={} safe_arm={} "
+                "safe_price={:.4f} catastrophic_floor={:.4f} position_id={}",
+                pos.asset,
+                mark,
+                entry,
+                seconds_since_fill,
+                continuation_grace_active,
+                safe_arm_stop_protection,
+                pos.safe_opposite_price,
+                catastrophic_floor,
+                pos.position_id,
+            )
+            return
+
         if not (stop_hit or final_window_loss):
             return
 
-        reason = "STOP_50C" if stop_hit else "FINAL_30S_LOSS"
-        pos.hard_exit_attempted = True   # block retries regardless of fill outcome
+        if final_window_loss and not stop_hit:
+            reason = "FINAL_30S_LOSS"
+        elif catastrophic_stop and (continuation_grace_active or safe_arm_stop_protection):
+            reason = "STOP_CATASTROPHIC"
+        else:
+            reason = "STOP_50C"
+        pos.hard_exit_last_attempt_ts = now_ts
+        pos.hard_exit_reason = reason
 
-        sell_price = round(max(0.01, mark - 0.02), 4)
+        primary_sell_price = round(max(0.01, float(self._cfg.hard_exit_stop_price)), 4)
+        market_through_cents = max(
+            float(getattr(self._cfg, "hard_exit_market_through_cents", 0.02) or 0.0),
+            0.0,
+        )
+        market_through_price = round(
+            max(
+                0.01,
+                float(self._cfg.hard_exit_stop_price) - market_through_cents,
+            ),
+            4,
+        )
+        if reason == "STOP_50C":
+            attempt_prices = [primary_sell_price]
+            # Optional fallback cross. When disabled (0.0c), keep retrying the
+            # intended 50c stop instead of chasing into a much worse live loss.
+            if market_through_cents > 0 and market_through_price < primary_sell_price:
+                attempt_prices.append(market_through_price)
+        else:
+            attempt_prices = [market_through_price]
+        sell_price = attempt_prices[-1]
         logger.info(
             "BracketExecutor: ⚠ HARD EXIT triggered  "
             "asset={}  reason={}  mark={:.4f}  entry={:.4f}  "
-            "sell_price={:.4f}  seconds_to_close={:.1f}  position_id={}",
-            pos.asset, reason, mark, entry, sell_price, seconds_to_close, pos.position_id,
+            "trigger_price={:.4f}  attempt_prices={}  seconds_to_close={:.1f}  position_id={}",
+            pos.asset, reason, mark, entry, stop_trigger_price, attempt_prices, seconds_to_close, pos.position_id,
         )
 
+        fill_payload: dict[str, object] = {}
         try:
-            await self._client.place_sell_order(
-                token_id=pos.p1_token_id,
-                price=sell_price,
-                size=pos.p1_shares,
-                entry_style="FOLLOW_TAKER",
-                client_order_id=f"{pos.position_id}-hard-exit",
-            )
-            pnl = round((sell_price - entry) * pos.p1_shares, 4)
+            filled = False
+            fill_price = 0.0
+            last_error: Exception | None = None
+            for idx, attempt_price in enumerate(attempt_prices):
+                result = await self._client.place_sell_order(
+                    token_id=pos.p1_token_id,
+                    price=attempt_price,
+                    size=pos.p1_shares,
+                    entry_style="FOLLOW_TAKER",
+                    client_order_id=f"{pos.position_id}-hard-exit-{idx + 1}",
+                )
+                order_id = str(result.get("exchange_order_id") or "")
+                filled, fill_price, fill_payload = await self._confirm_follow_taker_fill(
+                    order_result=result,
+                    order_id=order_id,
+                    expected_size=pos.p1_shares,
+                    fallback_price=attempt_price,
+                )
+                sell_price = attempt_price
+                if filled:
+                    break
+                last_error = RuntimeError(
+                    f"hard exit not filled status={self._normalized_status(fill_payload)}"
+                )
+                if idx + 1 < len(attempt_prices):
+                    logger.warning(
+                        "BracketExecutor: hard exit retrying lower  asset={} reason={} "
+                        "attempt_price={:.4f} next_price={:.4f} position_id={}",
+                        pos.asset,
+                        reason,
+                        attempt_price,
+                        attempt_prices[idx + 1],
+                        pos.position_id,
+                    )
+            if not filled:
+                raise last_error or RuntimeError("hard exit not filled")
+            entry_cost = entry * (1.0 + taker_fee(entry, category="crypto price"))
+            exit_proceeds = fill_price * (1.0 - taker_fee(fill_price, category="crypto price"))
+            pnl = round((exit_proceeds - entry_cost) * pos.p1_shares, 4)
             pos.phase = BracketPhase.HARD_EXITED
             pos.closed_at = time.time()
+            pos.hard_exit_attempted = True
+            pos.hard_exit_fill_price = fill_price
             pos.actual_pnl_usd = pnl
             logger.info(
                 "BracketExecutor: HARD EXIT filled  "
-                "asset={}  sell_price={:.4f}  pnl=${:.4f}  position_id={}",
-                pos.asset, sell_price, pnl, pos.position_id,
+                "asset={}  sell_price={:.4f}  reason={}  pnl=${:.4f}  position_id={}",
+                pos.asset, fill_price, reason, pnl, pos.position_id,
             )
         except Exception as exc:
             logger.error(
@@ -421,9 +735,14 @@ class BracketExecutor:
             "asset": pos.asset,
             "reason": reason,
             "mark": mark,
+            "trigger_price": stop_trigger_price,
+            "attempted_sell_prices": attempt_prices,
             "sell_price": sell_price,
+            "fill_price": pos.hard_exit_fill_price,
             "entry_price": entry,
+            "actual_pnl_usd": pos.actual_pnl_usd,
             "phase_after": pos.phase.value,
+            "execution_mode": self.execution_mode,
         })
 
     # ── Phase 1 fill polling (PASSIVE_LIMIT only) ────────────────────────
@@ -454,6 +773,7 @@ class BracketExecutor:
         if raw_state in ("FILLED", "MATCHED"):
             pos.phase = BracketPhase.PHASE1_FILLED
             pos.p1_fill_price = fill_price or pos.p1_price
+            pos.p1_filled_at = time.time()
             logger.info(
                 "BracketExecutor: Phase 1 FILLED (poll)  asset={}  "
                 "fill_price={:.4f}  position_id={}",
@@ -487,51 +807,88 @@ class BracketExecutor:
         Evaluate Phase 2 entry conditions every poll cycle.
 
         Trigger logic:
-          1. Track running minimum of opposite-side ask (the floor).
-             FIX #1: always update floor BEFORE the cooldown gate so we
-             never miss the true bottom even while retrying.
-          2. The opposite side must have bounced >= phase2_reversal_threshold
-             from its floor (confirms the reversal, not just noise).
-          3. FIX #2: Remove the `near_target` price gate entirely.
-             The bracket equation (condition 4) is the real gate.
-          4. Full bracket equation must be profitable after fees:
-                 1 - x*(1+fee_x) - y*(1+fee_y) > 0
-          5. Phase 2 retry cooldown must have elapsed.
+          1. Track the running minimum of the opposite-side ask.
+          2. Save y_safe the FIRST time the opposite side reaches the configured
+             safe zone and the bracket is profitable after fees.
+          3. Require the move to continue below y_safe by at least
+             phase2_reversal_threshold.
+          4. Only then buy when the opposite side reclaims y_safe on reversal.
+          5. The bracket must still be profitable at the observed reclaim price.
+          6. Phase 2 retry cooldown must have elapsed.
         """
         y_price = no_ask if pos.momentum_side == "YES" else yes_ask
         if y_price <= 0:
             return
 
-        # FIX #1: always track the floor regardless of cooldown
+        # Always track the true floor, even while waiting or cooling down.
         if y_price < pos.min_opposite_price:
             pos.min_opposite_price = y_price
 
-        # Cooldown gate (AFTER floor update)
-        if time.time() - pos.p2_last_attempt_ts < self._P2_RETRY_COOLDOWN:
-            return
-
-        floor = pos.min_opposite_price
-        reversal = self._cfg.phase2_reversal_threshold
-
-        # Condition 2: confirmed reversal from floor
-        if y_price < floor + reversal:
-            return
-
-        # Condition 4 (FIX #2: sole price gate — bracket equation must be profitable)
         x_cost = pos.p1_fill_price or pos.p1_price
         fee_x = taker_fee(x_cost, category="crypto price")
         fee_y = taker_fee(y_price, category="crypto price")
         net_margin = 1.0 - x_cost * (1.0 + fee_x) - y_price * (1.0 + fee_y)
 
+        # Arm the remembered safe price exactly once.
+        if pos.safe_opposite_price <= 0:
+            if y_price <= self._cfg.target_y_price and net_margin > 0:
+                pos.safe_opposite_price = round(y_price, 6)
+                logger.info(
+                    "BracketExecutor: Phase 2 armed  asset={}  safe_y={:.4f}  "
+                    "x_cost={:.4f}  net_margin={:.4f}  position_id={}",
+                    pos.asset, pos.safe_opposite_price, x_cost, net_margin, pos.position_id,
+                )
+                self._audit({
+                    "type": "PHASE2_SAFE_ARMED",
+                    "position_id": pos.position_id,
+                    "asset": pos.asset,
+                    "safe_opposite_price": pos.safe_opposite_price,
+                    "net_margin": round(net_margin, 6),
+                })
+            return
+
+        reversal = self._cfg.phase2_reversal_threshold
+        safe_price = pos.safe_opposite_price
+
+        # Require continuation below the remembered safe level before we count
+        # a reclaim as meaningful.
+        if y_price <= safe_price - reversal:
+            if not pos.dipped_below_safe_price:
+                logger.info(
+                    "BracketExecutor: Phase 2 continuation confirmed  asset={}  "
+                    "safe_y={:.4f}  floor_now={:.4f}  position_id={}",
+                    pos.asset, safe_price, y_price, pos.position_id,
+                )
+                self._audit({
+                    "type": "PHASE2_SAFE_BREACHED",
+                    "position_id": pos.position_id,
+                    "asset": pos.asset,
+                    "safe_opposite_price": safe_price,
+                    "y_price": round(y_price, 6),
+                })
+            pos.dipped_below_safe_price = True
+            return
+
+        if not pos.dipped_below_safe_price:
+            return
+
+        # Cooldown gate (after tracking safe-level state)
+        if time.time() - pos.p2_last_attempt_ts < self._P2_RETRY_COOLDOWN:
+            return
+
+        # Reclaim must come back to the remembered safe level without chasing
+        # materially above it.
+        if y_price < safe_price or y_price > safe_price + reversal:
+            return
         if net_margin <= 0:
-            # Profitable bracket not possible yet at this y_price; keep waiting
             return
 
         logger.info(
-            "BracketExecutor: ▶ Phase 2 trigger!  "
-            "asset={}  y_floor={:.4f}  y_now={:.4f}  "
+            "BracketExecutor: ▶ Phase 2 reclaim trigger!  "
+            "asset={}  safe_y={:.4f}  y_floor={:.4f}  y_now={:.4f}  "
             "x_cost={:.4f}  net_margin={:.4f}  position_id={}",
-            pos.asset, floor, y_price, x_cost, net_margin, pos.position_id,
+            pos.asset, safe_price, pos.min_opposite_price, y_price,
+            x_cost, net_margin, pos.position_id,
         )
         await self._place_phase2(pos, y_price)
 
@@ -587,9 +944,33 @@ class BracketExecutor:
         pos.p2_shares = shares
         pos.p2_notional_usd = round(entry_price * shares, 4)
 
-        # FIX #5: FOLLOW_TAKER → no exception = immediate fill
+        # FOLLOW_TAKER must be explicitly confirmed as filled.
         if entry_style == "FOLLOW_TAKER":
-            pos.p2_fill_price = entry_price
+            filled, fill_price, fill_payload = await self._confirm_follow_taker_fill(
+                order_result=result,
+                order_id=pos.p2_order_id,
+                expected_size=shares,
+                fallback_price=entry_price,
+            )
+            if not filled:
+                pos.phase = BracketPhase.PHASE1_FILLED
+                logger.warning(
+                    "BracketExecutor: Phase 2 not filled after submission  "
+                    "asset={} status={} position_id={}",
+                    pos.asset,
+                    self._normalized_status(fill_payload),
+                    pos.position_id,
+                )
+                self._audit({
+                    "type": "PHASE2_NOT_FILLED",
+                    "position_id": pos.position_id,
+                    "asset": pos.asset,
+                    "order_id": pos.p2_order_id,
+                    "status": self._normalized_status(fill_payload),
+                    "fill_payload": fill_payload,
+                })
+                return
+            pos.p2_fill_price = fill_price
             pos.phase = BracketPhase.BRACKET_COMPLETE
         else:
             # PASSIVE_LIMIT: order placed, will be confirmed later via poll
@@ -623,6 +1004,7 @@ class BracketExecutor:
             "p2_order_id": pos.p2_order_id,
             "p1_fill_price": pos.p1_fill_price or pos.p1_price,
             "guaranteed_margin": guaranteed,
+            "execution_mode": self.execution_mode,
         })
 
     # ================================================================== #
@@ -652,6 +1034,7 @@ class BracketExecutor:
                 BracketPhase.HARD_EXITED,
                 BracketPhase.CANCELLED,
             ):
+                self._store_window_summary(pos)
                 continue
 
             pos.closed_at = time.time()
@@ -671,6 +1054,7 @@ class BracketExecutor:
                     "asset": pos.asset,
                     "window_ts": window_ts,
                 })
+                self._store_window_summary(pos)
                 continue
 
             # FIX #6: Cancel pending Phase 2 order before settling
@@ -734,6 +1118,7 @@ class BracketExecutor:
                 "p2_price": pos.p2_price,
                 "p2_fill_price": pos.p2_fill_price,
             })
+            self._store_window_summary(pos)
 
     async def _cancel_order(
         self, order_id: str, pos: BracketPosition, reason: str = ""
@@ -794,6 +1179,10 @@ class BracketExecutor:
             "session_pnl_usd":   round(self.session_pnl_usd(), 4),
         }
 
+    def take_window_summary(self, window_ts: int, asset: str) -> dict[str, Any] | None:
+        """Return and clear the cached execution summary for one closed window."""
+        return self._closed_window_summaries.pop((window_ts, asset), None)
+
     # ================================================================== #
     # Audit log
     # ================================================================== #
@@ -806,3 +1195,37 @@ class BracketExecutor:
                 fh.write(json.dumps(record) + "\n")
         except Exception as exc:
             logger.error("BracketExecutor: audit write failed: {}", exc)
+
+    def _store_window_summary(self, pos: BracketPosition) -> None:
+        """Cache a compact execution summary for report rendering."""
+        self._closed_window_summaries[(pos.window_ts, pos.asset)] = {
+            "execution_mode": self.execution_mode,
+            "position_id": pos.position_id,
+            "event_id": pos.event_id,
+            "asset": pos.asset,
+            "window_ts": pos.window_ts,
+            "phase": pos.phase.value,
+            "signal_side": pos.momentum_side,
+            "signal_price": pos.signal_price,
+            "signal_entry_model": pos.entry_model,
+            "phase1_filled": bool(
+                pos.p1_fill_price
+                or pos.phase not in {BracketPhase.PHASE1_PENDING, BracketPhase.CANCELLED}
+            ),
+            "phase2_filled": bool(
+                pos.p2_fill_price
+                or pos.phase in {BracketPhase.BRACKET_COMPLETE, BracketPhase.BRACKET_SETTLED}
+            ),
+            "hard_exited": pos.phase == BracketPhase.HARD_EXITED,
+            "hard_exit_reason": pos.hard_exit_reason,
+            "hard_exit_fill_price": pos.hard_exit_fill_price,
+            "cancelled": pos.phase == BracketPhase.CANCELLED,
+            "actual_pnl_usd": pos.actual_pnl_usd,
+            "p1_shares": pos.p1_shares,
+            "p1_fill_price": pos.p1_fill_price or pos.p1_price,
+            "p2_fill_price": pos.p2_fill_price or pos.p2_price,
+            "safe_opposite_price": pos.safe_opposite_price,
+            "min_opposite_price": pos.min_opposite_price,
+            "dipped_below_safe_price": pos.dipped_below_safe_price,
+            "phase2_reclaim_seen": bool(pos.p2_price > 0 or pos.p2_fill_price > 0),
+        }

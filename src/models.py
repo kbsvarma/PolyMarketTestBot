@@ -272,11 +272,18 @@ class MarketInfo(BaseModel):
     title: str
     slug: str
     category: str
+    outcome_name: str = ""
+    outcome_index: int = 0
+    outcome_prices: list[float] = Field(default_factory=list)
     active: bool = True
     closed: bool = False
+    accepting_orders: bool = True
     liquidity: float = 0.0
     volume: float = 0.0
     end_date_iso: str | None = None
+    resolution_source: str | None = None
+    resolved_by: str | None = None
+    uma_resolution_status: str | None = None
     source_quality: SourceQuality = SourceQuality.REAL_PUBLIC_DATA
 
 
@@ -465,34 +472,53 @@ class PostSignalObservation(BaseModel):
     # bracket_margin = 1.0 - (x_cost*(1+fee_x) + y_cost*(1+fee_y))
     peak_bracket_margin: float = 0.0
 
-    # Lowest price seen for the opposite side after the signal fired
-    # (the floor we'd wait for before buying the second leg)
+    # Lowest price seen for the opposite side after the signal fired.
+    # This is the absolute floor reached after the signal.
     min_opposite_price: float = 999.0
 
+    # The first observed opposite-side price that qualifies as "safe".
+    # This is the remembered y_safe from the strategy:
+    # once the opposite ask first reaches a sufficiently profitable level,
+    # we save it but DO NOT buy yet.
+    safe_opposite_price: float | None = None
+
+    # After y_safe is discovered, we require the move to continue beneath it
+    # before we consider the reclaim meaningful. This flag becomes True once
+    # the opposite side trades at least `phase2_reversal_threshold` below
+    # safe_opposite_price.
+    dipped_below_safe_price: bool = False
+
     # Would the bracket equation have been solvable at any point?
-    # True if x + y + fees < $1.00 was satisfied after signal fired
+    # True if x + y + fees < $1.00 was satisfied after signal fired.
     bracket_would_have_formed: bool = False
 
-    # Phase 2 check: did the opposite side reverse upward from its floor
-    # by more than the reversal_threshold? This is the trigger for buying
-    # the second leg in the real strategy.
-    phase2_would_have_triggered: bool = False
-    phase2_trigger_price: float | None = None  # y price at the reversal point
+    # Phase 2 check: after y_safe was discovered and price continued lower,
+    # did the opposite side later reclaim that remembered safe level?
+    # This matches the intended live strategy:
+    #   1. discover y_safe
+    #   2. wait for extension below y_safe
+    #   3. buy only when the market comes back to y_safe on reversal
+    phase2_reclaim_seen: bool = False          # price-only reclaim was observed
+    phase2_would_have_triggered: bool = False  # reclaim + enough size for live FOK
+    phase2_trigger_price: float | None = None  # observed ask when reclaim fired
+    phase2_trigger_ask_size: float | None = None
+    phase2_would_fill: bool = False
 
     # Momentum side tracking: how far did it travel after signal?
     momentum_side_peak: float = 0.0       # highest momentum_side ask seen
-    momentum_side_at_close: float = 0.0   # momentum_side ask at window close
+    momentum_side_at_close: float = 0.0   # momentum-side ask at window close
     # Lowest momentum-side ask seen (models the hard-exit stop trigger):
     # if this dropped to hard_exit_stop_price (0.50), the stop would have fired.
     min_momentum_price: float = 999.0
 
     # Resolution outcome (filled in when window resolves)
     outcome: str = ""                     # "YES_WINS", "NO_WINS", "UNKNOWN"
+    outcome_source: str = "asset_price_proxy"
     asset_close_price: float = 0.0        # BTC/ETH price at window close
 
     # Estimated P&L if Phase 1 was exited at the momentum_side peak
     # (the early-exit path: sell momentum_side when bracket never formed)
-    estimated_phase1_exit_pnl: float = 0.0   # in dollars per 10-share position
+    estimated_phase1_exit_pnl: float = 0.0   # in dollars for the configured live share size
 
 
 class BracketSignalEvent(BaseModel):
@@ -524,8 +550,13 @@ class BracketSignalEvent(BaseModel):
 
     # --- Signal quality metrics ---
     momentum_side: str      # "YES" (BTC going up) or "NO" (BTC going down)
+    entry_model: str = "lag"  # "lag" or "continuation"
     momentum_price: float   # Best ask price of momentum_side token at signal time
     opposite_price: float   # Best ask price of opposite_side token at signal time
+    momentum_ask_size: float = 0.0
+    opposite_ask_size: float = 0.0
+    required_shares: float = 0.0
+    phase1_would_fill: bool = True
     implied_momentum_price: float  # GBM-model fair value for momentum_side
     lag_gap: float          # implied_momentum_price - momentum_price (larger = better entry)
     chop_score: float       # 0.0 (choppy) to 1.0 (perfectly clean directional move)

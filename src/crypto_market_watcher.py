@@ -141,11 +141,38 @@ class AssetWatcher:
         self._market_volume: float = 0.0
         self._market_title: str = ""            # for verification logging
         self._market_resolved: bool = False
+        self._resolve_retry_due_at: float = 0.0
 
         # --- Live YES/NO prices ---
+        self._yes_bid: float = 0.0
+        self._no_bid: float = 0.0
         self._yes_ask: float = 0.0
         self._no_ask: float = 0.0
+        self._yes_bid_size: float = 0.0
+        self._no_bid_size: float = 0.0
+        self._yes_ask_size: float = 0.0
+        self._no_ask_size: float = 0.0
         self._last_price_ts: float = 0.0        # time() when prices were last refreshed
+
+    def _reset_market_state(self, window_ts: int) -> None:
+        """Clear market/orderbook state before resolving a new window."""
+        self._current_window_ts = window_ts
+        self._market_id = ""
+        self._yes_token_id = ""
+        self._no_token_id = ""
+        self._market_liquidity = 0.0
+        self._market_volume = 0.0
+        self._market_title = ""
+        self._market_resolved = False
+        self._yes_bid = 0.0
+        self._no_bid = 0.0
+        self._yes_ask = 0.0
+        self._no_ask = 0.0
+        self._yes_bid_size = 0.0
+        self._no_bid_size = 0.0
+        self._yes_ask_size = 0.0
+        self._no_ask_size = 0.0
+        self._last_price_ts = 0.0
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -181,95 +208,78 @@ class AssetWatcher:
 
         Returns True if the market was successfully resolved.
         """
-        # Build candidate slugs: try current window, then next
-        candidates = [
-            f"{self._asset_cfg.slug_prefix}-{window_ts}",
-            f"{self._asset_cfg.slug_prefix}-{window_ts + self._cfg.window_duration_seconds}",
-        ]
+        self._reset_market_state(window_ts)
+        slug = f"{self._asset_cfg.slug_prefix}-{window_ts}"
 
-        for slug in candidates:
-            # Fetch YES (Up) and NO (Down) tokens separately so we always
-            # get both token IDs from the same market.  The Gamma API returns
-            # one market record with two clobTokenIds; fetch_market_lookup
-            # matches the right one when outcome= is supplied.
-            yes_info: MarketInfo | None = None
-            no_info: MarketInfo | None = None
-            fetch_error: str = ""
+        # Fetch YES (Up) and NO (Down) tokens separately so we always get both
+        # token IDs from the SAME market. Do not fall forward to the next
+        # window slug; that can bind the current window to a future market and
+        # poison the entire window with one-sided books.
+        yes_info: MarketInfo | None = None
+        no_info: MarketInfo | None = None
+        fetch_error: str = ""
 
-            for outcome_label, attr in (("Up", "yes_info"), ("Down", "no_info")):
-                try:
-                    result = await self._client.fetch_market_lookup(
-                        market_id="", market_slug=slug, outcome=outcome_label
-                    )
-                    if outcome_label == "Up":
-                        yes_info = result
-                    else:
-                        no_info = result
-                except Exception as exc:
-                    fetch_error = str(exc)
-                    logger.warning(
-                        "Market lookup failed asset={} slug={} outcome={} error={}",
-                        self.asset, slug, outcome_label, exc,
-                    )
-
-            if not yes_info and not no_info:
-                if fetch_error:
-                    continue  # already logged
-                logger.warning(
-                    "Could not find any tokens asset={} slug={}",
-                    self.asset, slug,
+        for outcome_label in ("Up", "Down"):
+            try:
+                result = await self._client.fetch_market_lookup(
+                    market_id="", market_slug=slug, outcome=outcome_label
                 )
-                continue
-
-            if yes_info and not no_info:
+                if outcome_label == "Up":
+                    yes_info = result
+                else:
+                    no_info = result
+            except Exception as exc:
+                fetch_error = str(exc)
                 logger.warning(
-                    "Only found YES token for asset={} slug={} — "
-                    "NO token missing. Prices for NO will be zero.",
-                    self.asset, slug,
-                )
-            if no_info and not yes_info:
-                logger.warning(
-                    "Only found NO token for asset={} slug={} — "
-                    "YES token missing. Prices for YES will be zero.",
-                    self.asset, slug,
+                    "Market lookup failed asset={} slug={} outcome={} error={}",
+                    self.asset, slug, outcome_label, exc,
                 )
 
-            # --- Commit resolved market state ---
-            self._current_window_ts = window_ts
-            self._market_id = (yes_info or no_info).market_id           # type: ignore[union-attr]
-            self._yes_token_id = yes_info.token_id if yes_info else ""
-            self._no_token_id = no_info.token_id if no_info else ""
-            self._market_title = (yes_info or no_info).title             # type: ignore[union-attr]
-            self._market_liquidity = max(
-                (yes_info.liquidity if yes_info else 0.0),
-                (no_info.liquidity if no_info else 0.0),
+        if not yes_info and not no_info:
+            if not fetch_error:
+                logger.warning("Could not find any tokens asset={} slug={}", self.asset, slug)
+            self._resolve_retry_due_at = time.time() + self._cfg.market_resolve_retry_seconds
+            logger.warning(
+                "Failed to resolve market asset={} window_ts={} slug={} — will retry in {:.1f}s",
+                self.asset,
+                window_ts,
+                slug,
+                self._cfg.market_resolve_retry_seconds,
             )
-            self._market_volume = max(
-                (yes_info.volume if yes_info else 0.0),
-                (no_info.volume if no_info else 0.0),
-            )
-            self._market_resolved = True
+            return False
 
-            # CRITICAL: Log the actual market title every window so you can verify
-            # that the slug prefix in config is producing the right market.
-            logger.info(
-                "Market resolved asset={} window_ts={} slug={} title='{}' "
-                "market_id={} yes_token={} no_token={} liquidity={:.0f}",
-                self.asset, window_ts, slug, self._market_title,
-                self._market_id,
-                self._yes_token_id or "MISSING",
-                self._no_token_id or "MISSING",
-                self._market_liquidity,
+        if yes_info is None or no_info is None:
+            missing = "YES" if yes_info is None else "NO"
+            logger.warning(
+                "Resolved partial market asset={} slug={} — missing {} token. "
+                "Will retry instead of using one-sided books.",
+                self.asset,
+                slug,
+                missing,
             )
-            return True
+            self._resolve_retry_due_at = time.time() + self._cfg.market_resolve_retry_seconds
+            return False
 
-        # Failed to resolve
-        self._market_resolved = False
-        logger.warning(
-            "Failed to resolve market asset={} window_ts={} tried={}",
-            self.asset, window_ts, candidates,
+        # --- Commit resolved market state ---
+        self._market_id = yes_info.market_id
+        self._yes_token_id = yes_info.token_id
+        self._no_token_id = no_info.token_id
+        self._market_title = yes_info.title
+        self._market_liquidity = max(yes_info.liquidity, no_info.liquidity)
+        self._market_volume = max(yes_info.volume, no_info.volume)
+        self._market_resolved = True
+        self._resolve_retry_due_at = 0.0
+
+        logger.info(
+            "Market resolved asset={} window_ts={} slug={} title='{}' "
+            "market_id={} yes_token={} no_token={} liquidity={:.0f}",
+            self.asset, window_ts, slug, self._market_title,
+            self._market_id,
+            self._yes_token_id or "MISSING",
+            self._no_token_id or "MISSING",
+            self._market_liquidity,
         )
-        return False
+        return True
 
     # ------------------------------------------------------------------ #
     # Price refreshing
@@ -284,31 +294,57 @@ class AssetWatcher:
         The ask price is what we'd pay to BUY — correct for entry cost calc.
         """
         if not self._market_resolved or (not self._yes_token_id and not self._no_token_id):
-            return
+            now = time.time()
+            if now >= self._resolve_retry_due_at:
+                await self.resolve_market(current_window_ts(self._cfg.window_duration_seconds))
+            if not self._market_resolved:
+                return
 
         # Fetch YES orderbook
         if self._yes_token_id:
             try:
                 yes_ob = await self._client.get_orderbook(self._yes_token_id)
+                if yes_ob and yes_ob.bids:
+                    self._yes_bid = float(yes_ob.bids[0].price)
+                    self._yes_bid_size = float(yes_ob.bids[0].size)
+                else:
+                    self._yes_bid = 0.0
+                    self._yes_bid_size = 0.0
                 if yes_ob and yes_ob.asks:
                     self._yes_ask = float(yes_ob.asks[0].price)
+                    self._yes_ask_size = float(yes_ob.asks[0].size)
                 else:
                     self._yes_ask = 0.0
+                    self._yes_ask_size = 0.0
             except Exception as exc:
                 logger.debug("YES orderbook fetch failed asset={} error={}", self.asset, exc)
+                self._yes_bid = 0.0
+                self._yes_bid_size = 0.0
                 self._yes_ask = 0.0
+                self._yes_ask_size = 0.0
 
         # Fetch NO orderbook
         if self._no_token_id:
             try:
                 no_ob = await self._client.get_orderbook(self._no_token_id)
+                if no_ob and no_ob.bids:
+                    self._no_bid = float(no_ob.bids[0].price)
+                    self._no_bid_size = float(no_ob.bids[0].size)
+                else:
+                    self._no_bid = 0.0
+                    self._no_bid_size = 0.0
                 if no_ob and no_ob.asks:
                     self._no_ask = float(no_ob.asks[0].price)
+                    self._no_ask_size = float(no_ob.asks[0].size)
                 else:
                     self._no_ask = 0.0
+                    self._no_ask_size = 0.0
             except Exception as exc:
                 logger.debug("NO orderbook fetch failed asset={} error={}", self.asset, exc)
+                self._no_bid = 0.0
+                self._no_bid_size = 0.0
                 self._no_ask = 0.0
+                self._no_ask_size = 0.0
 
         self._last_price_ts = time.time()
 
@@ -335,6 +371,24 @@ class AssetWatcher:
     def no_ask(self) -> float:
         return self._no_ask
 
+    def yes_bid(self) -> float:
+        return self._yes_bid
+
+    def no_bid(self) -> float:
+        return self._no_bid
+
+    def yes_ask_size(self) -> float:
+        return self._yes_ask_size
+
+    def no_ask_size(self) -> float:
+        return self._no_ask_size
+
+    def yes_bid_size(self) -> float:
+        return self._yes_bid_size
+
+    def no_bid_size(self) -> float:
+        return self._no_bid_size
+
     def is_ready(self) -> bool:
         """True if all required data is available and fresh."""
         return (
@@ -346,6 +400,27 @@ class AssetWatcher:
             and self.asset_price() > 0
         )
 
+    def readiness_reason(self) -> str:
+        """
+        Explain why the watcher is not currently ready for signal evaluation.
+
+        This keeps the observer/report honest when a generic PRICES_STALE gate
+        is really being caused by one specific missing dependency.
+        """
+        if not self._market_resolved:
+            return "market_unresolved"
+        if not self.rtds_is_fresh():
+            return "asset_feed_stale"
+        if not self.prices_are_fresh():
+            return "orderbook_refresh_stale"
+        if self._yes_ask <= 0:
+            return "yes_ask_missing"
+        if self._no_ask <= 0:
+            return "no_ask_missing"
+        if self.asset_price() <= 0:
+            return "asset_price_missing"
+        return "ready"
+
     def market_meta(self) -> dict[str, Any]:
         """Return market identifiers and metadata for the signal event log."""
         return {
@@ -354,6 +429,8 @@ class AssetWatcher:
             "no_token_id": self._no_token_id,
             "liquidity": self._market_liquidity,
             "volume": self._market_volume,
+            "yes_ask_size": self._yes_ask_size,
+            "no_ask_size": self._no_ask_size,
         }
 
 
@@ -409,7 +486,8 @@ class CryptoMarketWatcher:
         Detect 15-minute window rollovers.
 
         Returns a list of asset names that experienced a window transition
-        this call (i.e., successfully resolved their market for the new window).
+        this call. Market resolution may still be catching up after the
+        rollover; evaluators should still roll their window state on time.
         Returns empty list if no transition occurred.
 
         The caller (direction signal run loop) should:
@@ -429,9 +507,8 @@ class CryptoMarketWatcher:
 
         for asset, watcher in self._watchers.items():
             success = await watcher.resolve_market(new_ts)
-            if success:
-                transitioned.append(asset)
-            else:
+            transitioned.append(asset)
+            if not success:
                 logger.warning(
                     "Window transition: market NOT resolved asset={} window_ts={}",
                     asset, new_ts,

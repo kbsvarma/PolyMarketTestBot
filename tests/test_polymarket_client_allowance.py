@@ -11,7 +11,8 @@ from src.polymarket_client import PolymarketClient
 class _AllowanceSdkClient:
     def __init__(self, payload: dict[str, object]) -> None:
         self.payload = payload
-        self.builder = type("Builder", (), {"sig_type": 0})()
+        signer = type("Signer", (), {"address": lambda self: "0xabc"})()
+        self.builder = type("Builder", (), {"sig_type": 0, "signer": signer, "funder": "0xabc"})()
 
     def get_balance_allowance(self, params: object = None) -> dict[str, object]:
         return self.payload
@@ -19,7 +20,8 @@ class _AllowanceSdkClient:
 
 class _SignatureAwareAllowanceSdkClient:
     def __init__(self) -> None:
-        self.builder = type("Builder", (), {"sig_type": 0})()
+        signer = type("Signer", (), {"address": lambda self: "0xabc"})()
+        self.builder = type("Builder", (), {"sig_type": 0, "signer": signer, "funder": "0xdef"})()
 
     def get_balance_allowance(self, params: object = None) -> dict[str, object]:
         if getattr(params, "signature_type", None) == 1:
@@ -90,3 +92,15 @@ def test_allowance_tries_proxy_signature_type_and_keeps_exchange_side_result() -
     assert payload["sufficient"] is True
     assert payload["query_params"]["signature_type"] == 1
     assert payload["sdk_signature_type"] == 0
+
+
+def test_proxy_wallet_bootstraps_signature_type_one_for_live_orders() -> None:
+    client = PolymarketClient(_live_config())
+    client._sdk_client = _SignatureAwareAllowanceSdkClient()
+    client._preferred_signature_type = None
+
+    client._bootstrap_live_order_signature_preferences()
+
+    assert client._preferred_signature_type == 1
+    assert client._extract_sdk_signature_type() == 1
+    assert client._order_signature_type_candidates()[0] == 1
