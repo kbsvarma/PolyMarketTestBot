@@ -538,7 +538,7 @@ def test_report_uses_dominant_blocker_and_near_misses_for_no_signal(tmp_path) ->
 
     content = report_path.read_text(encoding="utf-8")
     assert "Could not place bet:** Price outside entry range" in content
-    assert "dominant blocker: `PRICE_RANGE_FAIL` 2/3 eval cycles; furthest gate reached: `LAG_GAP_INSUFFICIENT`" in content
+    assert "dominant blocker: `PRICE_RANGE_FAIL` 2/3 eval cycles; later blocker also seen: `LAG_GAP_INSUFFICIENT`" in content
     assert "near misses: range high <= +2c: 2; lag near-pass: 1" in content
     assert "single-guardrail counterfactuals: range +2c => fire: 2; lag -25% => fire: 1" in content
     assert "Entry range widened by 2c | 2" in content

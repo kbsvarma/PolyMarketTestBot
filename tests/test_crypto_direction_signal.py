@@ -298,7 +298,7 @@ class TestGateFailures:
             time_gate_minutes=1.0,
             continuation_enabled=True,
             continuation_min_minutes_remaining=1.5,
-            continuation_min_asset_move_pct=0.0004,
+            continuation_min_asset_move_pct=0.00035,
             continuation_min_chop_score=0.6,
             continuation_max_momentum_price=0.61,
             continuation_max_opposite_price=0.44,
@@ -319,7 +319,7 @@ class TestGateFailures:
             time_gate_minutes=1.0,
             continuation_enabled=True,
             continuation_min_minutes_remaining=1.5,
-            continuation_min_asset_move_pct=0.0004,
+            continuation_min_asset_move_pct=0.00035,
             continuation_min_chop_score=0.6,
             continuation_max_momentum_price=0.61,
             continuation_max_opposite_price=0.44,
@@ -339,7 +339,7 @@ class TestGateFailures:
             time_gate_minutes=1.0,
             continuation_enabled=True,
             continuation_min_minutes_remaining=1.5,
-            continuation_min_asset_move_pct=0.0004,
+            continuation_min_asset_move_pct=0.00035,
             continuation_min_chop_score=0.6,
             continuation_max_momentum_price=0.61,
             continuation_max_opposite_price=0.44,
@@ -360,7 +360,7 @@ class TestGateFailures:
             time_gate_minutes=1.0,
             continuation_enabled=True,
             continuation_min_minutes_remaining=1.5,
-            continuation_min_asset_move_pct=0.0004,
+            continuation_min_asset_move_pct=0.00035,
             continuation_min_chop_score=0.6,
             continuation_max_momentum_price=0.61,
             continuation_max_opposite_price=0.44,
@@ -381,7 +381,7 @@ class TestGateFailures:
             time_gate_minutes=1.0,
             continuation_enabled=True,
             continuation_min_minutes_remaining=1.5,
-            continuation_min_asset_move_pct=0.0004,
+            continuation_min_asset_move_pct=0.00035,
             continuation_min_chop_score=0.6,
             continuation_max_momentum_price=0.61,
             continuation_max_opposite_price=0.44,
@@ -393,7 +393,7 @@ class TestGateFailures:
             WindowCheckpoint(ts=float(WINDOW_OPEN_TS + i * 60), price=ASSET_OPEN + i * 10.0)
             for i in range(3)
         ]
-        tiny_move_price = ASSET_OPEN * 1.0003  # 0.03% move: above global gate, below continuation floor
+        tiny_move_price = ASSET_OPEN * 1.00034  # 0.034% move: above global gate, still below continuation floor
         with _patch_time(WINDOW_OPEN_TS + 791), _patch_gbm(0.5797):
             result = ev._run_gates(tiny_move_price, YES_ASK_IN_RANGE, 0.43)
         assert result["result"] == GATE_LAG

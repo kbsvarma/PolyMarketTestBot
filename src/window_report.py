@@ -850,11 +850,14 @@ def _format_window(w: WindowSummary) -> list[str]:
         lines.append(f"- **Could not place bet:** {dominant_label}")
 
         if w.total_eval_cycles:
-            lines.append(
+            details = (
                 f"  - *(dominant blocker: `{w.dominant_gate_fail}` "
-                f"{w.dominant_gate_count}/{w.total_eval_cycles} eval cycles; "
-                f"furthest gate reached: `{w.primary_gate_fail}`)*"
+                f"{w.dominant_gate_count}/{w.total_eval_cycles} eval cycles"
             )
+            if w.primary_gate_fail != w.dominant_gate_fail:
+                details += f"; later blocker also seen: `{w.primary_gate_fail}`"
+            details += ")*"
+            lines.append(details)
         if w.near_miss_counts:
             parts: list[str] = []
             if w.near_miss_counts.get("price_high_within_2c"):

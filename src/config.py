@@ -365,7 +365,7 @@ class CryptoDirectionConfig(BaseModel):
     # market is no longer lagging but the bracket structure is still attractive.
     continuation_enabled: bool = False
     continuation_min_minutes_remaining: float = 1.5
-    continuation_min_asset_move_pct: float = 0.0004
+    continuation_min_asset_move_pct: float = 0.00035
     continuation_min_chop_score: float = 0.66
     continuation_max_momentum_price: float = 0.59
     continuation_max_opposite_price: float = 0.44

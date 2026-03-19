@@ -235,7 +235,9 @@ crypto_direction:
   lag_threshold: 0.015                # raised from 0.005 — weak-lag signals (0.014) were losing; winners had 0.115+
   continuation_enabled: true          # second path: clean continuation when classic lag capture says no
   continuation_min_minutes_remaining: 1.5
-  continuation_min_asset_move_pct: 0.0004   # require at least a 0.04% real move before continuation can fire
+  continuation_min_asset_move_pct: 0.00035  # require at least a 0.035% real move before continuation can fire;
+                                            # this still blocks the weak 0.032-0.034% whipsaw losses while
+                                            # recovering the cleaner 0.035-0.039% continuation windows
   continuation_min_chop_score: 0.66
   continuation_max_momentum_price: 0.59
   continuation_max_opposite_price: 0.44

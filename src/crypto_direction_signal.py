@@ -158,13 +158,16 @@ class DirectionSignalEvaluator:
         logger.info(
             "DirectionSignalEvaluator init asset={} vol_per_second={:.8f} "
             "entry_range=[{}, {}] lag_threshold={} time_gate_minutes={} "
-            "continuation={} cont_min_mins={} cont_min_chop={} cont_ignore_lag={}",
+            "continuation={} cont_min_mins={} cont_min_move={} cont_min_chop={} "
+            "cont_max_neg_lag={} cont_ignore_lag={}",
             asset, self._vol_per_second,
             cfg.entry_range_low, cfg.entry_range_high,
             cfg.lag_threshold, cfg.time_gate_minutes,
             cfg.continuation_enabled,
             cfg.continuation_min_minutes_remaining,
+            cfg.continuation_min_asset_move_pct,
             cfg.continuation_min_chop_score,
+            cfg.continuation_max_negative_lag_gap,
             cfg.continuation_ignore_lag_veto,
         )
 
@@ -1116,13 +1119,16 @@ async def run_bracket_signal_observer(
     logger.info(
         "Starting bracket signal observer track_btc={} track_eth={} "
         "entry_range=[{}, {}] lag_threshold={} time_gate_minutes={} "
-        "continuation={} cont_min_mins={} cont_min_chop={} cont_ignore_lag={}",
+        "continuation={} cont_min_mins={} cont_min_move={} cont_min_chop={} "
+        "cont_max_neg_lag={} cont_ignore_lag={}",
         cfg.track_btc, cfg.track_eth,
         cfg.entry_range_low, cfg.entry_range_high,
         cfg.lag_threshold, cfg.time_gate_minutes,
         cfg.continuation_enabled,
         cfg.continuation_min_minutes_remaining,
+        cfg.continuation_min_asset_move_pct,
         cfg.continuation_min_chop_score,
+        cfg.continuation_max_negative_lag_gap,
         cfg.continuation_ignore_lag_veto,
     )
 
