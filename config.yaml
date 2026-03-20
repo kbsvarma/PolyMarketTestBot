@@ -228,7 +228,7 @@ crypto_direction:
   time_gate_minutes: 1.0              # was 2.0 — for 5-min windows, 1 min is enough for FOK fill
   entry_range_low: 0.57               # raised from 0.53 — at 0.53 opp.side starts at ~0.48 (2c from break-even);
                                       # any BTC reversal kills the bracket. At 0.57+ opp.side ~0.43 (9c buffer to 0.34 target).
-  entry_range_high: 0.63              # tightened from 0.65 — above 0.63 bracket margin at target_y becomes very thin
+  entry_range_high: 0.63              # restore safer 5m ceiling; higher fills made stop discipline too fragile
   chop_window: 3                      # was 4 — 5-min window yields max 3 minute-mark checkpoints before time gate
   chop_max_reversal_pct: 0.001        # unchanged — same BTC noise band
   chop_min_score: 0.51                # was 0.25 — blocks soft passes (0.50) which fired before enough checkpoints existed
@@ -239,17 +239,21 @@ crypto_direction:
                                             # this still blocks the weak 0.032-0.034% whipsaw losses while
                                             # recovering the cleaner 0.035-0.039% continuation windows
   continuation_min_chop_score: 0.66
-  continuation_max_momentum_price: 0.59
+  continuation_max_momentum_price: 0.61   # keep 5m continuation inside the original thesis band
   continuation_max_opposite_price: 0.44
-  continuation_max_negative_lag_gap: 0.03
+  continuation_max_negative_lag_gap: 0.03  # tighter 5m continuation veto to avoid weak market-led entries
   continuation_ignore_lag_veto: false
-  continuation_hard_exit_grace_seconds: 30.0
+  immediate_band_entry_enabled: false      # disabled for live reset: keep only lag + continuation entry lanes
+  immediate_band_entry_low: 0.57
+  immediate_band_entry_high: 0.61
+  continuation_hard_exit_grace_seconds: 0.0  # 15m-only experiment; do not let 5m continuation sit through stop windows
   continuation_catastrophic_stop_price: 0.0
   safe_arm_suspend_stop: true        # once the safe opposite price is armed, stop treating it like a plain leg-1 bet
   safe_arm_catastrophic_stop_price: 0.0
 
   # Bracket parameters
   target_y_price: 0.34                # Target entry for the second leg (opposite side)
+  phase2_min_locked_profit_per_share: 0.00   # dynamic safe-y can arm above 34c as long as the bracket is still profitable after fees
   phase2_reversal_threshold: 0.01     # Opposite side must bounce >= 1c from its floor
 
   # Timing
@@ -262,7 +266,7 @@ crypto_direction:
   signal_event_log_path: "logs/crypto_signal_events.jsonl"
   evaluation_log_path: "logs/crypto_signal_evaluations.jsonl"
   window_report_path: "logs/window_report.md"  # Human-readable per-window report
-  report_shares: 5.0                           # keep report/live parity at 5 shares per signal
+  report_shares: 10.0                          # report target share size; executed windows still show actual live-filled shares
 
   # Shadow-live mode: run the same bracket executor without touching the wallet.
   # Orders are simulated against fresh live orderbooks at submission time so the
@@ -288,20 +292,195 @@ crypto_direction:
   # and then reclaims that remembered safe level on reversal. Both use
   # FOLLOW_TAKER (FOK) for immediate fills. All trades logged to logs/bracket_trades.jsonl.
   # ---------------------------------------------------------------------------
-  execute_enabled: true               # live enabled — current sizing remains fixed at 5 shares
+  execute_enabled: true               # live enabled
   phase2_enabled: true                # both phases active — set false to test P1 only
   max_concurrent_brackets: 1         # max open bracket positions across all assets
-  phase1_shares: 5.0                 # fixed Phase 1 share count (Phase 2 mirrors this)
-  min_bracket_shares: 1.0            # minimum shares per order
+  phase1_shares: 10.0                # target Phase 1 size on liquid windows
+  min_bracket_shares: 5.0            # minimum executable Phase 1 size; if visible depth is below this, skip
   phase1_entry_style: FOLLOW_TAKER   # FOK — immediate fill, captures Binance lag
-  phase1_max_chase_cents: 0.01       # keep Phase 1 tight: signal 0.57 submits at 0.57/0.58, not 0.59+
+  phase1_max_chase_cents: 0.01       # restore tighter 5m capture; avoid overpaying into 64c+ entries
+  phase1_follow_taker_retry_attempts: 1      # one bounded retry after a clean non-fill; request exceptions now reconcile before retrying
+  phase1_follow_taker_retry_delay_seconds: 0.10  # quicker retry cadence for 5m windows
+  phase1_follow_taker_retry_to_strategy_cap: true  # bounded retries can reprice up to the strategy ceiling instead of repeating the lower first limit
   phase2_entry_style: FOLLOW_TAKER   # FOK — locks bracket on reclaim of remembered safe_y
   bracket_audit_log_path: "logs/bracket_trades.jsonl"
   # Hard exit: sell Phase-1 position to cut losses mid-window
   # Triggers if (a) momentum-side mark drops to stop_price, OR
   # (b) we're in the final hard_exit_final_seconds AND still losing.
   hard_exit_stop_price: 0.50         # sell if mark drops to 50c (bought above this)
+  hard_exit_high_entry_price: 0.64   # entries this expensive are lower quality; cut them earlier
+  hard_exit_high_entry_stop_price: 0.54  # use a tighter stop bucket for 64c+ fills
   hard_exit_trigger_buffer_cents: 0.02   # start trying a little early so we can still get the 50c stop if the book is there
   hard_exit_market_through_cents: 0.0    # stay anchored at the intended 50c stop; do not auto-chase lower
+  hard_exit_fallback_step_cents: 0.02    # if 50c is gone, step down in controlled 2c increments instead of sitting through settlement
+  hard_exit_min_sell_price: 0.40         # floor for controlled stop ladder; below this we accept that the book is effectively gone
+  hard_exit_emergency_min_sell_price: 0.40  # never chase below the controlled stop floor; stability over desperate liquidation
   hard_exit_retry_cooldown_seconds: 2.0  # if a stop order misses, retry instead of giving up forever
   hard_exit_final_seconds: 30        # also sell in last 30s if mark < entry price
+
+
+# ---------------------------------------------------------------------------
+# Optional named crypto profiles.
+#
+# The base `crypto_direction` block above remains the active 5-minute lane.
+# These profiles let us spin up a separate 15-minute lane with isolated logs
+# and reports, without destabilizing the current 5-minute bot.
+# ---------------------------------------------------------------------------
+crypto_direction_profiles:
+  polymarket_btc_5m:
+    venue: "polymarket"
+    instance_name: "polymarket_btc_5m"
+    btc:
+      slug_prefix: "btc-updown-5m"
+      min_asset_move_pct: 0.0002
+    track_btc: true
+    track_eth: false
+    prefer_higher_liquidity: false
+    window_duration_seconds: 300
+    window_settle_seconds: 15
+    time_gate_minutes: 1.0
+    entry_range_low: 0.57
+    entry_range_high: 0.63
+    continuation_enabled: true
+    continuation_min_minutes_remaining: 1.5
+    continuation_min_asset_move_pct: 0.00035
+    continuation_min_chop_score: 0.66
+    continuation_max_momentum_price: 0.61
+    continuation_max_opposite_price: 0.44
+    continuation_max_negative_lag_gap: 0.03
+    continuation_hard_exit_grace_seconds: 0.0
+    phase1_max_chase_cents: 0.01
+    phase1_follow_taker_retry_attempts: 1
+    hard_exit_emergency_min_sell_price: 0.40
+    immediate_band_entry_enabled: false
+    poll_interval_seconds: 0.5
+    price_refresh_interval_seconds: 0.5
+    signal_event_log_path: "logs/crypto_signal_events_pm_btc_5m.jsonl"
+    evaluation_log_path: "logs/crypto_signal_evaluations_pm_btc_5m.jsonl"
+    window_report_path: "logs/window_report_pm_btc_5m.md"
+    shadow_execution_log_path: "logs/bracket_trades_pm_btc_5m.jsonl"
+    bracket_audit_log_path: "logs/bracket_trades_pm_btc_5m.jsonl"
+
+  btc_15m:
+    venue: "polymarket"
+    instance_name: "polymarket_btc_15m"
+    btc:
+      slug_prefix: "btc-updown-15m"
+      min_asset_move_pct: 0.0006
+    track_btc: true
+    track_eth: false
+    prefer_higher_liquidity: false
+    window_duration_seconds: 900
+    window_settle_seconds: 30
+    time_gate_minutes: 5.0
+    entry_range_low: 0.57
+    entry_range_high: 0.63
+    chop_window: 4
+    chop_min_score: 0.60
+    lag_threshold: 0.015
+    continuation_enabled: true
+    continuation_min_minutes_remaining: 5.0
+    continuation_min_asset_move_pct: 0.00045
+    continuation_min_chop_score: 0.66
+    continuation_max_momentum_price: 0.63
+    continuation_max_opposite_price: 0.43
+    continuation_max_negative_lag_gap: 0.04
+    continuation_ignore_lag_veto: false
+    continuation_hard_exit_grace_seconds: 0.0
+    phase1_max_chase_cents: 0.01
+    phase1_follow_taker_retry_attempts: 1
+    hard_exit_emergency_min_sell_price: 0.40
+    immediate_band_entry_enabled: false
+    poll_interval_seconds: 1.0
+    price_refresh_interval_seconds: 1.0
+    signal_event_log_path: "logs/crypto_signal_events_15m.jsonl"
+    evaluation_log_path: "logs/crypto_signal_evaluations_15m.jsonl"
+    window_report_path: "logs/window_report_15m.md"
+    shadow_execution_log_path: "logs/bracket_trades_15m.jsonl"
+    bracket_audit_log_path: "logs/bracket_trades_15m.jsonl"
+
+  polymarket_btc_15m:
+    venue: "polymarket"
+    instance_name: "polymarket_btc_15m"
+    btc:
+      slug_prefix: "btc-updown-15m"
+      min_asset_move_pct: 0.0006
+    track_btc: true
+    track_eth: false
+    prefer_higher_liquidity: false
+    window_duration_seconds: 900
+    window_settle_seconds: 30
+    time_gate_minutes: 5.0
+    entry_range_low: 0.57
+    entry_range_high: 0.63
+    chop_window: 4
+    chop_min_score: 0.60
+    lag_threshold: 0.015
+    continuation_enabled: true
+    continuation_min_minutes_remaining: 5.0
+    continuation_min_asset_move_pct: 0.00045
+    continuation_min_chop_score: 0.66
+    continuation_max_momentum_price: 0.63
+    continuation_max_opposite_price: 0.43
+    continuation_max_negative_lag_gap: 0.04
+    continuation_ignore_lag_veto: false
+    continuation_hard_exit_grace_seconds: 0.0
+    phase1_max_chase_cents: 0.01
+    phase1_follow_taker_retry_attempts: 1
+    hard_exit_emergency_min_sell_price: 0.40
+    immediate_band_entry_enabled: false
+    poll_interval_seconds: 1.0
+    price_refresh_interval_seconds: 1.0
+    signal_event_log_path: "logs/crypto_signal_events_pm_btc_15m.jsonl"
+    evaluation_log_path: "logs/crypto_signal_evaluations_pm_btc_15m.jsonl"
+    window_report_path: "logs/window_report_pm_btc_15m.md"
+    shadow_execution_log_path: "logs/bracket_trades_pm_btc_15m.jsonl"
+    bracket_audit_log_path: "logs/bracket_trades_pm_btc_15m.jsonl"
+
+  kalshi_btc_5m:
+    venue: "kalshi"
+    instance_name: "kalshi_btc_5m"
+    btc:
+      slug_prefix: "KXBTC15M"
+    track_btc: true
+    track_eth: false
+    window_duration_seconds: 300
+    signal_event_log_path: "logs/crypto_signal_events_kalshi_btc_5m.jsonl"
+    evaluation_log_path: "logs/crypto_signal_evaluations_kalshi_btc_5m.jsonl"
+    window_report_path: "logs/window_report_kalshi_btc_5m.md"
+    shadow_execution_log_path: "logs/bracket_trades_kalshi_btc_5m.jsonl"
+    bracket_audit_log_path: "logs/bracket_trades_kalshi_btc_5m.jsonl"
+
+  kalshi_btc_15m:
+    venue: "kalshi"
+    instance_name: "kalshi_btc_15m"
+    btc:
+      slug_prefix: "KXBTC15M"
+      min_asset_move_pct: 0.0006
+    track_btc: true
+    track_eth: false
+    prefer_higher_liquidity: false
+    window_duration_seconds: 900
+    window_settle_seconds: 45
+    time_gate_minutes: 10.0
+    entry_range_low: 0.57
+    entry_range_high: 0.61
+    chop_window: 4
+    chop_min_score: 0.60
+    lag_threshold: 0.015
+    continuation_enabled: true
+    continuation_min_minutes_remaining: 10.0
+    continuation_min_asset_move_pct: 0.0006
+    continuation_min_chop_score: 0.66
+    continuation_max_momentum_price: 0.61
+    continuation_max_opposite_price: 0.43
+    continuation_max_negative_lag_gap: 0.03
+    continuation_ignore_lag_veto: false
+    immediate_band_entry_enabled: false
+    poll_interval_seconds: 1.0
+    price_refresh_interval_seconds: 1.0
+    signal_event_log_path: "logs/crypto_signal_events_kalshi_btc_15m.jsonl"
+    evaluation_log_path: "logs/crypto_signal_evaluations_kalshi_btc_15m.jsonl"
+    window_report_path: "logs/window_report_kalshi_btc_15m.md"
+    shadow_execution_log_path: "logs/bracket_trades_kalshi_btc_15m.jsonl"
+    bracket_audit_log_path: "logs/bracket_trades_kalshi_btc_15m.jsonl"

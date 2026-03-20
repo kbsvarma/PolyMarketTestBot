@@ -64,7 +64,7 @@ except ImportError:
     logger = logging.getLogger(__name__)  # type: ignore[assignment]
 
 from src.config import AssetVolConfig, CryptoDirectionConfig
-from src.fees import taker_fee
+from src.fees import max_profitable_opposite_price, taker_fee
 from src.lag_signal import _estimate_fair_p_up
 from src.models import BracketSignalEvent, PostSignalObservation, WindowCheckpoint
 from src.window_report import WindowReportWriter
@@ -159,7 +159,8 @@ class DirectionSignalEvaluator:
             "DirectionSignalEvaluator init asset={} vol_per_second={:.8f} "
             "entry_range=[{}, {}] lag_threshold={} time_gate_minutes={} "
             "continuation={} cont_min_mins={} cont_min_move={} cont_min_chop={} "
-            "cont_max_neg_lag={} cont_ignore_lag={}",
+            "cont_max_momentum={} cont_max_neg_lag={} cont_ignore_lag={} "
+            "band_entry={} band_range=[{}, {}]",
             asset, self._vol_per_second,
             cfg.entry_range_low, cfg.entry_range_high,
             cfg.lag_threshold, cfg.time_gate_minutes,
@@ -167,8 +168,12 @@ class DirectionSignalEvaluator:
             cfg.continuation_min_minutes_remaining,
             cfg.continuation_min_asset_move_pct,
             cfg.continuation_min_chop_score,
+            cfg.continuation_max_momentum_price,
             cfg.continuation_max_negative_lag_gap,
             cfg.continuation_ignore_lag_veto,
+            cfg.immediate_band_entry_enabled,
+            cfg.immediate_band_entry_low,
+            cfg.immediate_band_entry_high,
         )
 
     # ------------------------------------------------------------------ #
@@ -363,6 +368,14 @@ class DirectionSignalEvaluator:
             fee_x = taker_fee(x_price, category="crypto price")
             fee_y = taker_fee(y_price, category="crypto price")
             net_bracket = 1.0 - x_price * (1.0 + fee_x) - y_price * (1.0 + fee_y)
+            min_locked_profit = float(
+                getattr(self._cfg, "phase2_min_locked_profit_per_share", 0.0) or 0.0
+            )
+            profitable_y_ceiling = max_profitable_opposite_price(
+                x_price,
+                min_net_margin=min_locked_profit,
+                category="crypto price",
+            )
 
             if net_bracket > obs.peak_bracket_margin:
                 obs.peak_bracket_margin = round(net_bracket, 6)
@@ -375,29 +388,47 @@ class DirectionSignalEvaluator:
                 obs.min_opposite_price = y_price
 
             # y_safe discovery:
-            # save the FIRST observed opposite-side price that reaches the
-            # configured safe zone and is still profitable after fees.
+            # arm from the dynamic profitable ceiling implied by the actual
+            # Phase 1 fill. If the move later reaches the preferred target zone,
+            # tighten the reclaim anchor downward to that better observed price.
             if (
                 obs.safe_opposite_price is None
-                and y_price <= self._cfg.target_y_price
-                and net_bracket > 0
+                and profitable_y_ceiling > 0
+                and y_price <= profitable_y_ceiling
+                and net_bracket >= min_locked_profit
             ):
-                obs.safe_opposite_price = round(y_price, 6)
+                arm_price = y_price if y_price <= self._cfg.target_y_price else profitable_y_ceiling
+                obs.safe_opposite_price = round(arm_price, 6)
                 logger.info(
-                    "Safe opposite price armed asset={} safe_y={:.4f} bracket_margin={:.4f}",
-                    self.asset, y_price, net_bracket,
+                    "Safe opposite price armed asset={} safe_y={:.4f} "
+                    "profit_ceiling={:.4f} bracket_margin={:.4f}",
+                    self.asset, obs.safe_opposite_price, profitable_y_ceiling, net_bracket,
                 )
 
             safe_price = obs.safe_opposite_price
 
+            if (
+                safe_price is not None
+                and safe_price > self._cfg.target_y_price
+                and y_price <= self._cfg.target_y_price
+                and y_price < safe_price
+            ):
+                obs.safe_opposite_price = round(y_price, 6)
+                safe_price = obs.safe_opposite_price
+                logger.info(
+                    "Safe opposite price tightened asset={} safe_y={:.4f} "
+                    "profit_ceiling={:.4f} bracket_margin={:.4f}",
+                    self.asset, safe_price, profitable_y_ceiling, net_bracket,
+                )
+
             # Once y_safe exists, require the move to extend below it before
             # we credit a reclaim. This avoids buying the second leg the instant
             # the equation merely becomes safe.
-            if (
+            breached_safe = (
                 safe_price is not None
-                and y_price <= safe_price - self._cfg.phase2_reversal_threshold
-            ):
-                obs.dipped_below_safe_price = True
+                and obs.min_opposite_price <= safe_price - self._cfg.phase2_reversal_threshold
+            )
+            obs.dipped_below_safe_price = bool(breached_safe)
 
             # Phase 2 reclaim check:
             #   1. y_safe was armed
@@ -409,7 +440,7 @@ class DirectionSignalEvaluator:
                 and obs.dipped_below_safe_price
                 and y_price >= safe_price
                 and y_price <= safe_price + self._cfg.phase2_reversal_threshold
-                and net_bracket > 0
+                and net_bracket >= min_locked_profit
             ):
                 required_shares = self._required_shares()
                 phase2_would_fill = y_ask_size >= required_shares
@@ -614,6 +645,21 @@ class DirectionSignalEvaluator:
         lag_gap = implied_momentum_price - momentum_price
 
         if lag_gap < self._cfg.lag_threshold:
+            if self._immediate_band_entry_ok(
+                momentum_price=momentum_price,
+            ):
+                return {
+                    "result": GATE_FIRED,
+                    "entry_model": "band_touch",
+                    "minutes_remaining": round(minutes_remaining, 2),
+                    "asset_move_pct": round(asset_move_pct, 6),
+                    "momentum_side": momentum_side,
+                    "momentum_price": round(momentum_price, 4),
+                    "opposite_price": round(opposite_price, 4),
+                    "chop_score": round(chop_score, 3),
+                    "lag_gap": round(lag_gap, 4),
+                    "implied_momentum_price": round(implied_momentum_price, 4),
+                }
             if self._continuation_entry_ok(
                 asset_move_pct=asset_move_pct,
                 minutes_remaining=minutes_remaining,
@@ -741,6 +787,23 @@ class DirectionSignalEvaluator:
         ):
             return False
         return True
+
+    def _immediate_band_entry_ok(
+        self,
+        *,
+        momentum_price: float,
+    ) -> bool:
+        """
+        Aggressive thesis lane:
+
+        If the momentum side is already trading inside the original 57-61c band,
+        we buy immediately instead of waiting for lag confirmation.  This keeps
+        the base move/time/chop gates intact but removes the lag veto.
+        """
+        cfg = self._cfg
+        if not cfg.immediate_band_entry_enabled:
+            return False
+        return cfg.immediate_band_entry_low <= momentum_price <= cfg.immediate_band_entry_high
 
     # ------------------------------------------------------------------ #
     # Internal: signal event construction
@@ -1120,7 +1183,9 @@ async def run_bracket_signal_observer(
         "Starting bracket signal observer track_btc={} track_eth={} "
         "entry_range=[{}, {}] lag_threshold={} time_gate_minutes={} "
         "continuation={} cont_min_mins={} cont_min_move={} cont_min_chop={} "
-        "cont_max_neg_lag={} cont_ignore_lag={}",
+        "cont_max_momentum={} cont_max_neg_lag={} cont_ignore_lag={} "
+        "band_entry={} band_range=[{}, {}] "
+        "phase1_chase={} phase1_retries={} retry_delay={}",
         cfg.track_btc, cfg.track_eth,
         cfg.entry_range_low, cfg.entry_range_high,
         cfg.lag_threshold, cfg.time_gate_minutes,
@@ -1128,8 +1193,15 @@ async def run_bracket_signal_observer(
         cfg.continuation_min_minutes_remaining,
         cfg.continuation_min_asset_move_pct,
         cfg.continuation_min_chop_score,
+        cfg.continuation_max_momentum_price,
         cfg.continuation_max_negative_lag_gap,
         cfg.continuation_ignore_lag_veto,
+        cfg.immediate_band_entry_enabled,
+        cfg.immediate_band_entry_low,
+        cfg.immediate_band_entry_high,
+        cfg.phase1_max_chase_cents,
+        cfg.phase1_follow_taker_retry_attempts,
+        cfg.phase1_follow_taker_retry_delay_seconds,
     )
 
     # ---- Startup diagnostics ----

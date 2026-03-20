@@ -29,6 +29,7 @@ from src.crypto_direction_signal import (
     GATE_TIME,
     DirectionSignalEvaluator,
 )
+from src.fees import max_profitable_opposite_price
 from src.models import WindowCheckpoint
 
 
@@ -75,6 +76,7 @@ def make_config(tmp_path, **overrides) -> CryptoDirectionConfig:
         chop_min_score=0.6,
         lag_threshold=0.04,
         target_y_price=0.34,
+        phase2_min_locked_profit_per_share=0.0,
         phase2_reversal_threshold=0.01,
         signal_event_log_path=str(tmp_path / "signal_events.jsonl"),
         evaluation_log_path=str(tmp_path / "evaluations.jsonl"),
@@ -398,6 +400,39 @@ class TestGateFailures:
             result = ev._run_gates(tiny_move_price, YES_ASK_IN_RANGE, 0.43)
         assert result["result"] == GATE_LAG
 
+    def test_immediate_band_entry_fires_in_57_61_band_even_when_lag_fails(self, tmp_path):
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=1.0,
+            entry_range_high=0.68,
+            immediate_band_entry_enabled=True,
+            immediate_band_entry_low=0.57,
+            immediate_band_entry_high=0.61,
+            continuation_enabled=False,
+            lag_threshold=0.015,
+        )
+        seed_clean_checkpoints_up(ev, n=3)
+        with _patch_time(WINDOW_OPEN_TS + 791), _patch_gbm(0.52):
+            result = ev._run_gates(ASSET_PRICE_UP, 0.59, 0.41)
+        assert result["result"] == GATE_FIRED
+        assert result["entry_model"] == "band_touch"
+
+    def test_immediate_band_entry_does_not_fire_above_band_high(self, tmp_path):
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=1.0,
+            entry_range_high=0.68,
+            immediate_band_entry_enabled=True,
+            immediate_band_entry_low=0.57,
+            immediate_band_entry_high=0.61,
+            continuation_enabled=False,
+            lag_threshold=0.015,
+        )
+        seed_clean_checkpoints_up(ev, n=3)
+        with _patch_time(WINDOW_OPEN_TS + 791), _patch_gbm(0.52):
+            result = ev._run_gates(ASSET_PRICE_UP, 0.63, 0.38)
+        assert result["result"] == GATE_LAG
+
     def test_cooldown_blocks_same_side_in_same_window(self, tmp_path):
         """Second YES signal in same window is blocked by cooldown gate."""
         ev = make_evaluator(tmp_path)
@@ -472,7 +507,7 @@ class TestSignalFires:
         assert event.lag_gap > 0.04
         assert event.chop_score == 1.0
         assert event.mid_window_start is False
-        assert event.required_shares == pytest.approx(5.0)
+        assert event.required_shares == pytest.approx(10.0)
         assert event.momentum_ask_size == pytest.approx(25.0)
         assert event.phase1_would_fill is True
         # State updated
@@ -616,6 +651,29 @@ class TestPostSignalTracking:
         assert obs.safe_opposite_price == pytest.approx(0.34)
         assert obs.phase2_would_have_triggered is False
         assert obs.dipped_below_safe_price is False
+
+    def test_safe_opposite_price_can_arm_from_dynamic_profitable_ceiling(self, tmp_path):
+        """When 34c is never reached, arm from the actual profitable y ceiling."""
+        ev = self._fire_yes_signal(tmp_path)
+        obs = ev._state.observation
+
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.41, yes_ask_size=25.0, no_ask_size=25.0)
+
+        expected = max_profitable_opposite_price(0.58, min_net_margin=0.0, category="crypto price")
+        assert obs.safe_opposite_price == pytest.approx(expected, abs=1e-4)
+        assert obs.safe_opposite_price > 0.41
+
+    def test_safe_opposite_price_tightens_when_better_target_is_reached(self, tmp_path):
+        """A later deeper profitable move should tighten y_safe downward."""
+        ev = self._fire_yes_signal(tmp_path)
+        obs = ev._state.observation
+
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.41, yes_ask_size=25.0, no_ask_size=25.0)
+        first_safe = obs.safe_opposite_price
+        assert first_safe is not None and first_safe > 0.40
+
+        ev.update_post_signal(yes_ask=0.60, no_ask=0.34, yes_ask_size=25.0, no_ask_size=25.0)
+        assert obs.safe_opposite_price == pytest.approx(0.34)
 
     def test_phase2_triggers_only_after_safe_level_dips_and_reclaims(self, tmp_path):
         """Phase 2 requires y_safe discovery, extension below it, then reclaim back to it."""

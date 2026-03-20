@@ -99,8 +99,15 @@ class WindowSummary:
     execution_phase1_filled: bool = False
     execution_phase2_filled: bool = False
     execution_p1_fill_price: float = 0.0
+    execution_position_id: str = ""
+    execution_p1_order_id: str = ""
+    execution_p2_order_id: str = ""
+    execution_hard_exit_order_ids: list[str] = field(default_factory=list)
+    execution_phase2_attempted: bool = False
+    execution_hard_exit_attempted: bool = False
     execution_hard_exit_reason: str = ""
     execution_hard_exit_fill_price: float = 0.0
+    execution_hard_exit_filled_shares: float = 0.0
     outcome_source: str = "asset_price_proxy"
 
     @property
@@ -330,8 +337,15 @@ class WindowReportWriter:
         execution_phase1_filled = False
         execution_phase2_filled = False
         execution_p1_fill_price = 0.0
+        execution_position_id = ""
+        execution_p1_order_id = ""
+        execution_p2_order_id = ""
+        execution_hard_exit_order_ids: list[str] = []
+        execution_phase2_attempted = False
+        execution_hard_exit_attempted = False
         execution_hard_exit_reason = ""
         execution_hard_exit_fill_price = 0.0
+        execution_hard_exit_filled_shares = 0.0
 
         if self._live_execution and execution_summary:
             used_actual_execution = True
@@ -352,9 +366,22 @@ class WindowReportWriter:
             execution_phase1_filled = bool(execution_summary.get("phase1_filled"))
             execution_phase2_filled = bool(execution_summary.get("phase2_filled"))
             execution_p1_fill_price = float(execution_summary.get("p1_fill_price") or 0.0)
+            execution_position_id = str(execution_summary.get("position_id") or "")
+            execution_p1_order_id = str(execution_summary.get("p1_order_id") or "")
+            execution_p2_order_id = str(execution_summary.get("p2_order_id") or "")
+            execution_hard_exit_order_ids = [
+                str(order_id)
+                for order_id in (execution_summary.get("hard_exit_order_ids") or [])
+                if order_id
+            ]
+            execution_phase2_attempted = bool(execution_summary.get("phase2_order_attempted"))
+            execution_hard_exit_attempted = bool(execution_summary.get("hard_exit_attempted"))
             execution_hard_exit_reason = str(execution_summary.get("hard_exit_reason") or "")
             execution_hard_exit_fill_price = float(
                 execution_summary.get("hard_exit_fill_price") or 0.0
+            )
+            execution_hard_exit_filled_shares = float(
+                execution_summary.get("hard_exit_filled_shares") or 0.0
             )
             if execution_summary.get("outcome_source"):
                 outcome_source = str(execution_summary.get("outcome_source") or outcome_source)
@@ -421,8 +448,15 @@ class WindowReportWriter:
             execution_phase1_filled=execution_phase1_filled,
             execution_phase2_filled=execution_phase2_filled,
             execution_p1_fill_price=execution_p1_fill_price,
+            execution_position_id=execution_position_id,
+            execution_p1_order_id=execution_p1_order_id,
+            execution_p2_order_id=execution_p2_order_id,
+            execution_hard_exit_order_ids=execution_hard_exit_order_ids,
+            execution_phase2_attempted=execution_phase2_attempted,
+            execution_hard_exit_attempted=execution_hard_exit_attempted,
             execution_hard_exit_reason=execution_hard_exit_reason,
             execution_hard_exit_fill_price=execution_hard_exit_fill_price,
+            execution_hard_exit_filled_shares=execution_hard_exit_filled_shares,
             outcome_source=outcome_source,
         )
 
@@ -607,7 +641,7 @@ class WindowReportWriter:
             "",
             f"{mode_line}  ",
             f"> **Last Updated:** {now_et}  ",
-            f"> **Configured Share Size:** {self._share_count:.1f} shares per signal  ",
+            f"> **Configured Target Share Size:** {self._share_count:.1f} shares per signal (adaptive live sizing can trade smaller when depth is thin)  ",
             "> **Outcome Source:** Best available market metadata winner; falls back to Binance price proxy when unresolved  ",
             "",
             "---",
@@ -812,7 +846,18 @@ def _format_window(w: WindowSummary) -> list[str]:
                     f"- **Phase 2:** ✅ Bracket leg triggered — {_opp(w.signal_side)} @ {w.phase2_price:.3f}"
                 )
         else:
-            if w.phase2_reclaim_seen and not w.phase2_would_fill:
+            phase2_display_price = w.phase2_price or w.safe_opposite_price
+            if w.used_actual_execution and w.execution_phase2_attempted and not w.execution_phase2_filled:
+                if w.phase2_reclaim_seen and phase2_display_price > 0:
+                    lines.append(
+                        f"- **Phase 2:** ⚠ Reclaim seen @ {phase2_display_price:.3f}, but the live "
+                        "Phase 2 order did not fill"
+                    )
+                else:
+                    lines.append(
+                        "- **Phase 2:** ⚠ Phase 2 order was attempted, but the live order did not fill"
+                    )
+            elif w.phase2_reclaim_seen and not w.phase2_would_fill:
                 lines.append(
                     f"- **Phase 2:** ⚠ Reclaim seen @ {w.phase2_price:.3f}, but top ask "
                     f"{w.phase2_trigger_ask_size:.1f} shares < required {w.required_shares:.1f}"
@@ -845,6 +890,35 @@ def _format_window(w: WindowSummary) -> list[str]:
                     extra.append(f"fill={w.execution_hard_exit_fill_price:.3f}")
                 if extra:
                     lines.append(f"- **Hard exit:** {' '.join(extra)}")
+            elif w.execution_hard_exit_attempted and w.execution_hard_exit_fill_price <= 0:
+                extra: list[str] = []
+                if w.execution_hard_exit_reason:
+                    extra.append(f"reason=`{w.execution_hard_exit_reason}`")
+                lines.append(
+                    "- **Hard exit:** attempted"
+                    + (f" ({' '.join(extra)})" if extra else "")
+                    + ", but no live sell filled before close"
+                )
+            elif w.execution_hard_exit_filled_shares > 0 and w.share_count - w.execution_hard_exit_filled_shares > 1e-6:
+                lines.append(
+                    f"- **Partial hard exit:** sold {w.execution_hard_exit_filled_shares:.2f} shares @ "
+                    f"{w.execution_hard_exit_fill_price:.3f}; remaining "
+                    f"{(w.share_count - w.execution_hard_exit_filled_shares):.2f} shares settled at close"
+                )
+            execution_refs: list[str] = []
+            if w.execution_position_id:
+                execution_refs.append(f"position=`{w.execution_position_id}`")
+            if w.execution_p1_order_id:
+                execution_refs.append(f"phase1_order=`{w.execution_p1_order_id}`")
+            if w.execution_p2_order_id:
+                execution_refs.append(f"phase2_order=`{w.execution_p2_order_id}`")
+            if w.execution_hard_exit_order_ids:
+                execution_refs.append(
+                    "hard_exit_orders="
+                    + ", ".join(f"`{order_id}`" for order_id in w.execution_hard_exit_order_ids)
+                )
+            if execution_refs:
+                lines.append(f"- **Execution refs:** {' '.join(execution_refs)}")
     else:
         dominant_label = _GATE_LABELS.get(w.dominant_gate_fail, w.dominant_gate_fail)
         lines.append(f"- **Could not place bet:** {dominant_label}")

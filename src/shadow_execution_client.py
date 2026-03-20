@@ -68,12 +68,13 @@ class ShadowExecutionClient:
         client_order_id: str | None = None,
     ) -> dict[str, Any]:
         order_id = f"shadow-{next(self._seq)}"
-        if entry_style == "FOLLOW_TAKER":
+        if entry_style in {"FOLLOW_TAKER", "FOLLOW_TAKER_PARTIAL"}:
             payload = await self._simulate_fok_order(
                 token_id=token_id,
                 price=price,
                 size=size,
                 side=side,
+                allow_partial=entry_style == "FOLLOW_TAKER_PARTIAL",
                 order_id=order_id,
                 client_order_id=client_order_id,
             )
@@ -104,6 +105,7 @@ class ShadowExecutionClient:
         price: float,
         size: float,
         side: str,
+        allow_partial: bool,
         order_id: str,
         client_order_id: str | None,
     ) -> dict[str, Any]:
@@ -134,7 +136,7 @@ class ShadowExecutionClient:
 
         matched = remaining <= 1e-9
         average_fill_price = (spent / filled) if filled > 0 else 0.0
-        if matched:
+        if matched or (allow_partial and filled > 0):
             miss_reason = ""
         elif not levels:
             miss_reason = "no_book"
@@ -149,10 +151,10 @@ class ShadowExecutionClient:
 
         return {
             "exchange_order_id": order_id,
-            "status": "MATCHED" if matched else "CANCELLED",
-            "filled_size": round(filled if matched else 0.0, 6),
-            "average_fill_price": round(average_fill_price if matched else 0.0, 6),
-            "remaining_size": round(0.0 if matched else float(size), 6),
+            "status": "MATCHED" if matched else "PARTIAL" if (allow_partial and filled > 0) else "CANCELLED",
+            "filled_size": round(filled if (matched or allow_partial) else 0.0, 6),
+            "average_fill_price": round(average_fill_price if (matched or (allow_partial and filled > 0)) else 0.0, 6),
+            "remaining_size": round(max(float(size) - filled, 0.0) if (allow_partial and filled > 0) else (0.0 if matched else float(size)), 6),
             "client_order_id": client_order_id or "",
             "price": float(price),
             "size": float(size),
@@ -175,6 +177,9 @@ class ShadowExecutionClient:
         if order is None:
             raise RuntimeError(f"Unknown shadow order: {exchange_order_id}")
         return dict(order)
+
+    async def get_orderbook(self, token_id: str):
+        return await self._client.get_orderbook(token_id)
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         order = self._orders.get(order_id)

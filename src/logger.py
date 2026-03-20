@@ -30,9 +30,14 @@ except ImportError:  # pragma: no cover
     logger = _FallbackLogger()
 
 
-def setup_logging(log_dir: Path) -> None:
+def setup_logging(
+    log_dir: Path,
+    *,
+    system_filename: str = "system.log",
+    errors_filename: str = "errors.log",
+) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     logger.remove()
-    logger.add(log_dir / "system.log", rotation="5 MB", retention=5, serialize=True)
-    logger.add(log_dir / "errors.log", rotation="5 MB", retention=5, level="ERROR", serialize=True)
+    logger.add(log_dir / system_filename, rotation="5 MB", retention=5, serialize=True)
+    logger.add(log_dir / errors_filename, rotation="5 MB", retention=5, level="ERROR", serialize=True)
     logger.add(lambda message: print(message, end=""), level="INFO")

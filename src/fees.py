@@ -70,6 +70,46 @@ def taker_fee_pct(price: float, *, category: str = "crypto price") -> float:
     return round(taker_fee(price, category=category) * 100.0, 6)
 
 
+def max_profitable_opposite_price(
+    entry_price: float,
+    *,
+    min_net_margin: float = 0.0,
+    category: str = "crypto price",
+) -> float:
+    """
+    Return the highest opposite-side price that still leaves a profitable bracket.
+
+    Solves for ``y`` in:
+
+        1 - x*(1+fee_x) - y*(1+fee_y) >= min_net_margin
+
+    where ``x`` is the already-filled Phase 1 price and ``y`` is the opposite
+    token price we could still buy while meeting the configured minimum locked
+    profit after fees.
+    """
+    x = max(min(float(entry_price), 0.99), 0.01)
+    target_margin = max(float(min_net_margin), 0.0)
+    x_cost = x * (1.0 + taker_fee(x, category=category))
+    threshold = 1.0 - target_margin
+
+    lo = 0.01
+    hi = 0.99
+
+    def _lhs(y: float) -> float:
+        return x_cost + y * (1.0 + taker_fee(y, category=category))
+
+    if _lhs(lo) > threshold:
+        return 0.0
+
+    for _ in range(64):
+        mid = (lo + hi) / 2.0
+        if _lhs(mid) > threshold:
+            hi = mid
+        else:
+            lo = mid
+    return round(lo, 8)
+
+
 def net_edge_after_fees(
     *,
     gross_edge: float,

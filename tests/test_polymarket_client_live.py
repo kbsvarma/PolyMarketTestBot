@@ -110,6 +110,47 @@ def test_place_order_retries_with_preferred_signature_type(monkeypatch: pytest.M
     assert result["signature_type_used"] == 1
 
 
+def test_place_order_preserves_underlying_transport_error_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _DummyOrderArgs:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+
+    class _DummyOrderType:
+        GTC = "GTC"
+
+    class _TransportSdkClient:
+        def __init__(self) -> None:
+            self.builder = type("Builder", (), {"sig_type": 1})()
+
+        def create_order(self, order_args: object) -> dict[str, object]:
+            return {"signed": True}
+
+        def post_order(self, signed_order: object, order_type: object) -> dict[str, object]:
+            raise ValueError("Request exception!")
+
+        def get_order(self, order_id: str) -> dict[str, object]:
+            return {"id": order_id, "status": "RESTING"}
+
+        def cancel(self, order_id: str) -> dict[str, object]:
+            return {"id": order_id, "status": "CANCELLED"}
+
+        def get_orders(self) -> list[dict[str, object]]:
+            return []
+
+    client = PolymarketClient(_live_config())
+    client._sdk_client = _TransportSdkClient()
+    monkeypatch.setattr(polymarket_client_module, "OrderArgs", _DummyOrderArgs)
+    monkeypatch.setattr(polymarket_client_module, "OrderType", _DummyOrderType)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        asyncio.run(client.place_buy_order("token-1", 0.51, 5.0, "PASSIVE_LIMIT", client_order_id="cid-1"))
+
+    message = str(exc_info.value)
+    assert "ValueError" in message
+    assert "Request exception!" in message
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
 def test_get_open_orders_normalizes_remaining_size_from_original_size() -> None:
     class _OrderSdkClient:
         def __init__(self) -> None:

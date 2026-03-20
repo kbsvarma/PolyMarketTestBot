@@ -15,7 +15,7 @@ def test_report_header_uses_share_sizing(tmp_path) -> None:
     )
 
     content = report_path.read_text(encoding="utf-8")
-    assert "Configured Share Size:** 10.0 shares per signal" in content
+    assert "Configured Target Share Size:** 10.0 shares per signal" in content
     assert "Hypothetical Bet Size" not in content
 
 
@@ -388,6 +388,63 @@ def test_report_shows_hard_exit_reason_and_fill_price(tmp_path) -> None:
     assert "Hard exit:** reason=`FINAL_30S_LOSS` fill=0.599" in content
 
 
+def test_live_report_shows_phase2_reclaim_attempt_failure_and_execution_refs(tmp_path) -> None:
+    report_path = tmp_path / "window_report.md"
+    eval_path = tmp_path / "evaluations.jsonl"
+    eval_path.write_text("", encoding="utf-8")
+    writer = WindowReportWriter(
+        report_path=str(report_path),
+        report_shares=10.0,
+        live_execution=True,
+        execution_mode="live",
+        window_duration_seconds=300,
+    )
+
+    writer.record_window_close(
+        window_ts=1_700_000_000,
+        asset="BTC",
+        asset_open=84_000.0,
+        asset_close=83_900.0,
+        yes_ask_final=0.45,
+        no_ask_final=0.55,
+        last_signal_event={
+            "momentum_side": "NO",
+            "entry_model": "lag",
+            "momentum_price": 0.58,
+            "observation": {
+                "safe_opposite_price": 0.31,
+                "dipped_below_safe_price": True,
+                "phase2_reclaim_seen": True,
+                "phase2_trigger_price": 0.31,
+                "min_momentum_price": 0.52,
+            },
+        },
+        eval_log_path=str(eval_path),
+        yes_won=False,
+        execution_summary={
+            "phase": "HARD_EXITED",
+            "execution_mode": "live",
+            "position_id": "pos-1",
+            "p1_order_id": "order-p1",
+            "phase1_filled": True,
+            "phase2_filled": False,
+            "phase2_reclaim_seen": True,
+            "phase2_order_attempted": True,
+            "safe_opposite_price": 0.31,
+            "actual_pnl_usd": -1.09,
+            "p1_shares": 10.0,
+            "p1_fill_price": 0.60,
+            "hard_exit_reason": "STOP_50C",
+            "hard_exit_fill_price": 0.50,
+            "hard_exit_order_ids": ["order-exit-1"],
+        },
+    )
+
+    content = report_path.read_text(encoding="utf-8")
+    assert "Phase 2:** ⚠ Reclaim seen @ 0.310, but the live Phase 2 order did not fill" in content
+    assert "Execution refs:** position=`pos-1` phase1_order=`order-p1` hard_exit_orders=`order-exit-1`" in content
+
+
 def test_report_prefers_executed_signal_metadata_over_later_snapshot(tmp_path) -> None:
     report_path = tmp_path / "window_report.md"
     eval_path = tmp_path / "evaluations.jsonl"
@@ -443,6 +500,55 @@ def test_report_prefers_executed_signal_metadata_over_later_snapshot(tmp_path) -
     assert "Phase 2:** ⏳ Safe level armed @ 0.340, extension confirmed, but reclaim never completed" in content
     assert "Hard exit:** reason=`STOP_50C` fill=0.460" in content
     assert "hard-exit capped (sold @ 50¢)" not in content
+
+
+def test_report_calls_out_unfilled_hard_exit_attempt_before_close(tmp_path) -> None:
+    report_path = tmp_path / "window_report.md"
+    eval_path = tmp_path / "evaluations.jsonl"
+    eval_path.write_text("", encoding="utf-8")
+    writer = WindowReportWriter(
+        report_path=str(report_path),
+        report_shares=10.0,
+        live_execution=True,
+        window_duration_seconds=300,
+    )
+
+    writer.record_window_close(
+        window_ts=1_700_000_000,
+        asset="BTC",
+        asset_open=84_000.0,
+        asset_close=83_900.0,
+        yes_ask_final=0.45,
+        no_ask_final=0.55,
+        last_signal_event={
+            "momentum_side": "YES",
+            "entry_model": "continuation",
+            "momentum_price": 0.60,
+            "observation": {
+                "safe_opposite_price": 0.39,
+                "dipped_below_safe_price": True,
+                "phase2_reclaim_seen": False,
+            },
+        },
+        eval_log_path=str(eval_path),
+        yes_won=False,
+        execution_summary={
+            "phase": "PHASE1_ONLY_CLOSED",
+            "execution_mode": "live",
+            "phase1_filled": True,
+            "phase2_filled": False,
+            "phase2_order_attempted": False,
+            "hard_exit_attempted": True,
+            "hard_exit_reason": "STOP_50C",
+            "hard_exit_fill_price": 0.0,
+            "actual_pnl_usd": -6.05,
+            "p1_shares": 10.0,
+            "p1_fill_price": 0.60,
+        },
+    )
+
+    content = report_path.read_text(encoding="utf-8")
+    assert "Hard exit:** attempted (reason=`STOP_50C`), but no live sell filled before close" in content
 
 
 def test_report_uses_dominant_blocker_and_near_misses_for_no_signal(tmp_path) -> None:

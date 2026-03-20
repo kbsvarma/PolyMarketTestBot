@@ -51,11 +51,14 @@ class PolymarketClient:
         self.gamma_url = config.endpoints.gamma_base_url.rstrip("/")
         self.data_url = config.endpoints.data_base_url.rstrip("/")
         self.headers = {"User-Agent": config.endpoints.user_agent}
-        self.client = httpx.AsyncClient(timeout=12.0, headers=self.headers) if httpx else None
+        self.client = self._build_http_client()
         self._sdk_init_error = ""
         self._preferred_signature_type: int | None = config.env.polymarket_signature_type
         self._sdk_client = self._build_sdk_client()
         self._bootstrap_live_order_signature_preferences()
+
+    def _build_http_client(self) -> Any:
+        return httpx.AsyncClient(timeout=12.0, headers=self.headers) if httpx else None
 
     def _build_sdk_client(self) -> Any:
         if ClobClient is None:
@@ -110,6 +113,40 @@ class PolymarketClient:
     async def close(self) -> None:
         if self.client:
             await self.client.aclose()
+
+    async def refresh_live_order_session(self) -> dict[str, Any]:
+        """
+        Rebuild the async HTTP client and SDK order client after a transient
+        transport failure so the next Phase 1 retry is not reusing a bad
+        connection/session state.
+        """
+        previous_signature_type = self._preferred_signature_type
+        previous_http_client = self.client
+        if previous_http_client is not None:
+            try:
+                await previous_http_client.aclose()
+            except Exception:
+                pass
+
+        self.client = self._build_http_client()
+        self._sdk_client = self._build_sdk_client()
+        if self._sdk_client is None:
+            return {
+                "refreshed": False,
+                "sdk_ready": False,
+                "sdk_error": self._sdk_init_error or "sdk client unavailable after refresh",
+            }
+        if previous_signature_type is not None:
+            try:
+                self._set_order_signature_type(previous_signature_type)
+            except Exception:
+                pass
+        self._bootstrap_live_order_signature_preferences()
+        return {
+            "refreshed": True,
+            "sdk_ready": True,
+            "signature_type": self._extract_sdk_signature_type(),
+        }
 
     def _to_float(self, value: Any) -> float:
         try:
@@ -413,9 +450,15 @@ class PolymarketClient:
             "source_quality": SourceQuality.REAL_PUBLIC_DATA.value,
         }
 
-    def _allowance_params_variants(self) -> list[Any]:
+    def _allowance_params_variants(
+        self,
+        *,
+        asset_type: Any | None = None,
+        token_id: str | None = None,
+    ) -> list[Any]:
         if BalanceAllowanceParams is None or AssetType is None:
             return []
+        asset_type = asset_type or AssetType.COLLATERAL
         signature_type = getattr(getattr(self, "_sdk_client", None), "builder", None)
         signature_type = getattr(signature_type, "sig_type", None)
         configured_signature_type = self.config.env.polymarket_signature_type
@@ -423,9 +466,9 @@ class PolymarketClient:
         variants = []
         for value in signature_types:
             if value is None:
-                variants.append(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+                variants.append(BalanceAllowanceParams(asset_type=asset_type, token_id=token_id))
             else:
-                variants.append(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=value))
+                variants.append(BalanceAllowanceParams(asset_type=asset_type, token_id=token_id, signature_type=value))
         seen: set[tuple[str, str, object]] = set()
         deduped: list[Any] = []
         for params in variants:
@@ -500,6 +543,60 @@ class PolymarketClient:
                 1 if item.get("query_method") == "get_balance_allowance" else 0,
             ),
         )
+
+    async def ensure_token_sell_allowance(self, token_id: str) -> dict[str, Any]:
+        """
+        Refresh spendability for a conditional token before live sell orders.
+
+        Buy orders spend collateral; sell orders spend the conditional token
+        balance itself. The live stop path must therefore ensure conditional
+        token allowance is refreshed, otherwise Polymarket can reject the sell
+        with "not enough balance / allowance" even though the position exists.
+        """
+        if self._sdk_client is None or not token_id:
+            return {}
+        if not hasattr(self._sdk_client, "update_balance_allowance"):
+            return {}
+        attempts: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for params in self._allowance_params_variants(
+            asset_type=AssetType.CONDITIONAL,
+            token_id=token_id,
+        ):
+            try:
+                payload = self._sdk_client.update_balance_allowance(params)
+                normalized = self._normalize_allowance_payload(payload)
+                normalized["query_method"] = "update_balance_allowance"
+                normalized["query_params"] = {
+                    "asset_type": str(getattr(params, "asset_type", "")),
+                    "token_id": str(getattr(params, "token_id", "")),
+                    "signature_type": getattr(params, "signature_type", None),
+                }
+                attempts.append(normalized)
+            except Exception as exc:
+                errors.append(f"update_balance_allowance:{exc}")
+        if not attempts and hasattr(self._sdk_client, "get_balance_allowance"):
+            for params in self._allowance_params_variants(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+            ):
+                try:
+                    payload = self._sdk_client.get_balance_allowance(params)
+                    normalized = self._normalize_allowance_payload(payload)
+                    normalized["query_method"] = "get_balance_allowance"
+                    normalized["query_params"] = {
+                        "asset_type": str(getattr(params, "asset_type", "")),
+                        "token_id": str(getattr(params, "token_id", "")),
+                        "signature_type": getattr(params, "signature_type", None),
+                    }
+                    attempts.append(normalized)
+                except Exception as exc:
+                    errors.append(f"get_balance_allowance:{exc}")
+        if not attempts:
+            raise RuntimeError("; ".join(errors) if errors else "conditional allowance refresh unavailable")
+        best = self._best_allowance_attempt(attempts)
+        best["query_errors"] = errors
+        return best
 
     async def _rpc_call(self, method: str, params: list[Any]) -> Any:
         if not self.client:
@@ -1035,9 +1132,18 @@ class PolymarketClient:
             raise RuntimeError("LIVE_TRADING_ENABLED is false.")
         if self._sdk_client is None or OrderArgs is None or OrderType is None:
             raise RuntimeError("py-clob-client is required for real live order placement.")
+        if side == "SELL":
+            try:
+                await self.ensure_token_sell_allowance(token_id)
+            except Exception:
+                # We still attempt the sell, but refreshing here materially
+                # improves the odds that stop-loss exits can be placed live.
+                pass
         order_type = OrderType.GTC
         if hasattr(OrderType, "FOK") and entry_style == "FOLLOW_TAKER":
             order_type = OrderType.FOK
+        elif hasattr(OrderType, "FAK") and entry_style == "FOLLOW_TAKER_PARTIAL":
+            order_type = OrderType.FAK
         order_args = OrderArgs(
             price=price,
             size=size,
@@ -1045,6 +1151,7 @@ class PolymarketClient:
             token_id=token_id,
         )
         errors: list[str] = []
+        last_exception: Exception | None = None
         for signature_type in self._order_signature_type_candidates():
             try:
                 self._set_order_signature_type(signature_type)
@@ -1072,10 +1179,12 @@ class PolymarketClient:
                     "signature_type_used": self._extract_sdk_signature_type(),
                 }
             except Exception as exc:
-                errors.append(f"signature_type={signature_type}:{exc}")
+                error_type = f"{exc.__class__.__module__}.{exc.__class__.__name__}"
+                errors.append(f"signature_type={signature_type}:{error_type}:{exc}")
+                last_exception = exc
                 if "invalid signature" not in str(exc).lower():
                     break
-        raise RuntimeError(f"Real live order placement failed: {'; '.join(errors)}")
+        raise RuntimeError(f"Real live order placement failed: {'; '.join(errors)}") from last_exception
 
     async def place_buy_order(self, token_id: str, price: float, size: float, entry_style: str, client_order_id: str | None = None) -> dict[str, Any]:
         return await self.place_order(token_id=token_id, price=price, size=size, side="BUY", entry_style=entry_style, client_order_id=client_order_id)

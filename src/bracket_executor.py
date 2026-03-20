@@ -59,7 +59,7 @@ except ImportError:
     import logging
     logger = logging.getLogger(__name__)  # type: ignore[assignment]
 
-from src.fees import taker_fee
+from src.fees import max_profitable_opposite_price, taker_fee
 from src.models import BracketSignalEvent
 
 
@@ -95,8 +95,9 @@ class BracketPosition:
 
     # ── Phase 1 ──────────────────────────────────────────────────────────
     p1_token_id:     str
+    p1_initial_shares: float      # original number of shares requested
     p1_price:        float        # price at which the order was placed
-    p1_shares:       float        # number of shares
+    p1_shares:       float        # remaining open shares
     p1_notional_usd: float        # p1_price * p1_shares
     p1_order_id:     str = ""
     p1_fill_price:   float = 0.0  # actual fill price (= p1_price for FOLLOW_TAKER)
@@ -123,6 +124,8 @@ class BracketPosition:
     hard_exit_last_attempt_ts: float = 0.0
     hard_exit_reason:     str = ""
     hard_exit_fill_price: float = 0.0
+    hard_exit_filled_shares: float = 0.0
+    hard_exit_order_ids:  list[str] = field(default_factory=list)
 
     # ── Outcome (filled at window close) ─────────────────────────────────
     outcome:        str   = ""    # "YES_WINS" | "NO_WINS" | "UNKNOWN"
@@ -146,6 +149,8 @@ class BracketExecutor:
     """
 
     _P2_RETRY_COOLDOWN = 15.0   # seconds between Phase 2 retry attempts per position
+    _SELL_POSITION_VISIBILITY_WAIT_SECONDS = 0.75
+    _SELL_POSITION_VISIBILITY_POLL_SECONDS = 0.10
 
     def __init__(self, cfg: Any, client: Any) -> None:
         self._cfg = cfg
@@ -180,6 +185,16 @@ class BracketExecutor:
     def _normalized_status(payload: dict[str, Any]) -> str:
         return str(payload.get("status") or payload.get("state") or "").upper()
 
+    @staticmethod
+    def _reported_filled_size(payload: dict[str, Any], fallback_size: float = 0.0) -> float:
+        try:
+            filled_size = float(payload.get("filled_size") or 0.0)
+        except (TypeError, ValueError):
+            filled_size = 0.0
+        if filled_size > 1e-6:
+            return filled_size
+        return max(float(fallback_size or 0.0), 0.0)
+
     async def _confirm_follow_taker_fill(
         self,
         *,
@@ -187,6 +202,7 @@ class BracketExecutor:
         order_id: str,
         expected_size: float,
         fallback_price: float,
+        allow_partial: bool = False,
     ) -> tuple[bool, float, dict[str, Any]]:
         """
         Confirm that a FOLLOW_TAKER / FOK submission actually filled.
@@ -205,6 +221,8 @@ class BracketExecutor:
             remaining = float(last_payload.get("remaining_size") or 0.0)
 
             if self._filled_enough(filled_size, expected_size):
+                return True, avg_fill, last_payload
+            if allow_partial and filled_size > 1e-6:
                 return True, avg_fill, last_payload
             if status in {"FILLED", "MATCHED"} and remaining <= 1e-6:
                 return True, avg_fill, last_payload
@@ -226,6 +244,453 @@ class BracketExecutor:
                 break
 
         return False, 0.0, last_payload
+
+    async def _get_orderbook_for_retry(self, token_id: str):
+        getter = getattr(self._client, "get_orderbook", None)
+        if callable(getter):
+            return await getter(token_id)
+        inner_client = getattr(self._client, "_client", None)
+        inner_getter = getattr(inner_client, "get_orderbook", None)
+        if callable(inner_getter):
+            return await inner_getter(token_id)
+        return None
+
+    async def _marketable_book_context(
+        self,
+        *,
+        token_id: str,
+        limit_price: float,
+        shares: float,
+        side: str,
+    ) -> dict[str, Any]:
+        try:
+            orderbook = await self._get_orderbook_for_retry(token_id)
+        except Exception as exc:
+            return {"orderbook_error": str(exc)}
+        if orderbook is None:
+            return {}
+
+        if side == "SELL":
+            levels = list(getattr(orderbook, "bids", []) or [])
+        else:
+            levels = list(getattr(orderbook, "asks", []) or [])
+        best_price = float(levels[0].price) if levels else 0.0
+        marketable_depth = 0.0
+        for level in levels:
+            level_price = float(level.price)
+            marketable = level_price >= limit_price if side == "SELL" else level_price <= limit_price
+            if not marketable:
+                break
+            marketable_depth += float(level.size)
+        executable_shares = min(float(shares), marketable_depth)
+
+        return {
+            "best_price": round(best_price, 6),
+            "marketable_depth": round(marketable_depth, 6),
+            "executable_shares": round(executable_shares, 6),
+            "marketable_now": bool(best_price > 0 and executable_shares + 1e-9 >= shares),
+        }
+
+    async def _phase1_retry_context(
+        self,
+        *,
+        token_id: str,
+        limit_price: float,
+        shares: float,
+    ) -> dict[str, Any]:
+        context = await self._marketable_book_context(
+            token_id=token_id,
+            limit_price=limit_price,
+            shares=shares,
+            side="BUY",
+        )
+        if not context:
+            return context
+        return {
+            "best_ask": context.get("best_price", 0.0),
+            "marketable_depth": context.get("marketable_depth", 0.0),
+            "marketable_now": bool(context.get("marketable_now", False)),
+            "executable_shares": context.get("executable_shares", 0.0),
+        }
+
+    def _phase1_retry_ceiling(self, event: BracketSignalEvent, initial_limit: float) -> float:
+        retry_to_cap = bool(getattr(self._cfg, "phase1_follow_taker_retry_to_strategy_cap", False))
+        if not retry_to_cap:
+            return round(initial_limit, 4)
+
+        strategy_cap = float(getattr(self._cfg, "entry_range_high", initial_limit) or initial_limit)
+        entry_model = str(event.entry_model or "").lower()
+        if entry_model == "continuation":
+            continuation_cap = float(
+                getattr(self._cfg, "continuation_max_momentum_price", strategy_cap) or strategy_cap
+            )
+            strategy_cap = min(strategy_cap, continuation_cap)
+        elif entry_model == "band_touch":
+            band_cap = float(
+                getattr(self._cfg, "immediate_band_entry_high", strategy_cap) or strategy_cap
+            )
+            strategy_cap = min(strategy_cap, band_cap)
+        return round(max(initial_limit, min(0.99, strategy_cap)), 4)
+
+    @staticmethod
+    def _exception_diagnostics(exc: BaseException) -> dict[str, str]:
+        cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+        details = {
+            "exception_type": exc.__class__.__name__,
+            "exception_source": f"{exc.__class__.__module__}.{exc.__class__.__name__}",
+            "exception_message": str(exc),
+            "cause_type": "",
+            "cause_source": "",
+            "cause_message": "",
+        }
+        if cause is not None:
+            details["cause_type"] = cause.__class__.__name__
+            details["cause_source"] = f"{cause.__class__.__module__}.{cause.__class__.__name__}"
+            details["cause_message"] = str(cause)
+        return details
+
+    @staticmethod
+    def _is_request_exception_failure(*, error: str = "", details: dict[str, str] | None = None) -> bool:
+        text = (error or "").lower()
+        if "request exception" in text or "status_code=none" in text:
+            return True
+        if not details:
+            return False
+        cause_message = str(details.get("cause_message") or "").lower()
+        return "request exception" in cause_message or "status_code=none" in cause_message
+
+    async def _refresh_client_for_retry(self) -> dict[str, Any]:
+        refresher = getattr(self._client, "refresh_live_order_session", None)
+        if not callable(refresher):
+            return {"attempted": False, "ok": False, "reason": "refresh_unavailable"}
+        try:
+            payload = await refresher()
+            if isinstance(payload, dict):
+                return {
+                    "attempted": True,
+                    "ok": bool(payload.get("refreshed", True)),
+                    **payload,
+                }
+            return {"attempted": True, "ok": True}
+        except Exception as exc:
+            details = self._exception_diagnostics(exc)
+            return {
+                "attempted": True,
+                "ok": False,
+                **details,
+            }
+
+    @staticmethod
+    def _should_retry_follow_taker_failure(*, status: str = "", error: str = "") -> bool:
+        text = (error or "").lower()
+        normalized = (status or "").upper()
+        if "fully filled or killed" in text or "couldn't be fully filled" in text:
+            return True
+        if normalized in {"CANCELLED", "EXPIRED"}:
+            return True
+        return False
+
+    @staticmethod
+    def _is_allowance_failure(error: str) -> bool:
+        text = (error or "").lower()
+        return "not enough balance / allowance" in text or "not enough balance" in text
+
+    @staticmethod
+    def _round_shares(size: float) -> float:
+        return round(max(size, 0.0), 3)
+
+    @staticmethod
+    def _extract_position_quantity(payload: dict[str, Any]) -> float:
+        candidates = [
+            payload.get("quantity"),
+            payload.get("size"),
+            payload.get("shares"),
+            payload.get("balance"),
+            payload.get("remaining_size"),
+            payload.get("filled_size"),
+        ]
+        raw = payload.get("raw")
+        if isinstance(raw, dict):
+            candidates.extend(
+                [
+                    raw.get("quantity"),
+                    raw.get("size"),
+                    raw.get("shares"),
+                    raw.get("balance"),
+                ]
+            )
+        for candidate in candidates:
+            try:
+                value = float(candidate or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return round(value, 6)
+        return 0.0
+
+    @staticmethod
+    def _extract_position_average_price(payload: dict[str, Any], fallback_price: float) -> float:
+        candidates = [
+            payload.get("avg_price"),
+            payload.get("avgPrice"),
+            payload.get("average_price"),
+            payload.get("averagePrice"),
+            payload.get("average_fill_price"),
+            payload.get("entry_price"),
+            payload.get("entryPrice"),
+            payload.get("price"),
+        ]
+        raw = payload.get("raw")
+        if isinstance(raw, dict):
+            candidates.extend(
+                [
+                    raw.get("avg_price"),
+                    raw.get("avgPrice"),
+                    raw.get("average_price"),
+                    raw.get("averagePrice"),
+                    raw.get("entry_price"),
+                    raw.get("entryPrice"),
+                    raw.get("price"),
+                ]
+            )
+        for candidate in candidates:
+            try:
+                value = float(candidate or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return round(value, 6)
+        return round(max(fallback_price, 0.0), 6)
+
+    async def _available_token_position_shares(self, token_id: str) -> float | None:
+        """
+        Return the currently visible wallet balance for a conditional token.
+
+        This is used by the live hard-exit path so we do not keep trying to
+        sell more shares than Polymarket currently recognizes as spendable.
+        Returns:
+          - float >= 0 when position visibility is available
+          - None when position visibility could not be queried at all
+        """
+        get_positions = getattr(self._client, "get_positions", None)
+        if not callable(get_positions) or not token_id:
+            return None
+
+        try:
+            positions = await get_positions()
+        except Exception:
+            return None
+
+        best_qty = 0.0
+        saw_match = False
+        for item in positions or []:
+            item_token_id = str(
+                item.get("token_id")
+                or item.get("asset")
+                or item.get("asset_id")
+                or item.get("tokenId")
+                or ""
+            )
+            if item_token_id != token_id:
+                continue
+            saw_match = True
+            qty = self._extract_position_quantity(item)
+            if qty > best_qty:
+                best_qty = qty
+        if not saw_match:
+            return None
+        return round(best_qty, 6)
+
+    async def _wait_for_visible_token_position(
+        self,
+        token_id: str,
+        *,
+        min_shares: float = 0.001,
+        timeout_seconds: float | None = None,
+    ) -> float | None:
+        """
+        Wait briefly for a freshly bought conditional token to become spendable.
+
+        Phase 1 can fill before the token balance is immediately visible to
+        Polymarket's sell path. Hard exits should therefore poll for spendable
+        token visibility after an allowance refresh instead of immediately
+        assuming the position cannot be sold.
+        """
+        if not token_id:
+            return None
+
+        timeout = (
+            self._SELL_POSITION_VISIBILITY_WAIT_SECONDS
+            if timeout_seconds is None
+            else max(float(timeout_seconds), 0.0)
+        )
+        poll_seconds = max(float(self._SELL_POSITION_VISIBILITY_POLL_SECONDS), 0.0)
+        deadline = time.monotonic() + timeout
+        last_visible: float | None = None
+
+        while True:
+            visible = await self._available_token_position_shares(token_id)
+            if visible is not None:
+                last_visible = visible
+                if visible + 1e-6 >= max(min_shares, 0.0):
+                    return visible
+            if time.monotonic() >= deadline or poll_seconds <= 0:
+                break
+            await asyncio.sleep(poll_seconds)
+
+        return last_visible
+
+    async def _prime_token_sell_readiness(self, token_id: str) -> None:
+        """
+        Best-effort sell-side allowance refresh right after Phase 1 fills.
+
+        This keeps the signal path intact while improving the odds that a fast
+        5-minute hard exit can sell the newly bought token immediately.
+        """
+        ensure_allowance = getattr(self._client, "ensure_token_sell_allowance", None)
+        if not callable(ensure_allowance) or not token_id:
+            return
+        try:
+            await ensure_allowance(token_id)
+        except Exception as exc:
+            logger.warning(
+                "BracketExecutor: post-fill sell readiness refresh failed  token={} error={}",
+                token_id,
+                exc,
+            )
+
+    async def _reconcile_ambiguous_phase1_submission(
+        self,
+        *,
+        token_id: str,
+        market_id: str,
+        client_order_id: str,
+        min_shares: float,
+        fallback_price: float,
+    ) -> dict[str, Any] | None:
+        get_open_orders = getattr(self._client, "get_open_orders", None)
+        if callable(get_open_orders):
+            try:
+                open_orders = await get_open_orders()
+            except Exception:
+                open_orders = []
+            for item in open_orders or []:
+                if str(item.get("client_order_id") or "") != client_order_id:
+                    continue
+                exchange_order_id = str(item.get("exchange_order_id") or "")
+                if exchange_order_id and hasattr(self._client, "get_order_status"):
+                    try:
+                        status = await self._client.get_order_status(exchange_order_id)
+                    except Exception:
+                        status = {}
+                    filled_size = float(status.get("filled_size") or 0.0)
+                    if filled_size + 1e-9 >= min_shares:
+                        return {
+                            "exchange_order_id": exchange_order_id,
+                            "status": str(status.get("status") or "MATCHED"),
+                            "filled_size": filled_size,
+                            "average_fill_price": float(
+                                status.get("average_fill_price") or fallback_price
+                            ),
+                            "remaining_size": float(status.get("remaining_size") or 0.0),
+                            "raw": status.get("raw") or status,
+                            "reconciled_source": "open_order_status",
+                        }
+
+                filled_size = float(item.get("filled_size") or 0.0)
+                if filled_size + 1e-9 >= min_shares:
+                    return {
+                        "exchange_order_id": exchange_order_id,
+                        "status": str(item.get("status") or "MATCHED"),
+                        "filled_size": filled_size,
+                        "average_fill_price": float(item.get("price") or fallback_price),
+                        "remaining_size": float(item.get("remaining_size") or 0.0),
+                        "raw": item,
+                        "reconciled_source": "open_order",
+                    }
+
+        get_positions = getattr(self._client, "get_positions", None)
+        if callable(get_positions):
+            try:
+                positions = await get_positions()
+            except Exception:
+                positions = []
+            best_match: dict[str, Any] | None = None
+            best_qty = 0.0
+            for item in positions or []:
+                item_market_id = str(
+                    item.get("market_id")
+                    or item.get("conditionId")
+                    or item.get("market")
+                    or ""
+                )
+                item_token_id = str(
+                    item.get("token_id")
+                    or item.get("asset")
+                    or item.get("asset_id")
+                    or item.get("tokenId")
+                    or ""
+                )
+                if market_id and item_market_id and item_market_id != market_id:
+                    continue
+                if item_token_id != token_id:
+                    continue
+                qty = self._extract_position_quantity(item)
+                if qty > best_qty:
+                    best_match = item
+                    best_qty = qty
+            if best_match is not None and best_qty + 1e-9 >= min_shares:
+                return {
+                    "exchange_order_id": "",
+                    "status": "MATCHED",
+                    "filled_size": best_qty,
+                    "average_fill_price": self._extract_position_average_price(
+                        best_match,
+                        fallback_price,
+                    ),
+                    "remaining_size": 0.0,
+                    "raw": best_match,
+                    "reconciled_source": "positions",
+                }
+
+        return None
+
+    def _build_hard_exit_attempt_prices(
+        self, primary_sell_price: float, *, include_emergency: bool = False
+    ) -> list[float]:
+        primary_sell_price = round(max(0.01, primary_sell_price), 4)
+        market_through_cents = max(
+            float(getattr(self._cfg, "hard_exit_market_through_cents", 0.02) or 0.0),
+            0.0,
+        )
+        fallback_step_cents = max(
+            float(getattr(self._cfg, "hard_exit_fallback_step_cents", 0.0) or 0.0),
+            0.0,
+        )
+        min_sell_price = round(
+            max(
+                0.01,
+                float(getattr(self._cfg, "hard_exit_min_sell_price", 0.01) or 0.01),
+            ),
+            4,
+        )
+        attempt_prices = [primary_sell_price]
+        fallback_prices: list[float] = []
+        if market_through_cents > 0:
+            fallback_prices.append(
+                round(max(min_sell_price, primary_sell_price - market_through_cents), 4)
+            )
+        has_fallback_ladder = market_through_cents > 0 or fallback_step_cents > 0
+        ladder_floor = min_sell_price
+        if fallback_step_cents > 0 and ladder_floor < primary_sell_price:
+            next_price = primary_sell_price - fallback_step_cents
+            while next_price >= ladder_floor - 1e-9:
+                fallback_prices.append(round(max(ladder_floor, next_price), 4))
+                next_price -= fallback_step_cents
+        for candidate in fallback_prices:
+            if candidate < primary_sell_price and candidate not in attempt_prices:
+                attempt_prices.append(candidate)
+        return attempt_prices
 
     # ================================================================== #
     # PHASE 1 — entry on signal fire
@@ -291,14 +756,28 @@ class BracketExecutor:
 
         # ── Size: fixed share count for parity with the observer report ──
         signal_price = round(event.momentum_price, 4)
-        shares = max(
-            round(self._cfg.phase1_shares, 1),
+        target_shares = max(
+            round(self._cfg.phase1_shares, 3),
             self._cfg.min_bracket_shares,
         )
+        min_shares = max(round(self._cfg.min_bracket_shares, 3), 0.001)
+        shares = target_shares
         position_id = str(uuid.uuid4())[:12]
         entry_style = self._cfg.phase1_entry_style
         chase_cents = max(float(getattr(self._cfg, "phase1_max_chase_cents", 0.0) or 0.0), 0.0)
         entry_price = signal_price
+        strategy_entry_cap = float(getattr(self._cfg, "entry_range_high", 0.99) or 0.99)
+        entry_model = str(event.entry_model or "").lower()
+        if entry_model == "continuation":
+            strategy_entry_cap = min(
+                strategy_entry_cap,
+                float(getattr(self._cfg, "continuation_max_momentum_price", strategy_entry_cap) or strategy_entry_cap),
+            )
+        elif entry_model == "band_touch":
+            strategy_entry_cap = min(
+                strategy_entry_cap,
+                float(getattr(self._cfg, "immediate_band_entry_high", strategy_entry_cap) or strategy_entry_cap),
+            )
         if entry_style == "FOLLOW_TAKER" and chase_cents > 0:
             # Small controlled chase so we can still lock x when the book lifts
             # by a tick between signal snapshot and order submission, but never
@@ -306,7 +785,7 @@ class BracketExecutor:
             entry_price = round(
                 min(
                     0.99,
-                    float(getattr(self._cfg, "entry_range_high", 0.99) or 0.99),
+                    strategy_entry_cap,
                     signal_price + chase_cents,
                 ),
                 4,
@@ -321,41 +800,286 @@ class BracketExecutor:
             shares, entry_price * shares,
         )
 
-        # ── Place order ──────────────────────────────────────────────────
-        try:
-            result = await self._client.place_buy_order(
+        retry_budget = max(int(getattr(self._cfg, "phase1_follow_taker_retry_attempts", 0) or 0), 0)
+        retry_delay = max(float(getattr(self._cfg, "phase1_follow_taker_retry_delay_seconds", 0.0) or 0.0), 0.0)
+        retry_ceiling_price = self._phase1_retry_ceiling(event, entry_price)
+        attempt_log: list[dict[str, Any]] = []
+        result: dict[str, Any] | None = None
+        order_id = ""
+        fill_payload: dict[str, Any] = {}
+        fill_price = 0.0
+        phase1_filled = entry_style != "FOLLOW_TAKER"
+
+        for attempt_index in range(retry_budget + 1):
+            attempt_price = entry_price if attempt_index == 0 else retry_ceiling_price
+            retry_context = await self._phase1_retry_context(
                 token_id=momentum_token_id,
-                price=entry_price,
-                size=shares,
-                entry_style=entry_style,
-                client_order_id=position_id,
+                limit_price=attempt_price,
+                shares=target_shares,
             )
-        except Exception as exc:
-            logger.error("BracketExecutor: Phase 1 FAILED — {}", exc)
+            executable_shares = self._round_shares(float(retry_context.get("executable_shares") or 0.0))
+            if executable_shares + 1e-9 < min_shares:
+                best_ask = float(retry_context.get("best_ask") or 0.0)
+                can_retry_for_lift = (
+                    attempt_index < retry_budget
+                    and retry_ceiling_price > attempt_price + 1e-9
+                    and best_ask > 0.0
+                    and best_ask <= retry_ceiling_price + 1e-9
+                )
+                logger.info(
+                    "BracketExecutor: Phase 1 skipped for thin depth  asset={} position_id={} "
+                    "attempt={} best_ask={} marketable_depth={:.2f} executable={:.3f} "
+                    "min_required={:.3f} limit={:.4f}",
+                    event.asset,
+                    position_id,
+                    attempt_index + 1,
+                    retry_context.get("best_ask", 0.0),
+                    float(retry_context.get("marketable_depth") or 0.0),
+                    executable_shares,
+                    min_shares,
+                    attempt_price,
+                )
+                attempt_log.append(
+                    {
+                        "attempt": attempt_index + 1,
+                        "submit_limit_price": attempt_price,
+                        "status": "RETRY_SKIPPED" if attempt_index > 0 else "DEPTH_TOO_THIN",
+                        "min_required_shares": min_shares,
+                        **retry_context,
+                    }
+                )
+                if can_retry_for_lift:
+                    logger.info(
+                        "BracketExecutor: Phase 1 retrying after thin depth  asset={} "
+                        "position_id={} attempt={} best_ask={:.4f} retry_limit={:.4f}",
+                        event.asset,
+                        position_id,
+                        attempt_index + 1,
+                        best_ask,
+                        retry_ceiling_price,
+                    )
+                    if retry_delay > 0:
+                        await asyncio.sleep(retry_delay)
+                    continue
+                break
+            shares = executable_shares
+
+            try:
+                result = await self._client.place_buy_order(
+                    token_id=momentum_token_id,
+                    price=attempt_price,
+                    size=shares,
+                    entry_style=entry_style,
+                    client_order_id=position_id,
+                )
+            except Exception as exc:
+                error_text = str(exc)
+                error_details = self._exception_diagnostics(exc)
+                request_exception_failure = self._is_request_exception_failure(
+                    error=error_text,
+                    details=error_details,
+                )
+                reconciled_result: dict[str, Any] | None = None
+                retryable = (
+                    entry_style == "FOLLOW_TAKER"
+                    and attempt_index < retry_budget
+                    and not request_exception_failure
+                    and self._should_retry_follow_taker_failure(error=error_text)
+                )
+                refresh_payload: dict[str, Any] = {}
+                if request_exception_failure:
+                    refresh_payload = await self._refresh_client_for_retry()
+                    reconciled_result = await self._reconcile_ambiguous_phase1_submission(
+                        token_id=momentum_token_id,
+                        market_id=event.market_id,
+                        client_order_id=position_id,
+                        min_shares=min_shares,
+                        fallback_price=attempt_price,
+                    )
+                if reconciled_result is not None:
+                    result = reconciled_result
+                    attempt_log.append(
+                        {
+                            "attempt": attempt_index + 1,
+                            "submit_limit_price": attempt_price,
+                            "status": "RECONCILED_MATCHED",
+                            "order_id": str(result.get("exchange_order_id") or ""),
+                            "shares": shares,
+                            "request_exception_retryable": request_exception_failure,
+                            "session_refresh": refresh_payload,
+                            "reconciled_source": result.get("reconciled_source", ""),
+                            **retry_context,
+                        }
+                    )
+                    logger.warning(
+                        "BracketExecutor: Phase 1 recovered ambiguous submission via reconciliation  "
+                        "asset={} position_id={} attempt={} limit={:.4f} source={} refresh_ok={}",
+                        event.asset,
+                        position_id,
+                        attempt_index + 1,
+                        attempt_price,
+                        result.get("reconciled_source", "unknown"),
+                        refresh_payload.get("ok", False) if refresh_payload else "n/a",
+                    )
+                else:
+                    attempt_log.append(
+                        {
+                            "attempt": attempt_index + 1,
+                            "submit_limit_price": attempt_price,
+                            "status": "ORDER_FAILED",
+                            "error": error_text,
+                            **error_details,
+                            "retryable": retryable,
+                            "request_exception_retryable": request_exception_failure,
+                            "session_refresh": refresh_payload,
+                            **retry_context,
+                        }
+                    )
+                    if retryable:
+                        logger.info(
+                            "BracketExecutor: Phase 1 retrying after order failure  asset={} "
+                            "position_id={} attempt={} limit={:.4f} error={} "
+                            "exception_source={} cause_source={} refresh_ok={}",
+                            event.asset,
+                            position_id,
+                            attempt_index + 1,
+                            attempt_price,
+                            error_text,
+                            error_details["exception_source"],
+                            error_details["cause_source"] or "-",
+                            refresh_payload.get("ok", False) if refresh_payload else "n/a",
+                        )
+                        if retry_delay > 0 and not request_exception_failure:
+                            await asyncio.sleep(retry_delay)
+                        continue
+
+                    logger.error("BracketExecutor: Phase 1 FAILED — {}", error_text)
+                    self._audit({
+                        "type": "PHASE1_ORDER_FAILED",
+                        "position_id": position_id,
+                        "event_id": event.event_id,
+                        "asset": event.asset,
+                        "entry_price": attempt_price,
+                        "shares": shares,
+                        "error": error_text,
+                        **error_details,
+                        "attempt_log": attempt_log,
+                    })
+                    self._cache_signal_attempt_summary(
+                        event=event,
+                        position_id=position_id,
+                        phase="PHASE1_ORDER_FAILED",
+                        shares=shares,
+                        requested_price=attempt_price,
+                    )
+                    return False
+
+            order_id = result.get("exchange_order_id", "")
+            raw_status = str(result.get("status") or "").upper()
+            logger.info(
+                "BracketExecutor: Phase 1 placed  order_id={}  raw_status={} attempt={}",
+                order_id, raw_status, attempt_index + 1,
+            )
+
+            # FOLLOW_TAKER = FOK. Submission success is not enough; explicitly
+            # confirm that the order filled before we credit the position.
+            if entry_style == "FOLLOW_TAKER":
+                filled, fill_price, fill_payload = await self._confirm_follow_taker_fill(
+                    order_result=result,
+                    order_id=order_id,
+                    expected_size=shares,
+                    fallback_price=attempt_price,
+                )
+                if not filled:
+                    attempt_status = self._normalized_status(fill_payload)
+                    attempt_log.append(
+                        {
+                            "attempt": attempt_index + 1,
+                            "submit_limit_price": attempt_price,
+                            "order_id": order_id,
+                            "status": attempt_status,
+                            "shares": shares,
+                            "fill_payload": fill_payload,
+                            **retry_context,
+                        }
+                    )
+                    if (
+                        attempt_index < retry_budget
+                        and self._should_retry_follow_taker_failure(
+                            status=attempt_status,
+                            error=str(fill_payload.get("error") or ""),
+                        )
+                    ):
+                        logger.info(
+                            "BracketExecutor: Phase 1 retrying after non-fill  asset={} "
+                            "position_id={} attempt={} limit={:.4f} status={}",
+                            event.asset,
+                            position_id,
+                            attempt_index + 1,
+                            attempt_price,
+                            attempt_status,
+                        )
+                        if retry_delay > 0:
+                            await asyncio.sleep(retry_delay)
+                        continue
+
+                    logger.warning(
+                        "BracketExecutor: Phase 1 not filled after submission  "
+                        "asset={} status={} order_id={} position_id={}",
+                        event.asset,
+                        attempt_status,
+                        order_id,
+                        position_id,
+                    )
+                    self._audit({
+                        "type": "PHASE1_NOT_FILLED",
+                        "position_id": position_id,
+                        "event_id": event.event_id,
+                        "asset": event.asset,
+                        "signal_price": signal_price,
+                        "submit_limit_price": attempt_price,
+                        "order_id": order_id,
+                        "shares": shares,
+                        "status": attempt_status,
+                        "fill_payload": fill_payload,
+                        "attempt_log": attempt_log,
+                    })
+                    self._cache_signal_attempt_summary(
+                        event=event,
+                        position_id=position_id,
+                        phase="PHASE1_NOT_FILLED",
+                        shares=shares,
+                        requested_price=attempt_price,
+                    )
+                    return False
+
+                entry_price = attempt_price
+                phase1_filled = True
+                break
+            break
+
+        if result is None or not phase1_filled:
+            last_attempt = attempt_log[-1] if attempt_log else {}
             self._audit({
-                "type": "PHASE1_ORDER_FAILED",
+                "type": "PHASE1_NOT_FILLED",
                 "position_id": position_id,
                 "event_id": event.event_id,
                 "asset": event.asset,
-                "entry_price": entry_price,
+                "signal_price": signal_price,
+                "submit_limit_price": entry_price,
+                "status": str(last_attempt.get("status") or "RETRY_SKIPPED"),
                 "shares": shares,
-                "error": str(exc),
+                "fill_payload": fill_payload,
+                "attempt_log": attempt_log,
             })
             self._cache_signal_attempt_summary(
                 event=event,
                 position_id=position_id,
-                phase="PHASE1_ORDER_FAILED",
+                phase="PHASE1_NOT_FILLED",
                 shares=shares,
                 requested_price=entry_price,
             )
             return False
-
-        order_id = result.get("exchange_order_id", "")
-        raw_status = str(result.get("status") or "").upper()
-        logger.info(
-            "BracketExecutor: Phase 1 placed  order_id={}  raw_status={}",
-            order_id, raw_status,
-        )
 
         # ── Record position ───────────────────────────────────────────────
         pos = BracketPosition(
@@ -368,6 +1092,7 @@ class BracketExecutor:
             entry_model=event.entry_model,
             signal_price=signal_price,
             p1_token_id=momentum_token_id,
+            p1_initial_shares=shares,
             p1_price=entry_price,
             p1_shares=shares,
             p1_notional_usd=round(entry_price * shares, 4),
@@ -375,53 +1100,17 @@ class BracketExecutor:
             p2_token_id=opposite_token_id,
         )
 
-        # FOLLOW_TAKER = FOK. Submission success is not enough; explicitly
-        # confirm that the order filled before we credit the position.
         if entry_style == "FOLLOW_TAKER":
-            filled, fill_price, fill_payload = await self._confirm_follow_taker_fill(
-                order_result=result,
-                order_id=order_id,
-                expected_size=shares,
-                fallback_price=entry_price,
-            )
-            if not filled:
-                logger.warning(
-                    "BracketExecutor: Phase 1 not filled after submission  "
-                    "asset={} status={} order_id={} position_id={}",
-                    event.asset,
-                    self._normalized_status(fill_payload),
-                    order_id,
-                    position_id,
-                )
-                self._audit({
-                    "type": "PHASE1_NOT_FILLED",
-                    "position_id": position_id,
-                    "event_id": event.event_id,
-                    "asset": event.asset,
-                    "signal_price": signal_price,
-                    "submit_limit_price": entry_price,
-                    "order_id": order_id,
-                    "status": self._normalized_status(fill_payload),
-                    "fill_payload": fill_payload,
-                })
-                self._cache_signal_attempt_summary(
-                    event=event,
-                    position_id=position_id,
-                    phase="PHASE1_NOT_FILLED",
-                    shares=shares,
-                    requested_price=entry_price,
-                )
-                return False
-
             pos.phase = BracketPhase.PHASE1_FILLED
             pos.p1_fill_price = fill_price
             pos.p1_filled_at = time.time()
             pos.p1_notional_usd = round(pos.p1_fill_price * shares, 4)
+            await self._prime_token_sell_readiness(pos.p1_token_id)
             logger.info(
                 "BracketExecutor: Phase 1 FILLED (FOLLOW_TAKER)  "
                 "asset={}  fill_price={:.4f}  signal_price={:.4f} "
-                "submit_limit={:.4f}  position_id={}",
-                event.asset, pos.p1_fill_price, signal_price, entry_price, position_id,
+                "submit_limit={:.4f} shares={:.3f}  position_id={}",
+                event.asset, pos.p1_fill_price, signal_price, entry_price, shares, position_id,
             )
             self._audit({
                 "type": "PHASE1_FILLED",
@@ -431,8 +1120,10 @@ class BracketExecutor:
                 "fill_price": pos.p1_fill_price,
                 "signal_price": signal_price,
                 "submit_limit_price": entry_price,
+                "shares": shares,
                 "style": "FOLLOW_TAKER",
                 "execution_mode": self.execution_mode,
+                "attempt_log": attempt_log,
             })
         # PASSIVE_LIMIT: stays PHASE1_PENDING; tick() polls for fill.
 
@@ -526,7 +1217,7 @@ class BracketExecutor:
                 # Hard exit check takes priority over Phase 2.
                 # If it fires, phase becomes HARD_EXITED and Phase 2 is skipped.
                 await self._check_hard_exit(pos, yes_ask, no_ask, yes_bid=yes_bid, no_bid=no_bid)
-                if pos.phase == BracketPhase.PHASE1_FILLED and self._cfg.phase2_enabled:
+                if pos.phase == BracketPhase.PHASE1_FILLED and self._cfg.phase2_enabled and not pos.hard_exit_reason:
                     await self._check_phase2(pos, yes_ask, no_ask)
 
     # ── Hard exit — cut losses mid-window ────────────────────────────────
@@ -582,7 +1273,15 @@ class BracketExecutor:
             return
         seconds_since_fill = max(0.0, now_ts - (pos.p1_filled_at or pos.opened_at))
 
-        stop_trigger_price = float(self._cfg.hard_exit_stop_price) + float(
+        hard_exit_stop_price = float(self._cfg.hard_exit_stop_price)
+        high_entry_cutoff = float(getattr(self._cfg, "hard_exit_high_entry_price", 0.0) or 0.0)
+        high_entry_stop_price = float(
+            getattr(self._cfg, "hard_exit_high_entry_stop_price", hard_exit_stop_price) or hard_exit_stop_price
+        )
+        if high_entry_cutoff > 0 and entry >= high_entry_cutoff:
+            hard_exit_stop_price = max(hard_exit_stop_price, high_entry_stop_price)
+
+        stop_trigger_price = hard_exit_stop_price + float(
             getattr(self._cfg, "hard_exit_trigger_buffer_cents", 0.0) or 0.0
         )
         stop_hit = mark <= stop_trigger_price
@@ -593,6 +1292,7 @@ class BracketExecutor:
 
         continuation_grace_active = (
             pos.entry_model == "continuation"
+            and not (high_entry_cutoff > 0 and entry >= high_entry_cutoff)
             and seconds_since_fill < float(
                 getattr(self._cfg, "continuation_hard_exit_grace_seconds", 0.0) or 0.0
             )
@@ -600,6 +1300,7 @@ class BracketExecutor:
         safe_arm_stop_protection = (
             bool(getattr(self._cfg, "safe_arm_suspend_stop", True))
             and pos.safe_opposite_price > 0
+            and not pos.dipped_below_safe_price
         )
         catastrophic_floor = 0.0
         if continuation_grace_active:
@@ -640,29 +1341,16 @@ class BracketExecutor:
             reason = "STOP_CATASTROPHIC"
         else:
             reason = "STOP_50C"
+        hard_exit_in_progress = (
+            pos.hard_exit_last_attempt_ts > 0 or pos.hard_exit_filled_shares > 0
+        )
         pos.hard_exit_last_attempt_ts = now_ts
         pos.hard_exit_reason = reason
-
-        primary_sell_price = round(max(0.01, float(self._cfg.hard_exit_stop_price)), 4)
-        market_through_cents = max(
-            float(getattr(self._cfg, "hard_exit_market_through_cents", 0.02) or 0.0),
-            0.0,
+        pos.hard_exit_attempted = True
+        attempt_prices = self._build_hard_exit_attempt_prices(
+            hard_exit_stop_price,
+            include_emergency=hard_exit_in_progress,
         )
-        market_through_price = round(
-            max(
-                0.01,
-                float(self._cfg.hard_exit_stop_price) - market_through_cents,
-            ),
-            4,
-        )
-        if reason == "STOP_50C":
-            attempt_prices = [primary_sell_price]
-            # Optional fallback cross. When disabled (0.0c), keep retrying the
-            # intended 50c stop instead of chasing into a much worse live loss.
-            if market_through_cents > 0 and market_through_price < primary_sell_price:
-                attempt_prices.append(market_through_price)
-        else:
-            attempt_prices = [market_through_price]
         sell_price = attempt_prices[-1]
         logger.info(
             "BracketExecutor: ⚠ HARD EXIT triggered  "
@@ -673,55 +1361,223 @@ class BracketExecutor:
 
         fill_payload: dict[str, object] = {}
         try:
-            filled = False
-            fill_price = 0.0
+            remaining_shares = float(pos.p1_shares)
+            realized_pnl = float(pos.actual_pnl_usd or 0.0)
+            total_exit_shares = float(pos.hard_exit_filled_shares or 0.0)
+            weighted_exit_notional = float(pos.hard_exit_fill_price or 0.0) * total_exit_shares
             last_error: Exception | None = None
+            visible_position_remaining: float | None = None
+
+            ensure_allowance = getattr(self._client, "ensure_token_sell_allowance", None)
+            if callable(ensure_allowance):
+                try:
+                    await ensure_allowance(pos.p1_token_id)
+                except Exception as exc:
+                    logger.warning(
+                        "BracketExecutor: token sell allowance refresh failed  asset={} "
+                        "token={} error={} position_id={}",
+                        pos.asset,
+                        pos.p1_token_id,
+                        exc,
+                        pos.position_id,
+                    )
+
             for idx, attempt_price in enumerate(attempt_prices):
-                result = await self._client.place_sell_order(
+                if remaining_shares <= 1e-6:
+                    break
+
+                if visible_position_remaining is None:
+                    visible_position_remaining = await self._available_token_position_shares(
+                        pos.p1_token_id
+                    )
+                visible_position_shares = visible_position_remaining
+                sell_target_shares = remaining_shares
+                if visible_position_shares is not None:
+                    sell_target_shares = min(remaining_shares, visible_position_shares)
+                    if sell_target_shares <= 1e-6:
+                        last_error = RuntimeError("hard exit token balance unavailable")
+                        logger.warning(
+                            "BracketExecutor: hard exit waiting for spendable token balance  asset={} "
+                            "reason={} remaining={:.3f} visible_position={:.3f} position_id={}",
+                            pos.asset,
+                            reason,
+                            remaining_shares,
+                            visible_position_shares,
+                            pos.position_id,
+                        )
+                        break
+
+                sell_context = await self._marketable_book_context(
                     token_id=pos.p1_token_id,
-                    price=attempt_price,
-                    size=pos.p1_shares,
-                    entry_style="FOLLOW_TAKER",
-                    client_order_id=f"{pos.position_id}-hard-exit-{idx + 1}",
+                    limit_price=attempt_price,
+                    shares=sell_target_shares,
+                    side="SELL",
                 )
+                executable_shares = self._round_shares(
+                    min(
+                        sell_target_shares,
+                        float(sell_context.get("executable_shares") or 0.0),
+                    )
+                )
+                if executable_shares <= 1e-6:
+                    # The stop trigger stream can still be fresher than a
+                    # follow-up orderbook fetch. If we already know the token
+                    # position is visible/spendable, send a partial-capable
+                    # sell anyway and let the exchange fill whatever is truly
+                    # executable instead of silently riding to settlement.
+                    if visible_position_shares is not None and sell_target_shares > 1e-6:
+                        executable_shares = self._round_shares(sell_target_shares)
+                        logger.warning(
+                            "BracketExecutor: hard exit proceeding without prechecked depth  "
+                            "asset={} reason={} attempt_price={:.4f} visible_position={:.3f} "
+                            "best_bid_hint={:.4f} position_id={}",
+                            pos.asset,
+                            reason,
+                            attempt_price,
+                            visible_position_shares,
+                            float(sell_context.get("best_price") or 0.0),
+                            pos.position_id,
+                        )
+                    else:
+                        last_error = RuntimeError(
+                            f"hard exit no marketable depth at {attempt_price:.3f}"
+                        )
+                        continue
+
+                result: dict[str, Any] | None = None
+                for sell_attempt in range(2):
+                    try:
+                        result = await self._client.place_sell_order(
+                            token_id=pos.p1_token_id,
+                            price=attempt_price,
+                            size=executable_shares,
+                            entry_style="FOLLOW_TAKER_PARTIAL",
+                            client_order_id=f"{pos.position_id}-hard-exit-{idx + 1}",
+                        )
+                        break
+                    except Exception as exc:
+                        if sell_attempt == 0 and self._is_allowance_failure(str(exc)):
+                            if callable(ensure_allowance):
+                                try:
+                                    await ensure_allowance(pos.p1_token_id)
+                                except Exception as refresh_exc:
+                                    logger.warning(
+                                        "BracketExecutor: token sell allowance retry failed  asset={} "
+                                        "token={} error={} position_id={}",
+                                        pos.asset,
+                                        pos.p1_token_id,
+                                        refresh_exc,
+                                        pos.position_id,
+                                    )
+                            refresh_order_session = getattr(self._client, "refresh_live_order_session", None)
+                            if callable(refresh_order_session):
+                                try:
+                                    await refresh_order_session()
+                                except Exception as refresh_exc:
+                                    logger.warning(
+                                        "BracketExecutor: hard-exit session refresh failed  asset={} "
+                                        "error={} position_id={}",
+                                        pos.asset,
+                                        refresh_exc,
+                                        pos.position_id,
+                                    )
+                            refreshed_visible_shares = await self._wait_for_visible_token_position(
+                                pos.p1_token_id,
+                                min_shares=min(executable_shares, remaining_shares),
+                            )
+                            if refreshed_visible_shares is None or refreshed_visible_shares <= 1e-6:
+                                last_error = RuntimeError(
+                                    "hard exit token balance unavailable after allowance refresh"
+                                )
+                                break
+                            visible_position_remaining = refreshed_visible_shares
+                            executable_shares = self._round_shares(
+                                min(executable_shares, refreshed_visible_shares)
+                            )
+                            if executable_shares <= 1e-6:
+                                last_error = RuntimeError(
+                                    "hard exit token balance unavailable after allowance refresh"
+                                )
+                                break
+                            await asyncio.sleep(0.05)
+                            continue
+                        raise
+                if result is None:
+                    raise last_error or RuntimeError("hard exit order placement returned no result")
                 order_id = str(result.get("exchange_order_id") or "")
+                if order_id:
+                    pos.hard_exit_order_ids.append(order_id)
                 filled, fill_price, fill_payload = await self._confirm_follow_taker_fill(
                     order_result=result,
                     order_id=order_id,
-                    expected_size=pos.p1_shares,
+                    expected_size=executable_shares,
                     fallback_price=attempt_price,
+                    allow_partial=True,
                 )
                 sell_price = attempt_price
+
                 if filled:
+                    filled_size = self._reported_filled_size(fill_payload, executable_shares)
+                    entry_cost = entry * (1.0 + taker_fee(entry, category="crypto price"))
+                    exit_proceeds = fill_price * (1.0 - taker_fee(fill_price, category="crypto price"))
+                    chunk_pnl = round((exit_proceeds - entry_cost) * filled_size, 4)
+                    realized_pnl = round(realized_pnl + chunk_pnl, 4)
+                    remaining_shares = round(max(0.0, remaining_shares - filled_size), 6)
+                    total_exit_shares = round(total_exit_shares + filled_size, 6)
+                    weighted_exit_notional += fill_price * filled_size
+                    if visible_position_remaining is not None:
+                        visible_position_remaining = round(
+                            max(0.0, visible_position_remaining - filled_size), 6
+                        )
+                    pos.p1_shares = remaining_shares
+                    pos.hard_exit_filled_shares = total_exit_shares
+                    pos.hard_exit_fill_price = round(weighted_exit_notional / total_exit_shares, 6)
+                    pos.actual_pnl_usd = realized_pnl
+                    logger.info(
+                        "BracketExecutor: hard exit partial fill  asset={} reason={} "
+                        "attempt_price={:.4f} fill_price={:.4f} filled={:.3f} remaining={:.3f} "
+                        "position_id={}",
+                        pos.asset,
+                        reason,
+                        attempt_price,
+                        fill_price,
+                        filled_size,
+                        remaining_shares,
+                        pos.position_id,
+                    )
+
+                if remaining_shares <= 1e-6:
+                    pos.phase = BracketPhase.HARD_EXITED
+                    pos.closed_at = time.time()
+                    pos.hard_exit_attempted = True
+                    logger.info(
+                        "BracketExecutor: HARD EXIT filled  "
+                        "asset={}  avg_fill_price={:.4f}  reason={}  pnl=${:.4f}  position_id={}",
+                        pos.asset,
+                        pos.hard_exit_fill_price,
+                        reason,
+                        pos.actual_pnl_usd,
+                        pos.position_id,
+                    )
                     break
+
                 last_error = RuntimeError(
-                    f"hard exit not filled status={self._normalized_status(fill_payload)}"
+                    f"hard exit remaining={remaining_shares:.3f} status={self._normalized_status(fill_payload)}"
                 )
                 if idx + 1 < len(attempt_prices):
                     logger.warning(
                         "BracketExecutor: hard exit retrying lower  asset={} reason={} "
-                        "attempt_price={:.4f} next_price={:.4f} position_id={}",
+                        "attempt_price={:.4f} next_price={:.4f} remaining={:.3f} position_id={}",
                         pos.asset,
                         reason,
                         attempt_price,
                         attempt_prices[idx + 1],
+                        remaining_shares,
                         pos.position_id,
                     )
-            if not filled:
+
+            if remaining_shares > 1e-6:
                 raise last_error or RuntimeError("hard exit not filled")
-            entry_cost = entry * (1.0 + taker_fee(entry, category="crypto price"))
-            exit_proceeds = fill_price * (1.0 - taker_fee(fill_price, category="crypto price"))
-            pnl = round((exit_proceeds - entry_cost) * pos.p1_shares, 4)
-            pos.phase = BracketPhase.HARD_EXITED
-            pos.closed_at = time.time()
-            pos.hard_exit_attempted = True
-            pos.hard_exit_fill_price = fill_price
-            pos.actual_pnl_usd = pnl
-            logger.info(
-                "BracketExecutor: HARD EXIT filled  "
-                "asset={}  sell_price={:.4f}  reason={}  pnl=${:.4f}  position_id={}",
-                pos.asset, fill_price, reason, pnl, pos.position_id,
-            )
         except Exception as exc:
             logger.error(
                 "BracketExecutor: HARD EXIT sell FAILED (will resolve at window close)  "
@@ -828,21 +1684,38 @@ class BracketExecutor:
         fee_x = taker_fee(x_cost, category="crypto price")
         fee_y = taker_fee(y_price, category="crypto price")
         net_margin = 1.0 - x_cost * (1.0 + fee_x) - y_price * (1.0 + fee_y)
+        min_locked_profit = max(
+            float(getattr(self._cfg, "phase2_min_locked_profit_per_share", 0.0) or 0.0),
+            0.0,
+        )
+        profitable_y_ceiling = max_profitable_opposite_price(
+            x_cost,
+            min_net_margin=min_locked_profit,
+            category="crypto price",
+        )
 
-        # Arm the remembered safe price exactly once.
+        # Arm from the dynamic profitable ceiling implied by the actual Phase 1
+        # fill. If the move later reaches the preferred target zone, tighten the
+        # reclaim anchor downward to that better observed level.
         if pos.safe_opposite_price <= 0:
-            if y_price <= self._cfg.target_y_price and net_margin > 0:
-                pos.safe_opposite_price = round(y_price, 6)
+            if (
+                profitable_y_ceiling > 0
+                and y_price <= profitable_y_ceiling
+                and net_margin >= min_locked_profit
+            ):
+                arm_price = y_price if y_price <= self._cfg.target_y_price else profitable_y_ceiling
+                pos.safe_opposite_price = round(arm_price, 6)
                 logger.info(
                     "BracketExecutor: Phase 2 armed  asset={}  safe_y={:.4f}  "
-                    "x_cost={:.4f}  net_margin={:.4f}  position_id={}",
-                    pos.asset, pos.safe_opposite_price, x_cost, net_margin, pos.position_id,
+                    "profit_ceiling={:.4f}  x_cost={:.4f}  net_margin={:.4f}  position_id={}",
+                    pos.asset, pos.safe_opposite_price, profitable_y_ceiling, x_cost, net_margin, pos.position_id,
                 )
                 self._audit({
                     "type": "PHASE2_SAFE_ARMED",
                     "position_id": pos.position_id,
                     "asset": pos.asset,
                     "safe_opposite_price": pos.safe_opposite_price,
+                    "profit_ceiling": round(profitable_y_ceiling, 6),
                     "net_margin": round(net_margin, 6),
                 })
             return
@@ -850,23 +1723,45 @@ class BracketExecutor:
         reversal = self._cfg.phase2_reversal_threshold
         safe_price = pos.safe_opposite_price
 
+        if (
+            safe_price > self._cfg.target_y_price
+            and y_price <= self._cfg.target_y_price
+            and y_price < safe_price
+        ):
+            pos.safe_opposite_price = round(y_price, 6)
+            safe_price = pos.safe_opposite_price
+            logger.info(
+                "BracketExecutor: Phase 2 safe tightened  asset={}  safe_y={:.4f}  "
+                "profit_ceiling={:.4f}  x_cost={:.4f}  net_margin={:.4f}  position_id={}",
+                pos.asset, safe_price, profitable_y_ceiling, x_cost, net_margin, pos.position_id,
+            )
+            self._audit({
+                "type": "PHASE2_SAFE_TIGHTENED",
+                "position_id": pos.position_id,
+                "asset": pos.asset,
+                "safe_opposite_price": safe_price,
+                "profit_ceiling": round(profitable_y_ceiling, 6),
+                "net_margin": round(net_margin, 6),
+            })
+
         # Require continuation below the remembered safe level before we count
         # a reclaim as meaningful.
+        breached_safe = pos.min_opposite_price <= safe_price - reversal
+        if breached_safe and not pos.dipped_below_safe_price:
+            logger.info(
+                "BracketExecutor: Phase 2 continuation confirmed  asset={}  "
+                "safe_y={:.4f}  floor_now={:.4f}  position_id={}",
+                pos.asset, safe_price, pos.min_opposite_price, pos.position_id,
+            )
+            self._audit({
+                "type": "PHASE2_SAFE_BREACHED",
+                "position_id": pos.position_id,
+                "asset": pos.asset,
+                "safe_opposite_price": safe_price,
+                "y_price": round(pos.min_opposite_price, 6),
+            })
+        pos.dipped_below_safe_price = bool(breached_safe)
         if y_price <= safe_price - reversal:
-            if not pos.dipped_below_safe_price:
-                logger.info(
-                    "BracketExecutor: Phase 2 continuation confirmed  asset={}  "
-                    "safe_y={:.4f}  floor_now={:.4f}  position_id={}",
-                    pos.asset, safe_price, y_price, pos.position_id,
-                )
-                self._audit({
-                    "type": "PHASE2_SAFE_BREACHED",
-                    "position_id": pos.position_id,
-                    "asset": pos.asset,
-                    "safe_opposite_price": safe_price,
-                    "y_price": round(y_price, 6),
-                })
-            pos.dipped_below_safe_price = True
             return
 
         if not pos.dipped_below_safe_price:
@@ -880,7 +1775,7 @@ class BracketExecutor:
         # materially above it.
         if y_price < safe_price or y_price > safe_price + reversal:
             return
-        if net_margin <= 0:
+        if net_margin < min_locked_profit:
             return
 
         logger.info(
@@ -1071,7 +1966,7 @@ class BracketExecutor:
                     + y * (1.0 + taker_fee(y, category="crypto price"))
                 )
                 # One token pays $1/share, other pays $0/share → net = $1/share
-                pos.actual_pnl_usd = round((1.0 - cost) * pos.p1_shares, 4)
+                pos.actual_pnl_usd = round(pos.actual_pnl_usd + (1.0 - cost) * pos.p1_shares, 4)
                 # Terminal state — frees concurrency slot for next window
                 pos.phase = BracketPhase.BRACKET_SETTLED
                 logger.info(
@@ -1096,7 +1991,7 @@ class BracketExecutor:
                 else:
                     pnl_per_share = -cost          # lost: received $0, paid cost
 
-                pos.actual_pnl_usd = round(pnl_per_share * pos.p1_shares, 4)
+                pos.actual_pnl_usd = round(pos.actual_pnl_usd + pnl_per_share * pos.p1_shares, 4)
                 logger.info(
                     "BracketExecutor: P1-ONLY SETTLED  asset={}  outcome={}  "
                     "momentum={}  pnl=${:.4f}  position_id={}",
@@ -1114,7 +2009,8 @@ class BracketExecutor:
                 "actual_pnl_usd": pos.actual_pnl_usd,
                 "p1_price": pos.p1_price,
                 "p1_fill_price": pos.p1_fill_price,
-                "p1_shares": pos.p1_shares,
+                "p1_shares": pos.p1_initial_shares,
+                "p1_remaining_shares": pos.p1_shares,
                 "p2_price": pos.p2_price,
                 "p2_fill_price": pos.p2_fill_price,
             })
@@ -1218,14 +2114,27 @@ class BracketExecutor:
             ),
             "hard_exited": pos.phase == BracketPhase.HARD_EXITED,
             "hard_exit_reason": pos.hard_exit_reason,
+            "hard_exit_attempted": pos.hard_exit_attempted,
             "hard_exit_fill_price": pos.hard_exit_fill_price,
+            "hard_exit_filled_shares": pos.hard_exit_filled_shares,
             "cancelled": pos.phase == BracketPhase.CANCELLED,
             "actual_pnl_usd": pos.actual_pnl_usd,
-            "p1_shares": pos.p1_shares,
+            "p1_shares": pos.p1_initial_shares,
+            "p1_remaining_shares": pos.p1_shares,
             "p1_fill_price": pos.p1_fill_price or pos.p1_price,
             "p2_fill_price": pos.p2_fill_price or pos.p2_price,
+            "p1_order_id": pos.p1_order_id,
+            "p2_order_id": pos.p2_order_id,
+            "hard_exit_order_ids": list(pos.hard_exit_order_ids),
             "safe_opposite_price": pos.safe_opposite_price,
             "min_opposite_price": pos.min_opposite_price,
             "dipped_below_safe_price": pos.dipped_below_safe_price,
-            "phase2_reclaim_seen": bool(pos.p2_price > 0 or pos.p2_fill_price > 0),
+            "phase2_reclaim_seen": bool(
+                pos.p2_last_attempt_ts > 0 or pos.p2_price > 0 or pos.p2_fill_price > 0
+            ),
+            "phase2_order_attempted": bool(pos.p2_last_attempt_ts > 0),
+            "phase2_attempt_price": (
+                pos.p2_price
+                or (pos.safe_opposite_price if pos.p2_last_attempt_ts > 0 else 0.0)
+            ),
         }

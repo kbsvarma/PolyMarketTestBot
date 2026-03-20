@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -227,6 +228,10 @@ class EnvConfig(BaseModel):
     polymarket_private_key: str = ""
     polymarket_funder: str = ""
     polymarket_signature_type: int | None = None
+    kalshi_api_key_id: str = ""
+    kalshi_private_key: str = ""
+    kalshi_private_key_path: str = ""
+    kalshi_api_base_url: str = "https://api.elections.kalshi.com/trade-api/v2"
     live_trading_enabled: bool = False
     allowed_country_codes: list[str] = Field(default_factory=list)
     country_code: str = "US"
@@ -300,6 +305,8 @@ class CryptoDirectionConfig(BaseModel):
       7. Cooldown:       same side hasn't already fired a signal this window
     """
     enabled: bool = False   # must be explicitly enabled in config.yaml
+    venue: str = "polymarket"
+    instance_name: str = "polymarket_btc_5m"
 
     # ---- Asset configs ----
     btc: AssetVolConfig = Field(default_factory=lambda: AssetVolConfig(
@@ -342,9 +349,10 @@ class CryptoDirectionConfig(BaseModel):
 
     # ---- Gate 3: Momentum side price range ----
     # Signal only fires when the momentum_side ask is in this range.
-    # 57-60¢ = market has moved meaningfully but hasn't overshot.
+    # 57-68¢ = aggressive 5m profile: still directional, but not so tight that
+    # we miss clean continuation windows before they become executable.
     entry_range_low: float = 0.57
-    entry_range_high: float = 0.60
+    entry_range_high: float = 0.63
 
     # ---- Gate 5: Chop filter ----
     # How many recent :00-second checkpoints to evaluate for directional cleanliness.
@@ -367,11 +375,16 @@ class CryptoDirectionConfig(BaseModel):
     continuation_min_minutes_remaining: float = 1.5
     continuation_min_asset_move_pct: float = 0.00035
     continuation_min_chop_score: float = 0.66
-    continuation_max_momentum_price: float = 0.59
+    continuation_max_momentum_price: float = 0.61
     continuation_max_opposite_price: float = 0.44
     continuation_max_negative_lag_gap: float = 0.03
     continuation_ignore_lag_veto: bool = False
-    continuation_hard_exit_grace_seconds: float = 30.0
+    # Third entry lane: as soon as the momentum side is cleanly trading inside
+    # the original 57-61c thesis band, buy it without waiting for lag.
+    immediate_band_entry_enabled: bool = False
+    immediate_band_entry_low: float = 0.57
+    immediate_band_entry_high: float = 0.61
+    continuation_hard_exit_grace_seconds: float = 0.0
     continuation_catastrophic_stop_price: float = 0.0
     safe_arm_suspend_stop: bool = True
     safe_arm_catastrophic_stop_price: float = 0.0
@@ -381,6 +394,10 @@ class CryptoDirectionConfig(BaseModel):
     # If x=0.58 is paid for leg 1, we want x+y+fees < $1.00.
     # With fees ~1.5-2% total, y_target ~0.34 gives ~6% net bracket margin.
     target_y_price: float = 0.34
+    # Smallest locked profit/share we still consider worth arming for Phase 2.
+    # 0.00 means "strictly profitable after fees"; raise later if we want a
+    # larger safety cushion before committing the opposite leg.
+    phase2_min_locked_profit_per_share: float = 0.00
     # How much the opposite side must recover from its floor to confirm reversal.
     # E.g., if NO bottoms at 0.30 and recovers to 0.31, that's a 1¢ reversal confirmation.
     phase2_reversal_threshold: float = 0.01   # 1¢
@@ -406,7 +423,7 @@ class CryptoDirectionConfig(BaseModel):
     window_report_path: str = "logs/window_report.md"
     # Fixed share count used by the observer report for hypothetical PnL.
     # A value of 10.0 means "pretend each window used 10 shares", not "$10 notional".
-    report_shares: float = 5.0
+    report_shares: float = 10.0
 
     # ---- Shadow-live execution ----
     # When true, --observe-crypto still runs without touching the wallet, but it
@@ -431,24 +448,38 @@ class CryptoDirectionConfig(BaseModel):
     execute_enabled: bool = False               # master switch — must be explicit
     phase2_enabled: bool = True                 # both phases run together by default
     max_concurrent_brackets: int = 1            # max open positions across all assets
-    # Fixed Phase 1 share count. The live executor uses the same share count
-    # for Phase 2 so the bracket stays symmetric.
-    phase1_shares: float = 5.0
-    min_bracket_shares: float = 1.0             # minimum shares per order
+    # Adaptive Phase 1 sizing. `phase1_shares` is the target size on liquid
+    # windows; if visible depth inside our cap is thinner, we can still trade
+    # the exact marketable size as long as it stays above min_bracket_shares.
+    # Phase 2 mirrors the actual Phase 1 filled shares so the bracket remains
+    # symmetric.
+    phase1_shares: float = 10.0
+    min_bracket_shares: float = 5.0             # minimum executable shares for Phase 1
     # FOLLOW_TAKER (FOK) for both phases — immediate fill, locks bracket in real-time
     # after the safe-y reclaim condition has been satisfied.
     phase1_entry_style: str = "FOLLOW_TAKER"
-    # Phase 1 catch-up window for FOLLOW_TAKER. Keep this tight so execution
-    # stays faithful to the signal band rather than drifting into a materially
-    # worse x cost after the signal has already fired.
+    # Phase 1 catch-up window for FOLLOW_TAKER. This is intentionally a bit
+    # aggressive in 5m mode so we catch more real windows instead of missing
+    # them on a one-tick lift.
     phase1_max_chase_cents: float = 0.01
+    # Give live/shadow FOK entry a couple of bounded retries when the first
+    # immediate cross misses because the book shifted between signal snapshot
+    # and submission.
+    phase1_follow_taker_retry_attempts: int = 1
+    phase1_follow_taker_retry_delay_seconds: float = 0.10
+    phase1_follow_taker_retry_to_strategy_cap: bool = True
     phase2_entry_style: str = "FOLLOW_TAKER"
     bracket_audit_log_path: str = "logs/bracket_trades.jsonl"
     # Hard exit: sell Phase-1 leg mid-window to cap losses.
     # Triggers if mark drops to stop_price OR we're in the final N seconds losing.
     hard_exit_stop_price: float = 0.50
+    hard_exit_high_entry_price: float = 0.64
+    hard_exit_high_entry_stop_price: float = 0.54
     hard_exit_trigger_buffer_cents: float = 0.02
     hard_exit_market_through_cents: float = 0.0
+    hard_exit_fallback_step_cents: float = 0.02
+    hard_exit_min_sell_price: float = 0.40
+    hard_exit_emergency_min_sell_price: float = 0.40
     hard_exit_retry_cooldown_seconds: float = 2.0
     hard_exit_final_seconds: int = 30
 
@@ -475,6 +506,9 @@ class AppConfig(BaseModel):
     completion_tracker: CompletionTrackerConfig = Field(default_factory=CompletionTrackerConfig)
     # Bracket strategy direction signal observer (crypto 15m markets)
     crypto_direction: CryptoDirectionConfig = Field(default_factory=CryptoDirectionConfig)
+    # Optional named crypto profiles that override the base crypto_direction
+    # block. This lets us keep 5m stable while adding a clean 15m lane.
+    crypto_direction_profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
 
 RUNTIME_FILES: dict[str, str] = {
@@ -518,6 +552,26 @@ RUNTIME_FILES: dict[str, str] = {
     # Bracket strategy direction signal observer logs
     "logs/crypto_signal_events.jsonl": "",
     "logs/crypto_signal_evaluations.jsonl": "",
+    "logs/crypto_signal_events_15m.jsonl": "",
+    "logs/crypto_signal_evaluations_15m.jsonl": "",
+    "logs/bracket_trades_15m.jsonl": "",
+    "logs/window_report_15m.md": "",
+    "logs/crypto_signal_events_pm_btc_5m.jsonl": "",
+    "logs/crypto_signal_evaluations_pm_btc_5m.jsonl": "",
+    "logs/window_report_pm_btc_5m.md": "",
+    "logs/bracket_trades_pm_btc_5m.jsonl": "",
+    "logs/crypto_signal_events_pm_btc_15m.jsonl": "",
+    "logs/crypto_signal_evaluations_pm_btc_15m.jsonl": "",
+    "logs/window_report_pm_btc_15m.md": "",
+    "logs/bracket_trades_pm_btc_15m.jsonl": "",
+    "logs/crypto_signal_events_kalshi_btc_5m.jsonl": "",
+    "logs/crypto_signal_evaluations_kalshi_btc_5m.jsonl": "",
+    "logs/window_report_kalshi_btc_5m.md": "",
+    "logs/bracket_trades_kalshi_btc_5m.jsonl": "",
+    "logs/crypto_signal_events_kalshi_btc_15m.jsonl": "",
+    "logs/crypto_signal_evaluations_kalshi_btc_15m.jsonl": "",
+    "logs/window_report_kalshi_btc_15m.md": "",
+    "logs/bracket_trades_kalshi_btc_15m.jsonl": "",
 }
 
 
@@ -541,6 +595,10 @@ def _load_env() -> EnvConfig:
             if os.getenv("POLYMARKET_SIGNATURE_TYPE", "").strip()
             else None
         ),
+        kalshi_api_key_id=os.getenv("KALSHI_API_KEY_ID", ""),
+        kalshi_private_key=os.getenv("KALSHI_PRIVATE_KEY", ""),
+        kalshi_private_key_path=os.getenv("KALSHI_PRIVATE_KEY_PATH", ""),
+        kalshi_api_base_url=os.getenv("KALSHI_API_BASE_URL", "https://api.elections.kalshi.com/trade-api/v2"),
         live_trading_enabled=os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true",
         allowed_country_codes=[code.strip() for code in allowed if code.strip()],
         country_code=os.getenv("COUNTRY_CODE", "US"),
@@ -582,6 +640,35 @@ def load_config(config_path: Path, env_path: Path | None = None) -> AppConfig:
     config = AppConfig.model_validate(data)
     config.env = _load_env()
     return config
+
+
+def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def apply_crypto_direction_profile(config: AppConfig, profile_name: str) -> AppConfig:
+    """
+    Return a copy of AppConfig with crypto_direction overridden by a named profile.
+    """
+    profiles = config.crypto_direction_profiles or {}
+    if profile_name not in profiles:
+        available = ", ".join(sorted(profiles)) or "<none>"
+        raise KeyError(
+            f"Unknown crypto profile '{profile_name}'. Available profiles: {available}"
+        )
+
+    merged = _deep_merge_dicts(
+        config.crypto_direction.model_dump(),
+        profiles[profile_name],
+    )
+    profiled_crypto = CryptoDirectionConfig.model_validate(merged)
+    return config.model_copy(update={"crypto_direction": profiled_crypto})
 
 
 def ensure_runtime_files(root: Path, config: AppConfig) -> None:

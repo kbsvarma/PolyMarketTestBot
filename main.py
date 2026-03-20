@@ -9,7 +9,7 @@ from pathlib import Path
 from src.alerts import AlertManager
 from src.analytics import AnalyticsEngine
 from src.category_scoring import CategoryScorer
-from src.config import AppConfig, ensure_runtime_files, load_config
+from src.config import AppConfig, apply_crypto_direction_profile, ensure_runtime_files, load_config
 from src.geoblock import GeoblockChecker
 from src.live_engine import LiveTradingEngine
 from src.logger import setup_logging
@@ -93,6 +93,15 @@ def _decision_snapshot(decision: TradeDecision) -> dict[str, object]:
         "source_quality": decision.context.get("source_quality", ""),
         "trust_level": decision.context.get("trust_level", ""),
     }
+
+
+def _argv_flag_value(flag: str) -> str | None:
+    if flag not in sys.argv:
+        return None
+    idx = sys.argv.index(flag)
+    if idx + 1 >= len(sys.argv):
+        raise ValueError(f"Missing value for {flag}")
+    return sys.argv[idx + 1]
 
 
 async def _run_cycle_stage(
@@ -772,7 +781,51 @@ async def run() -> None:
             break
 
 
-async def run_observe_crypto() -> None:
+def _load_runtime_crypto_config(root: Path, profile_name: str | None = None) -> AppConfig:
+    config_path_value = os.getenv("POLYBOT_CONFIG_PATH", "config.yaml")
+    config_path = Path(config_path_value)
+    if not config_path.is_absolute():
+        config_path = root / config_path
+
+    config: AppConfig = load_config(config_path, root / ".env")
+    if profile_name:
+        config = apply_crypto_direction_profile(config, profile_name)
+    return config
+
+
+def _build_crypto_client(config: AppConfig):
+    venue = str(config.crypto_direction.venue or "polymarket").lower()
+    if venue == "polymarket":
+        from src.polymarket_client import PolymarketClient
+
+        return PolymarketClient(config)
+    if venue == "kalshi":
+        if int(config.crypto_direction.window_duration_seconds) != 900:
+            raise NotImplementedError(
+                "Kalshi crypto runtime currently supports only the 15-minute BTC lane."
+            )
+        if config.crypto_direction.track_eth:
+            raise NotImplementedError(
+                "Kalshi crypto runtime currently supports BTC only."
+            )
+        from src.kalshi_client import KalshiClient
+
+        return KalshiClient(config)
+    raise ValueError(f"Unsupported crypto venue '{venue}'")
+
+
+def _crypto_runtime_log_dir(root: Path, config: AppConfig) -> Path:
+    """
+    Give each crypto instance its own runtime log directory so parallel 5m/15m
+    lanes don't overwrite or intermingle generic process logs.
+    """
+    instance_name = str(getattr(config.crypto_direction, "instance_name", "") or "").strip()
+    if not instance_name:
+        instance_name = "crypto_default"
+    return root / "logs" / "instances" / instance_name
+
+
+async def run_observe_crypto(profile_name: str | None = None) -> None:
     """
     Entry point for the bracket strategy direction signal observer.
 
@@ -794,23 +847,18 @@ async def run_observe_crypto() -> None:
     from src.crypto_direction_signal import run_bracket_signal_observer
 
     root = Path(__file__).resolve().parent
-    config_path_value = os.getenv("POLYBOT_CONFIG_PATH", "config.yaml")
-    config_path = Path(config_path_value)
-    if not config_path.is_absolute():
-        config_path = root / config_path
-
-    config: AppConfig = load_config(config_path, root / ".env")
+    config: AppConfig = _load_runtime_crypto_config(root, profile_name=profile_name)
     ensure_runtime_files(root, config)
-    setup_logging(root / "logs")
+    setup_logging(_crypto_runtime_log_dir(root, config))
 
-    # Build a minimal Polymarket client (needed for market resolution)
-    from src.polymarket_client import PolymarketClient
     from src.bracket_executor import BracketExecutor
     from src.shadow_execution_client import ShadowExecutionClient
-    client = PolymarketClient(config)
+    client = _build_crypto_client(config)
     cfg_d = config.crypto_direction
 
     executor = None
+    if profile_name:
+        logger.info("Crypto observer using profile={}", profile_name)
     if cfg_d.shadow_execute_enabled:
         shadow_cfg = cfg_d.model_copy(
             update={
@@ -831,7 +879,7 @@ async def run_observe_crypto() -> None:
     await run_bracket_signal_observer(config=config, client=client, executor=executor)
 
 
-async def run_execute_crypto() -> None:
+async def run_execute_crypto(profile_name: str | None = None) -> None:
     """
     Entry point for the bracket strategy LIVE EXECUTION mode.
 
@@ -851,19 +899,13 @@ async def run_execute_crypto() -> None:
     """
     from src.bracket_executor import BracketExecutor
     from src.crypto_direction_signal import run_bracket_signal_observer
-    from src.polymarket_client import PolymarketClient
 
     root = Path(__file__).resolve().parent
-    config_path_value = os.getenv("POLYBOT_CONFIG_PATH", "config.yaml")
-    config_path = Path(config_path_value)
-    if not config_path.is_absolute():
-        config_path = root / config_path
-
-    config: AppConfig = load_config(config_path, root / ".env")
+    config: AppConfig = _load_runtime_crypto_config(root, profile_name=profile_name)
     ensure_runtime_files(root, config)
-    setup_logging(root / "logs")
+    setup_logging(_crypto_runtime_log_dir(root, config))
 
-    client = PolymarketClient(config)
+    client = _build_crypto_client(config)
     cfg_d = config.crypto_direction
 
     if not cfg_d.execute_enabled:
@@ -881,6 +923,9 @@ async def run_execute_crypto() -> None:
         )
         return
 
+    if profile_name:
+        logger.info("Crypto live executor using profile={}", profile_name)
+
     logger.info(
         "🚀 Bracket executor LIVE mode — execute_enabled=true "
         "max_concurrent={} phase1_shares={} p1_style={} p2_style={}",
@@ -895,7 +940,22 @@ async def run_execute_crypto() -> None:
 
 
 if __name__ == "__main__":
-    if "--observe-crypto" in sys.argv:
+    observe_instance = _argv_flag_value("--observe-crypto-instance")
+    execute_instance = _argv_flag_value("--execute-crypto-instance")
+
+    if observe_instance:
+        asyncio.run(run_observe_crypto(profile_name=observe_instance))
+    elif execute_instance:
+        asyncio.run(run_execute_crypto(profile_name=execute_instance))
+    elif "--observe-crypto-15m" in sys.argv:
+        asyncio.run(run_observe_crypto(profile_name="btc_15m"))
+    elif "--execute-crypto-15m" in sys.argv:
+        asyncio.run(run_execute_crypto(profile_name="btc_15m"))
+    elif "--observe-crypto-5m" in sys.argv:
+        asyncio.run(run_observe_crypto())
+    elif "--execute-crypto-5m" in sys.argv:
+        asyncio.run(run_execute_crypto())
+    elif "--observe-crypto" in sys.argv:
         asyncio.run(run_observe_crypto())
     elif "--execute-crypto" in sys.argv:
         asyncio.run(run_execute_crypto())
