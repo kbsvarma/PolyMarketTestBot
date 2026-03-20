@@ -892,6 +892,48 @@ def test_hard_exit_can_fill_across_visible_depth_fok_chunks(tmp_path, monkeypatc
     assert client.allowance_refresh_calls == ["yes-1", "yes-1"]
 
 
+def test_hard_exit_treats_tiny_residual_as_dust_and_stops_retrying(tmp_path, monkeypatch) -> None:
+    client = _DummyClient()
+    client.positions = [
+        {
+            "token_id": "yes-1",
+            "quantity": 10.0,
+            "avg_price": 0.58,
+        }
+    ]
+    client.next_sell_result = {
+        "exchange_order_id": "test-sell-dust",
+        "status": "MATCHED",
+        "filled_size": 9.86,
+        "average_fill_price": 0.50,
+        "remaining_size": 0.0,
+    }
+    cfg = CryptoDirectionConfig(
+        execute_enabled=True,
+        phase1_shares=10.0,
+        phase1_max_chase_cents=0.0,
+        min_bracket_shares=1.0,
+        hard_exit_stop_price=0.50,
+        hard_exit_dust_shares=0.25,
+        bracket_audit_log_path=str(tmp_path / "bracket_trades.jsonl"),
+    )
+    executor = BracketExecutor(cfg, client)
+    asyncio.run(executor.on_signal(_signal_event()))
+
+    pos = executor.active_positions()[0]
+    pos.p1_filled_at = 1_000.0
+    pos.window_close_ts = 2_000
+    monkeypatch.setattr("src.bracket_executor.time.time", lambda: 1_050.0)
+
+    asyncio.run(executor._check_hard_exit(pos, yes_ask=0.50, no_ask=0.50))
+
+    assert pos.phase == BracketPhase.HARD_EXITED
+    assert pos.p1_shares == 0.0
+    assert pos.hard_exit_filled_shares == pytest.approx(9.86)
+    assert pos.hard_exit_fill_price == 0.50
+    assert len(client.sell_calls) == 1
+
+
 def test_hard_exit_retries_allowance_failures_then_sells(tmp_path, monkeypatch) -> None:
     client = _DummyClient()
     client.positions = [

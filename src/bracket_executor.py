@@ -1365,6 +1365,10 @@ class BracketExecutor:
             realized_pnl = float(pos.actual_pnl_usd or 0.0)
             total_exit_shares = float(pos.hard_exit_filled_shares or 0.0)
             weighted_exit_notional = float(pos.hard_exit_fill_price or 0.0) * total_exit_shares
+            dust_shares = max(
+                float(getattr(self._cfg, "hard_exit_dust_shares", 0.0) or 0.0),
+                0.0,
+            )
             last_error: Exception | None = None
             visible_position_remaining: float | None = None
 
@@ -1545,6 +1549,19 @@ class BracketExecutor:
                         remaining_shares,
                         pos.position_id,
                     )
+                    if remaining_shares <= dust_shares + 1e-6:
+                        if remaining_shares > 1e-6:
+                            logger.info(
+                                "BracketExecutor: hard exit residual treated as dust  asset={} "
+                                "reason={} residual={:.3f} dust_limit={:.3f} position_id={}",
+                                pos.asset,
+                                reason,
+                                remaining_shares,
+                                dust_shares,
+                                pos.position_id,
+                            )
+                        remaining_shares = 0.0
+                        pos.p1_shares = 0.0
 
                 if remaining_shares <= 1e-6:
                     pos.phase = BracketPhase.HARD_EXITED

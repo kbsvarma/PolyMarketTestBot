@@ -467,7 +467,7 @@ class CryptoDirectionConfig(BaseModel):
     # and submission.
     phase1_follow_taker_retry_attempts: int = 1
     phase1_follow_taker_retry_delay_seconds: float = 0.10
-    phase1_follow_taker_retry_to_strategy_cap: bool = True
+    phase1_follow_taker_retry_to_strategy_cap: bool = False
     phase2_entry_style: str = "FOLLOW_TAKER"
     bracket_audit_log_path: str = "logs/bracket_trades.jsonl"
     # Hard exit: sell Phase-1 leg mid-window to cap losses.
@@ -481,6 +481,7 @@ class CryptoDirectionConfig(BaseModel):
     hard_exit_min_sell_price: float = 0.40
     hard_exit_emergency_min_sell_price: float = 0.40
     hard_exit_retry_cooldown_seconds: float = 2.0
+    hard_exit_dust_shares: float = 0.25
     hard_exit_final_seconds: int = 30
 
 
