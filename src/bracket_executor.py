@@ -195,6 +195,19 @@ class BracketExecutor:
             return filled_size
         return max(float(fallback_size or 0.0), 0.0)
 
+    @staticmethod
+    def _phase1_stepdown_size(current_shares: float, min_shares: float) -> float:
+        current = max(float(current_shares or 0.0), 0.0)
+        minimum = max(float(min_shares or 0.0), 0.0)
+        # The live crypto lanes intentionally use a 5–10 share window. Only
+        # step down inside that regime; falling from 5 to 1 shares in tests or
+        # other tiny-share configs would change behavior more than intended.
+        if minimum < 5.0 - 1e-9:
+            return 0.0
+        if current <= minimum + 1e-9:
+            return 0.0
+        return round(minimum, 6)
+
     async def _confirm_follow_taker_fill(
         self,
         *,
@@ -396,6 +409,14 @@ class BracketExecutor:
         return "not enough balance / allowance" in text or "not enough balance" in text
 
     @staticmethod
+    def _is_fak_no_match_failure(error: str) -> bool:
+        text = (error or "").lower()
+        return (
+            "no orders found to match with fak order" in text
+            or "fak orders are partially filled or killed if no match is found" in text
+        )
+
+    @staticmethod
     def _round_shares(size: float) -> float:
         return round(max(size, 0.0), 3)
 
@@ -546,17 +567,33 @@ class BracketExecutor:
 
         This keeps the signal path intact while improving the odds that a fast
         5-minute hard exit can sell the newly bought token immediately.
+
+        Calls ensure_allowance first (approves the USDC spend), then waits for
+        the token balance to propagate into the portfolio API.  Without the
+        wait, the stop could fire in the next tick and see visible_position=0
+        (token still settling), causing every sell attempt to break immediately
+        before placing any order.
         """
         ensure_allowance = getattr(self._client, "ensure_token_sell_allowance", None)
-        if not callable(ensure_allowance) or not token_id:
+        if not token_id:
             return
-        try:
-            await ensure_allowance(token_id)
-        except Exception as exc:
+        if callable(ensure_allowance):
+            try:
+                await ensure_allowance(token_id)
+            except Exception as exc:
+                logger.warning(
+                    "BracketExecutor: post-fill sell readiness refresh failed  token={} error={}",
+                    token_id,
+                    exc,
+                )
+        # Wait for the token to appear as spendable in the portfolio.  The CLOB
+        # fill completes before the balance is visible; without this wait a hard
+        # exit firing seconds later will see 0 shares and never place any order.
+        visible = await self._wait_for_visible_token_position(token_id)
+        if visible is None or visible <= 1e-6:
             logger.warning(
-                "BracketExecutor: post-fill sell readiness refresh failed  token={} error={}",
+                "BracketExecutor: token not yet visible after fill readiness wait  token={}",
                 token_id,
-                exc,
             )
 
     async def _reconcile_ambiguous_phase1_submission(
@@ -922,6 +959,8 @@ class BracketExecutor:
                         refresh_payload.get("ok", False) if refresh_payload else "n/a",
                     )
                 else:
+                    stepdown_shares = 0.0
+                    stepdown_order_id = ""
                     attempt_log.append(
                         {
                             "attempt": attempt_index + 1,
@@ -935,6 +974,88 @@ class BracketExecutor:
                             **retry_context,
                         }
                     )
+                    if (
+                        entry_style == "FOLLOW_TAKER"
+                        and not request_exception_failure
+                        and self._should_retry_follow_taker_failure(error=error_text)
+                    ):
+                        stepdown_shares = self._phase1_stepdown_size(shares, min_shares)
+                    if stepdown_shares > 0:
+                        logger.info(
+                            "BracketExecutor: Phase 1 retrying same-cycle with smaller block  "
+                            "asset={} position_id={} attempt={} full_shares={:.3f} fallback_shares={:.3f} limit={:.4f}",
+                            event.asset,
+                            position_id,
+                            attempt_index + 1,
+                            shares,
+                            stepdown_shares,
+                            attempt_price,
+                        )
+                        try:
+                            stepdown_result = await self._client.place_buy_order(
+                                token_id=momentum_token_id,
+                                price=attempt_price,
+                                size=stepdown_shares,
+                                entry_style=entry_style,
+                                client_order_id=position_id,
+                            )
+                            stepdown_order_id = str(stepdown_result.get("exchange_order_id") or "")
+                            filled, fill_price, fill_payload = await self._confirm_follow_taker_fill(
+                                order_result=stepdown_result,
+                                order_id=stepdown_order_id,
+                                expected_size=stepdown_shares,
+                                fallback_price=attempt_price,
+                            )
+                            attempt_log.append(
+                                {
+                                    "attempt": attempt_index + 1,
+                                    "submit_limit_price": attempt_price,
+                                    "order_id": stepdown_order_id,
+                                    "status": "SIZE_STEPDOWN_FILLED" if filled else "SIZE_STEPDOWN_NOT_FILLED",
+                                    "shares": stepdown_shares,
+                                    "fill_payload": fill_payload,
+                                    "stepdown": True,
+                                    **retry_context,
+                                }
+                            )
+                            if filled:
+                                result = stepdown_result
+                                order_id = stepdown_order_id
+                                shares = stepdown_shares
+                                phase1_filled = True
+                                logger.info(
+                                    "BracketExecutor: Phase 1 smaller-block fallback FILLED  "
+                                    "asset={} position_id={} shares={:.3f} fill_price={:.4f}",
+                                    event.asset,
+                                    position_id,
+                                    shares,
+                                    fill_price,
+                                )
+                                break
+                        except Exception as step_exc:
+                            step_error_text = str(step_exc)
+                            step_error_details = self._exception_diagnostics(step_exc)
+                            attempt_log.append(
+                                {
+                                    "attempt": attempt_index + 1,
+                                    "submit_limit_price": attempt_price,
+                                    "order_id": stepdown_order_id,
+                                    "status": "SIZE_STEPDOWN_FAILED",
+                                    "error": step_error_text,
+                                    "shares": stepdown_shares,
+                                    "stepdown": True,
+                                    **step_error_details,
+                                    **retry_context,
+                                }
+                            )
+                            logger.info(
+                                "BracketExecutor: Phase 1 smaller-block fallback failed  "
+                                "asset={} position_id={} attempt={} error={}",
+                                event.asset,
+                                position_id,
+                                attempt_index + 1,
+                                step_error_text,
+                            )
                     if retryable:
                         logger.info(
                             "BracketExecutor: Phase 1 retrying after order failure  asset={} "
@@ -1399,17 +1520,39 @@ class BracketExecutor:
                 if visible_position_shares is not None:
                     sell_target_shares = min(remaining_shares, visible_position_shares)
                     if sell_target_shares <= 1e-6:
-                        last_error = RuntimeError("hard exit token balance unavailable")
+                        # Token is in the positions API but balance shows 0 —
+                        # the buy settled at the CLOB but the wallet credit is
+                        # still propagating.  Wait for it instead of breaking
+                        # immediately; without this wait, every retry attempt
+                        # breaks here and the position rides to full loss.
                         logger.warning(
-                            "BracketExecutor: hard exit waiting for spendable token balance  asset={} "
-                            "reason={} remaining={:.3f} visible_position={:.3f} position_id={}",
+                            "BracketExecutor: hard exit token balance zero — waiting for credit  "
+                            "asset={} reason={} remaining={:.3f} visible_position={:.3f} position_id={}",
                             pos.asset,
                             reason,
                             remaining_shares,
                             visible_position_shares,
                             pos.position_id,
                         )
-                        break
+                        waited_shares = await self._wait_for_visible_token_position(
+                            pos.p1_token_id,
+                            min_shares=min_shares,
+                        )
+                        if waited_shares is not None and waited_shares > 1e-6:
+                            visible_position_remaining = waited_shares
+                            sell_target_shares = min(remaining_shares, waited_shares)
+                        else:
+                            last_error = RuntimeError(
+                                "hard exit token balance unavailable after visibility wait"
+                            )
+                            logger.warning(
+                                "BracketExecutor: hard exit token still not spendable after wait  "
+                                "asset={} reason={} position_id={}",
+                                pos.asset,
+                                reason,
+                                pos.position_id,
+                            )
+                            break
 
                 sell_context = await self._marketable_book_context(
                     token_id=pos.p1_token_id,
@@ -1449,6 +1592,7 @@ class BracketExecutor:
                         continue
 
                 result: dict[str, Any] | None = None
+                step_lower_after_no_match = False
                 for sell_attempt in range(2):
                     try:
                         result = await self._client.place_sell_order(
@@ -1505,8 +1649,29 @@ class BracketExecutor:
                                 break
                             await asyncio.sleep(0.05)
                             continue
+                        if self._is_fak_no_match_failure(str(exc)):
+                            last_error = RuntimeError(
+                                f"hard exit no match at {attempt_price:.3f}: {exc}"
+                            )
+                            step_lower_after_no_match = True
+                            break
                         raise
                 if result is None:
+                    if step_lower_after_no_match:
+                        if idx + 1 < len(attempt_prices):
+                            logger.warning(
+                                "BracketExecutor: hard exit no-match stepping lower  asset={} "
+                                "reason={} attempt_price={:.4f} next_price={:.4f} remaining={:.3f} "
+                                "position_id={}",
+                                pos.asset,
+                                reason,
+                                attempt_price,
+                                attempt_prices[idx + 1],
+                                remaining_shares,
+                                pos.position_id,
+                            )
+                            continue
+                        raise last_error or RuntimeError("hard exit no match at floor")
                     raise last_error or RuntimeError("hard exit order placement returned no result")
                 order_id = str(result.get("exchange_order_id") or "")
                 if order_id:
