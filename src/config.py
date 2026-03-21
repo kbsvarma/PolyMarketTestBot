@@ -360,6 +360,10 @@ class CryptoDirectionConfig(BaseModel):
     stretch_min_chop_score: float = 0.0
     stretch_min_lag_gap: float = 0.0
     stretch_min_consecutive_polls: int = 1
+    # Minimum consecutive eval polls the signal must hold before firing on core/standard tier.
+    # Set > 1 on noisy timeframes (e.g. 5m) to filter signals that immediately reverse.
+    # stretch tier uses stretch_min_consecutive_polls; this applies to all other tiers.
+    core_min_consecutive_polls: int = 1
 
     # ---- Gate 5: Chop filter ----
     # How many recent :00-second checkpoints to evaluate for directional cleanliness.

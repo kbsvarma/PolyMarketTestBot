@@ -355,6 +355,8 @@ crypto_direction_profiles:
     stretch_min_chop_score: 0.66
     stretch_min_lag_gap: 0.03
     stretch_min_consecutive_polls: 2
+    core_min_consecutive_polls: 3     # require signal to hold 3 consecutive polls (~3s) before firing;
+                                      # filters BTC noise spikes that reverse within 6-27s of entry
     continuation_enabled: false
     continuation_min_minutes_remaining: 1.5
     continuation_min_asset_move_pct: 0.00035

@@ -93,6 +93,8 @@ class _WindowState:
     # Signal state
     signal_fired: bool = False
     signal_fired_side: str = ""     # "YES" or "NO" — prevents duplicate signals same side
+    pending_signal_signature: str = ""  # tracks short persistence before a live fire
+    pending_signal_count: int = 0
 
     # :00-second deduplication — avoid recording the same second twice
     last_checkpoint_second: int = -1
@@ -113,6 +115,7 @@ GATE_CHOP = "CHOP_FILTER_FAIL"
 GATE_LAG = "LAG_GAP_INSUFFICIENT"
 GATE_COOLDOWN = "ALREADY_FIRED_THIS_WINDOW"
 GATE_NO_STATE = "NO_WINDOW_STATE"
+GATE_PERSISTENCE = "PERSISTENCE_PENDING"
 GATE_FIRED = "SIGNAL_FIRED"
 
 
@@ -535,6 +538,11 @@ class DirectionSignalEvaluator:
         now = time.time()
         state = self._state
 
+        def fail(result: str, *, reset_persistence: bool = True, **data: Any) -> dict[str, Any]:
+            if reset_persistence:
+                self._reset_signal_persistence()
+            return {"result": result, **data}
+
         # ---- Gate 0: Window settle ----
         # Skip the noisy first N seconds after window open. The AMM seeds
         # liquidity at extreme spreads and BTC flickers ±0.02% before real
@@ -542,34 +550,34 @@ class DirectionSignalEvaluator:
         # dramatically reduces false signals from opening noise.
         seconds_since_open = now - state.window_open_ts
         if seconds_since_open < self._cfg.window_settle_seconds:
-            return {
-                "result": "WINDOW_SETTLING",
-                "seconds_since_open": round(seconds_since_open, 1),
-                "window_settle_seconds": self._cfg.window_settle_seconds,
-            }
+            return fail(
+                "WINDOW_SETTLING",
+                seconds_since_open=round(seconds_since_open, 1),
+                window_settle_seconds=self._cfg.window_settle_seconds,
+            )
 
         # ---- Gate 1: Time ----
         # Must have enough window left for Phase 2 to develop.
         minutes_remaining = (state.window_close_ts - now) / 60.0
         if minutes_remaining < self._cfg.time_gate_minutes:
-            return {
-                "result": GATE_TIME,
-                "minutes_remaining": round(minutes_remaining, 2),
-                "time_gate_minutes": self._cfg.time_gate_minutes,
-            }
+            return fail(
+                GATE_TIME,
+                minutes_remaining=round(minutes_remaining, 2),
+                time_gate_minutes=self._cfg.time_gate_minutes,
+            )
 
         # ---- Gate 2: Asset move ----
         # BTC/ETH must have moved meaningfully from window open.
         if state.asset_open <= 0:
-            return {"result": GATE_MOVE, "reason": "asset_open_zero"}
+            return fail(GATE_MOVE, reason="asset_open_zero")
 
         asset_move_pct = (asset_price - state.asset_open) / state.asset_open
         if abs(asset_move_pct) < self._asset_vol_cfg.min_asset_move_pct:
-            return {
-                "result": GATE_MOVE,
-                "asset_move_pct": round(asset_move_pct, 6),
-                "min_required": self._asset_vol_cfg.min_asset_move_pct,
-            }
+            return fail(
+                GATE_MOVE,
+                asset_move_pct=round(asset_move_pct, 6),
+                min_required=self._asset_vol_cfg.min_asset_move_pct,
+            )
 
         # ---- Gate 3: Momentum side and price range ----
         # Determine which token is the "momentum side" based on direction.
@@ -585,22 +593,23 @@ class DirectionSignalEvaluator:
             momentum_price = no_ask
             opposite_price = yes_ask
 
-        if not (self._cfg.entry_range_low <= momentum_price <= self._cfg.entry_range_high):
-            return {
-                "result": GATE_RANGE,
-                "momentum_side": momentum_side,
-                "momentum_price": round(momentum_price, 4),
-                "entry_range": [self._cfg.entry_range_low, self._cfg.entry_range_high],
-            }
+        entry_tier = self._entry_tier_for_price(momentum_price)
+        if entry_tier is None:
+            return fail(
+                GATE_RANGE,
+                momentum_side=momentum_side,
+                momentum_price=round(momentum_price, 4),
+                entry_range=[self._cfg.entry_range_low, self._cfg.entry_range_high],
+            )
 
         # ---- Gate 4: Price sanity ----
         # Both YES and NO prices must be available (non-zero means data is present).
         if yes_ask <= 0 or no_ask <= 0:
-            return {
-                "result": GATE_STALE,
-                "yes_ask": yes_ask,
-                "no_ask": no_ask,
-            }
+            return fail(
+                GATE_STALE,
+                yes_ask=yes_ask,
+                no_ask=no_ask,
+            )
 
         # ---- Gate 5: Chop filter ----
         # The asset must have moved CLEANLY in one direction — not oscillated.
@@ -609,12 +618,12 @@ class DirectionSignalEvaluator:
         # score even before the first minute-mark checkpoint arrives.
         chop_score = self._compute_chop_score(asset_move_pct, asset_price)
         if chop_score < self._cfg.chop_min_score:
-            return {
-                "result": GATE_CHOP,
-                "chop_score": round(chop_score, 3),
-                "min_required": self._cfg.chop_min_score,
-                "checkpoints_used": len(state.checkpoints[-self._cfg.chop_window:]),
-            }
+            return fail(
+                GATE_CHOP,
+                chop_score=round(chop_score, 3),
+                min_required=self._cfg.chop_min_score,
+                checkpoints_used=len(state.checkpoints[-self._cfg.chop_window:]),
+            )
 
         # ---- Gate 6: Cooldown ----
         # Once a window has fired, the executor and report should treat later
@@ -622,10 +631,10 @@ class DirectionSignalEvaluator:
         # applies before lag/continuation selection so continuation cannot
         # bypass the one-signal-per-window rule.
         if state.signal_fired:
-            return {
-                "result": GATE_COOLDOWN,
-                "fired_side": state.signal_fired_side,
-            }
+            return fail(
+                GATE_COOLDOWN,
+                fired_side=state.signal_fired_side,
+            )
 
         # ---- Gate 7: Lag gap ----
         # The GBM fair-value estimate for momentum_side must exceed the actual
@@ -651,6 +660,7 @@ class DirectionSignalEvaluator:
                 return {
                     "result": GATE_FIRED,
                     "entry_model": "band_touch",
+                    "entry_tier": entry_tier,
                     "minutes_remaining": round(minutes_remaining, 2),
                     "asset_move_pct": round(asset_move_pct, 6),
                     "momentum_side": momentum_side,
@@ -671,6 +681,7 @@ class DirectionSignalEvaluator:
                 return {
                     "result": GATE_FIRED,
                     "entry_model": "continuation",
+                    "entry_tier": entry_tier,
                     "minutes_remaining": round(minutes_remaining, 2),
                     "asset_move_pct": round(asset_move_pct, 6),
                     "momentum_side": momentum_side,
@@ -680,18 +691,39 @@ class DirectionSignalEvaluator:
                     "lag_gap": round(lag_gap, 4),
                     "implied_momentum_price": round(implied_momentum_price, 4),
                 }
-            return {
-                "result": GATE_LAG,
-                "lag_gap": round(lag_gap, 4),
-                "implied_momentum_price": round(implied_momentum_price, 4),
-                "momentum_price": round(momentum_price, 4),
-                "min_required": self._cfg.lag_threshold,
-            }
+            return fail(
+                GATE_LAG,
+                lag_gap=round(lag_gap, 4),
+                implied_momentum_price=round(implied_momentum_price, 4),
+                momentum_price=round(momentum_price, 4),
+                min_required=self._cfg.lag_threshold,
+                entry_tier=entry_tier,
+            )
+
+        stretch_gate = self._stretch_gate_result(
+            entry_tier=entry_tier,
+            asset_move_pct=asset_move_pct,
+            chop_score=chop_score,
+            lag_gap=lag_gap,
+            momentum_side=momentum_side,
+            momentum_price=momentum_price,
+        )
+        if stretch_gate is not None:
+            return stretch_gate
+
+        persistence_gate = self._persistence_gate_result(
+            entry_model="lag",
+            entry_tier=entry_tier,
+            momentum_side=momentum_side,
+        )
+        if persistence_gate is not None:
+            return persistence_gate
 
         # ---- All gates passed ----
         return {
             "result": GATE_FIRED,
             "entry_model": "lag",
+            "entry_tier": entry_tier,
             "minutes_remaining": round(minutes_remaining, 2),
             "asset_move_pct": round(asset_move_pct, 6),
             "momentum_side": momentum_side,
@@ -701,6 +733,145 @@ class DirectionSignalEvaluator:
             "lag_gap": round(lag_gap, 4),
             "implied_momentum_price": round(implied_momentum_price, 4),
         }
+
+    def _reset_signal_persistence(self) -> None:
+        state = self._state
+        if state is None:
+            return
+        state.pending_signal_signature = ""
+        state.pending_signal_count = 0
+
+    def _entry_tier_for_price(self, momentum_price: float) -> str | None:
+        cfg = self._cfg
+        low = float(cfg.entry_range_low)
+        high = float(cfg.entry_range_high)
+        if not (low <= momentum_price <= high):
+            return None
+
+        core_high = float(getattr(cfg, "entry_core_range_high", 0.0) or 0.0)
+        stretch_high = float(getattr(cfg, "stretch_entry_range_high", 0.0) or 0.0)
+        if (
+            core_high <= 0.0
+            or stretch_high <= 0.0
+            or stretch_high <= core_high
+            or stretch_high < (high - 1e-9)
+        ):
+            return "core"
+        if momentum_price <= core_high:
+            return "core"
+        if momentum_price <= stretch_high:
+            return "stretch"
+        return None
+
+    def _stretch_gate_result(
+        self,
+        *,
+        entry_tier: str,
+        asset_move_pct: float,
+        chop_score: float,
+        lag_gap: float,
+        momentum_side: str,
+        momentum_price: float,
+    ) -> dict[str, Any] | None:
+        if entry_tier != "stretch":
+            return None
+
+        min_move = max(
+            float(self._asset_vol_cfg.min_asset_move_pct or 0.0),
+            float(getattr(self._cfg, "stretch_min_asset_move_pct", 0.0) or 0.0),
+        )
+        if abs(asset_move_pct) < min_move:
+            self._reset_signal_persistence()
+            return {
+                "result": GATE_MOVE,
+                "asset_move_pct": round(asset_move_pct, 6),
+                "min_required": min_move,
+                "momentum_side": momentum_side,
+                "momentum_price": round(momentum_price, 4),
+                "entry_tier": entry_tier,
+            }
+
+        min_chop = max(
+            float(self._cfg.chop_min_score or 0.0),
+            float(getattr(self._cfg, "stretch_min_chop_score", 0.0) or 0.0),
+        )
+        if chop_score < min_chop:
+            self._reset_signal_persistence()
+            return {
+                "result": GATE_CHOP,
+                "chop_score": round(chop_score, 3),
+                "min_required": min_chop,
+                "momentum_side": momentum_side,
+                "momentum_price": round(momentum_price, 4),
+                "entry_tier": entry_tier,
+            }
+
+        min_lag = max(
+            float(self._cfg.lag_threshold or 0.0),
+            float(getattr(self._cfg, "stretch_min_lag_gap", 0.0) or 0.0),
+        )
+        if lag_gap < min_lag:
+            self._reset_signal_persistence()
+            return {
+                "result": GATE_LAG,
+                "lag_gap": round(lag_gap, 4),
+                "implied_momentum_price": round(momentum_price + lag_gap, 4),
+                "momentum_price": round(momentum_price, 4),
+                "min_required": min_lag,
+                "momentum_side": momentum_side,
+                "entry_tier": entry_tier,
+            }
+        return None
+
+    def _persistence_gate_result(
+        self,
+        *,
+        entry_model: str,
+        entry_tier: str,
+        momentum_side: str,
+    ) -> dict[str, Any] | None:
+        required = 1
+        if entry_tier == "stretch":
+            required = max(
+                1,
+                int(getattr(self._cfg, "stretch_min_consecutive_polls", 1) or 1),
+            )
+        else:
+            # core/standard tier: apply core_min_consecutive_polls if configured.
+            # Filters noise spikes on short timeframes (e.g. 5m) where BTC can
+            # pass all 7 gates and then reverse in seconds — requiring the signal
+            # to hold for N consecutive polls before firing prevents most of these.
+            required = max(
+                required,
+                int(getattr(self._cfg, "core_min_consecutive_polls", 1) or 1),
+            )
+        if required <= 1:
+            self._reset_signal_persistence()
+            return None
+
+        state = self._state
+        if state is None:
+            return None
+
+        signature = f"{entry_model}:{momentum_side}:{entry_tier}"
+        if state.pending_signal_signature == signature:
+            state.pending_signal_count += 1
+        else:
+            state.pending_signal_signature = signature
+            state.pending_signal_count = 1
+
+        if state.pending_signal_count < required:
+            return {
+                "result": GATE_PERSISTENCE,
+                "entry_model": entry_model,
+                "entry_tier": entry_tier,
+                "momentum_side": momentum_side,
+                "consecutive_polls": state.pending_signal_count,
+                "min_required": required,
+            }
+
+        self._reset_signal_persistence()
+        return None
 
     def _compute_chop_score(self, asset_move_pct: float, current_price: float) -> float:
         """
@@ -888,6 +1059,7 @@ class DirectionSignalEvaluator:
         # Update window state so post-signal tracking and cooldown work
         state.signal_fired = True
         state.signal_fired_side = momentum_side
+        self._reset_signal_persistence()
         state.observation = PostSignalObservation(
             event_id=event.event_id,
             momentum_side_peak=momentum_price,   # initialise to entry price
@@ -902,10 +1074,11 @@ class DirectionSignalEvaluator:
         })
 
         logger.info(
-            "BRACKET SIGNAL FIRED | asset={} model={} side={} price={} lag_gap={:.3f} "
+            "BRACKET SIGNAL FIRED | asset={} model={} tier={} side={} price={} lag_gap={:.3f} "
             "chop={:.2f} net_bracket_target={:.4f} mins_left={:.1f} "
             "market_id={}",
-            self.asset, event.entry_model, momentum_side, momentum_price, gate["lag_gap"],
+            self.asset, event.entry_model, gate.get("entry_tier", "core"),
+            momentum_side, momentum_price, gate["lag_gap"],
             gate["chop_score"], net_bracket_at_target, gate["minutes_remaining"],
             market_meta.get("market_id", "?"),
         )
@@ -944,8 +1117,11 @@ def _build_live_snapshot(
         "move_threshold_cfg": asset_vol_cfg.min_asset_move_pct,
         "entry_range_low_cfg": cfg.entry_range_low,
         "entry_range_high_cfg": cfg.entry_range_high,
+        "entry_core_range_high_cfg": round(float(getattr(cfg, "entry_core_range_high", 0.0) or 0.0), 4),
+        "stretch_entry_range_high_cfg": round(float(getattr(cfg, "stretch_entry_range_high", 0.0) or 0.0), 4),
         "chop_min_score_cfg": cfg.chop_min_score,
         "lag_threshold_cfg": cfg.lag_threshold,
+        "stretch_min_persistence_polls_cfg": int(getattr(cfg, "stretch_min_consecutive_polls", 1) or 1),
     }
 
     if not state:
@@ -959,6 +1135,8 @@ def _build_live_snapshot(
     )
     snapshot["mid_window_start"] = state.mid_window_start
     snapshot["signal_already_fired"] = state.signal_fired
+    snapshot["pending_signal_signature"] = state.pending_signal_signature
+    snapshot["pending_signal_count"] = state.pending_signal_count
 
     if state.asset_open <= 0 or asset_price <= 0:
         return snapshot
@@ -989,6 +1167,15 @@ def _build_live_snapshot(
     if momentum_side:
         snapshot["momentum_side_live"] = momentum_side
         snapshot["momentum_price_live"] = round(momentum_price, 4)
+        tier = "OUT_OF_RANGE"
+        if cfg.entry_range_low <= momentum_price <= cfg.entry_range_high:
+            core_high = float(getattr(cfg, "entry_core_range_high", 0.0) or 0.0)
+            stretch_high = float(getattr(cfg, "stretch_entry_range_high", 0.0) or 0.0)
+            if core_high > 0.0 and stretch_high > core_high and momentum_price > core_high:
+                tier = "stretch"
+            else:
+                tier = "core"
+        snapshot["entry_tier_live"] = tier
         snapshot["opposite_price_live"] = round(opposite_price, 4)
         snapshot["momentum_ask_size_live"] = round(float(momentum_ask_size or 0.0), 4)
         snapshot["opposite_ask_size_live"] = round(float(opposite_ask_size or 0.0), 4)

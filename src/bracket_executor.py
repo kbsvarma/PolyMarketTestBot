@@ -1595,6 +1595,22 @@ class BracketExecutor:
                         if waited_shares is not None and waited_shares > 1e-6:
                             visible_position_remaining = waited_shares
                             sell_target_shares = min(remaining_shares, waited_shares)
+                        elif float(pos.p1_fill_price or 0.0) > 0:
+                            # Balance still zero after wait, but Phase 1 fill is confirmed.
+                            # Don't break — fall through with remaining_shares and let the
+                            # exchange be the authority on whether the tokens exist.
+                            # Breaking here is what caused positions to ride to full settlement
+                            # loss: every tick broke immediately, zero sell orders ever placed.
+                            sell_target_shares = remaining_shares
+                            logger.warning(
+                                "BracketExecutor: hard exit balance still zero after wait — "
+                                "proceeding blind on confirmed fill  "
+                                "asset={} reason={} remaining={:.3f} position_id={}",
+                                pos.asset,
+                                reason,
+                                remaining_shares,
+                                pos.position_id,
+                            )
                         else:
                             last_error = RuntimeError(
                                 "hard exit token balance unavailable after visibility wait"
