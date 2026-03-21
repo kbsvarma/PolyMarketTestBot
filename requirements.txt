@@ -10,3 +10,4 @@ python-dotenv>=1.0,<2
 pytest>=8.2,<9
 py-clob-client>=0.23,<1
 cryptography>=42,<46
+aiohttp>=3.9

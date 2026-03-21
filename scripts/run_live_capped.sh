@@ -8,7 +8,7 @@ SYSTEM_LOG="$ROOT/logs/system.log"
 cd "$ROOT"
 source .venv/bin/activate
 
-export POLYBOT_CONFIG_PATH="${POLYBOT_CONFIG_PATH:-config.live_smoke.yaml}"
+export POLYBOT_CONFIG_PATH="${POLYBOT_CONFIG_PATH:-config.yaml}"
 export POLYBOT_LIVE_SESSION_MAX_USD="${POLYBOT_LIVE_SESSION_MAX_USD:-30}"
 export POLYBOT_LIVE_MAX_TRADE_USD="${POLYBOT_LIVE_MAX_TRADE_USD:-5}"
 export POLYBOT_LIVE_MAX_POSITIONS="${POLYBOT_LIVE_MAX_POSITIONS:-10}"
@@ -25,19 +25,29 @@ echo "  state: $APP_STATE"
 echo ""
 echo "Live heartbeat will print every 10s."
 
+# Main wallet-following bot
 python main.py &
 BOT_PID=$!
 
+# BTC 15-minute bracket observer (separate process — must be started alongside main bot)
+python -u main.py --execute-crypto-instance polymarket_btc_15m &
+CRYPTO_PID=$!
+
 cleanup() {
+  echo "[shutdown] stopping all bot processes..."
   if kill -0 "$BOT_PID" 2>/dev/null; then
     kill "$BOT_PID" 2>/dev/null || true
     wait "$BOT_PID" 2>/dev/null || true
+  fi
+  if kill -0 "$CRYPTO_PID" 2>/dev/null; then
+    kill "$CRYPTO_PID" 2>/dev/null || true
+    wait "$CRYPTO_PID" 2>/dev/null || true
   fi
 }
 
 trap cleanup INT TERM
 
-while kill -0 "$BOT_PID" 2>/dev/null; do
+while kill -0 "$BOT_PID" 2>/dev/null && kill -0 "$CRYPTO_PID" 2>/dev/null; do
   if [[ -f "$APP_STATE" ]]; then
     python -c '
 import json
@@ -69,4 +79,7 @@ else:
   sleep 10
 done
 
-wait "$BOT_PID"
+echo "[shutdown] a bot process exited — cleaning up remaining processes"
+cleanup
+wait "$BOT_PID" 2>/dev/null || true
+wait "$CRYPTO_PID" 2>/dev/null || true
