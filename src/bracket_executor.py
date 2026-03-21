@@ -2033,8 +2033,20 @@ class BracketExecutor:
         entry_style = self._cfg.phase2_entry_style
         shares = pos.p1_shares   # symmetric sizing matches both legs
 
-        # Build attempt price list: base price, then one retry at the FOK ceiling.
-        base_price = round(min(max(y_price, 0.01), 0.99), 4)
+        # Build attempt price list: base price (with latency buffer), then one
+        # retry at the FOK ceiling.
+        #
+        # phase2_fok_entry_buffer: lift the FIRST attempt above the detection
+        # price.  By the time the FOK reaches the exchange the ask has already
+        # moved slightly; submitting at the raw reclaim price almost always
+        # results in an immediate kill.  Capped at fok_ceiling so the bracket
+        # margin is never blown.
+        fok_entry_buffer = float(
+            getattr(self._cfg, "phase2_fok_entry_buffer", 0.01) or 0.0
+        )
+        base_price = round(
+            min(max(y_price + fok_entry_buffer, 0.01), fok_ceiling, 0.99), 4
+        )
         attempt_prices: list[float] = [base_price]
         fok_slippage = float(getattr(self._cfg, "phase2_fok_retry_slippage", 0.02) or 0.0)
         if entry_style == "FOLLOW_TAKER" and fok_slippage > 0:
@@ -2062,8 +2074,15 @@ class BracketExecutor:
                 )
             except Exception as exc:
                 exc_str = str(exc).lower()
+                # Use apostrophe-agnostic substrings: the Polymarket API error
+                # "order couldn't be fully filled" may contain a Unicode
+                # right-single-quote (U+2019) rather than an ASCII apostrophe,
+                # which would cause an exact string match to silently fail and
+                # skip the retry entirely.
                 is_fok_rejection = (
-                    "couldn't be fully filled" in exc_str or "fok orders" in exc_str
+                    ("fully filled" in exc_str and "fok" in exc_str)
+                    or "fok orders" in exc_str
+                    or ("fully filled" in exc_str and "status_code=400" in exc_str)
                 )
                 if not is_retry and is_fok_rejection and len(attempt_prices) > 1:
                     logger.info(

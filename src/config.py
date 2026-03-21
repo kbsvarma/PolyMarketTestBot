@@ -482,6 +482,12 @@ class CryptoDirectionConfig(BaseModel):
     # signal_price + lag_gap * multiplier (capped at entry_range_high).
     # 0.0 = disabled (same price as attempt 0).
     phase1_lag_retry_multiplier: float = 0.0
+    # Phase 2 FOK entry buffer: lift the initial attempt price this many cents
+    # above the reclaim detection price to absorb submission latency.  The
+    # reclaim is detected at y_price but the ask keeps moving; without a buffer
+    # the FOK arrives at the exchange marginally below the ask and is killed.
+    # Capped at profitable_y_ceiling so the bracket margin is never blown.
+    phase2_fok_entry_buffer: float = 0.01
     # Phase 2 FOK retry: on FOK rejection, retry once at y_price + slippage
     # capped at profitable_y_ceiling.  0.0 = disabled.
     phase2_fok_retry_slippage: float = 0.02
