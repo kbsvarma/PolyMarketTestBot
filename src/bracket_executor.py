@@ -328,9 +328,10 @@ class BracketExecutor:
 
     def _phase1_retry_ceiling(self, event: BracketSignalEvent, initial_limit: float) -> float:
         retry_to_cap = bool(getattr(self._cfg, "phase1_follow_taker_retry_to_strategy_cap", False))
-        if not retry_to_cap:
-            return round(initial_limit, 4)
 
+        # Resolve the strategy-level cap once; both retry_to_cap and the
+        # lag-conditioned path use it, and both must respect the same
+        # continuation / band-touch sub-caps.
         strategy_cap = float(getattr(self._cfg, "entry_range_high", initial_limit) or initial_limit)
         entry_model = str(event.entry_model or "").lower()
         if entry_model == "continuation":
@@ -343,7 +344,31 @@ class BracketExecutor:
                 getattr(self._cfg, "immediate_band_entry_high", strategy_cap) or strategy_cap
             )
             strategy_cap = min(strategy_cap, band_cap)
-        return round(max(initial_limit, min(0.99, strategy_cap)), 4)
+
+        if retry_to_cap:
+            return round(max(initial_limit, min(0.99, strategy_cap)), 4)
+
+        # Lag-conditioned retry ceiling: if the signal had a strong GBM lag gap,
+        # the retry is allowed to chase up to signal_price + lag_gap * multiplier.
+        # Budget reasoning: if lag_gap = 0.04 and multiplier = 0.5, we pay at most
+        # 2c above signal price — still 2c below GBM fair value, edge is positive.
+        # Hard cap at entry_range_high so the strategy ceiling is never crossed.
+        # Disabled (multiplier = 0.0) by default; opt-in via phase1_lag_retry_multiplier.
+        lag_retry_multiplier = float(
+            getattr(self._cfg, "phase1_lag_retry_multiplier", 0.0) or 0.0
+        )
+        if lag_retry_multiplier > 0:
+            lag_gap = float(getattr(event, "lag_gap", 0.0) or 0.0)
+            if lag_gap > 0:
+                signal_price = float(
+                    getattr(event, "momentum_price", initial_limit) or initial_limit
+                )
+                lag_ceiling = round(signal_price + lag_gap * lag_retry_multiplier, 4)
+                lag_ceiling = min(lag_ceiling, strategy_cap, 0.99)
+                lag_ceiling = max(lag_ceiling, initial_limit)
+                return round(lag_ceiling, 4)
+
+        return round(initial_limit, 4)
 
     @staticmethod
     def _exception_diagnostics(exc: BaseException) -> dict[str, str]:
@@ -849,57 +874,72 @@ class BracketExecutor:
 
         for attempt_index in range(retry_budget + 1):
             attempt_price = entry_price if attempt_index == 0 else retry_ceiling_price
-            retry_context = await self._phase1_retry_context(
-                token_id=momentum_token_id,
-                limit_price=attempt_price,
-                shares=target_shares,
+
+            # On the first FOLLOW_TAKER attempt, optionally skip the pre-submission
+            # orderbook fetch (phase1_skip_depth_precheck).  Submitting the FOK
+            # immediately saves ~100–300 ms on the hot path; the exchange 400
+            # rejection is the safety net if depth isn't there.  On retries we
+            # always fetch so the lag-conditioned ceiling gate works correctly.
+            skip_depth_precheck = (
+                attempt_index == 0
+                and entry_style == "FOLLOW_TAKER"
+                and bool(getattr(self._cfg, "phase1_skip_depth_precheck", False))
             )
-            executable_shares = self._round_shares(float(retry_context.get("executable_shares") or 0.0))
-            if executable_shares + 1e-9 < min_shares:
-                best_ask = float(retry_context.get("best_ask") or 0.0)
-                can_retry_for_lift = (
-                    attempt_index < retry_budget
-                    and retry_ceiling_price > attempt_price + 1e-9
-                    and best_ask > 0.0
-                    and best_ask <= retry_ceiling_price + 1e-9
+            if skip_depth_precheck:
+                retry_context: dict[str, Any] = {}
+                shares = target_shares
+            else:
+                retry_context = await self._phase1_retry_context(
+                    token_id=momentum_token_id,
+                    limit_price=attempt_price,
+                    shares=target_shares,
                 )
-                logger.info(
-                    "BracketExecutor: Phase 1 skipped for thin depth  asset={} position_id={} "
-                    "attempt={} best_ask={} marketable_depth={:.2f} executable={:.3f} "
-                    "min_required={:.3f} limit={:.4f}",
-                    event.asset,
-                    position_id,
-                    attempt_index + 1,
-                    retry_context.get("best_ask", 0.0),
-                    float(retry_context.get("marketable_depth") or 0.0),
-                    executable_shares,
-                    min_shares,
-                    attempt_price,
-                )
-                attempt_log.append(
-                    {
-                        "attempt": attempt_index + 1,
-                        "submit_limit_price": attempt_price,
-                        "status": "RETRY_SKIPPED" if attempt_index > 0 else "DEPTH_TOO_THIN",
-                        "min_required_shares": min_shares,
-                        **retry_context,
-                    }
-                )
-                if can_retry_for_lift:
+                executable_shares = self._round_shares(float(retry_context.get("executable_shares") or 0.0))
+                if executable_shares + 1e-9 < min_shares:
+                    best_ask = float(retry_context.get("best_ask") or 0.0)
+                    can_retry_for_lift = (
+                        attempt_index < retry_budget
+                        and retry_ceiling_price > attempt_price + 1e-9
+                        and best_ask > 0.0
+                        and best_ask <= retry_ceiling_price + 1e-9
+                    )
                     logger.info(
-                        "BracketExecutor: Phase 1 retrying after thin depth  asset={} "
-                        "position_id={} attempt={} best_ask={:.4f} retry_limit={:.4f}",
+                        "BracketExecutor: Phase 1 skipped for thin depth  asset={} position_id={} "
+                        "attempt={} best_ask={} marketable_depth={:.2f} executable={:.3f} "
+                        "min_required={:.3f} limit={:.4f}",
                         event.asset,
                         position_id,
                         attempt_index + 1,
-                        best_ask,
-                        retry_ceiling_price,
+                        retry_context.get("best_ask", 0.0),
+                        float(retry_context.get("marketable_depth") or 0.0),
+                        executable_shares,
+                        min_shares,
+                        attempt_price,
                     )
-                    if retry_delay > 0:
-                        await asyncio.sleep(retry_delay)
-                    continue
-                break
-            shares = executable_shares
+                    attempt_log.append(
+                        {
+                            "attempt": attempt_index + 1,
+                            "submit_limit_price": attempt_price,
+                            "status": "RETRY_SKIPPED" if attempt_index > 0 else "DEPTH_TOO_THIN",
+                            "min_required_shares": min_shares,
+                            **retry_context,
+                        }
+                    )
+                    if can_retry_for_lift:
+                        logger.info(
+                            "BracketExecutor: Phase 1 retrying after thin depth  asset={} "
+                            "position_id={} attempt={} best_ask={:.4f} retry_limit={:.4f}",
+                            event.asset,
+                            position_id,
+                            attempt_index + 1,
+                            best_ask,
+                            retry_ceiling_price,
+                        )
+                        if retry_delay > 0:
+                            await asyncio.sleep(retry_delay)
+                        continue
+                    break
+                shares = executable_shares
 
             try:
                 result = await self._client.place_buy_order(
