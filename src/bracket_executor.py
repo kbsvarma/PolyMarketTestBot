@@ -914,6 +914,26 @@ class BracketExecutor:
                     limit_price=attempt_price,
                     shares=target_shares,
                 )
+                # On retries, abort if the ask has already fallen below the original
+                # signal price — the trade thesis is gone and retrying would be
+                # chasing a falling market (e.g. FOK failed because book was thin
+                # during a fast move and price continued lower).
+                if attempt_index > 0:
+                    retry_ask = float(retry_context.get("best_ask") or 0.0)
+                    if retry_ask > 0 and retry_ask < signal_price:
+                        logger.info(
+                            "BracketExecutor: Phase 1 retry aborted — ask below signal price  "
+                            "asset={} position_id={} attempt={} signal_price={:.4f} ask={:.4f}",
+                            event.asset, position_id, attempt_index + 1, signal_price, retry_ask,
+                        )
+                        attempt_log.append({
+                            "attempt": attempt_index + 1,
+                            "submit_limit_price": attempt_price,
+                            "status": "RETRY_ABORTED_FALLING_PRICE",
+                            "signal_price": signal_price,
+                            "current_ask": retry_ask,
+                        })
+                        break
                 executable_shares = self._round_shares(float(retry_context.get("executable_shares") or 0.0))
                 if executable_shares + 1e-9 < min_shares:
                     best_ask = float(retry_context.get("best_ask") or 0.0)
@@ -2096,10 +2116,11 @@ class BracketExecutor:
         if momentum_ask > entry - buffer:
             return  # not dropped enough yet
 
-        # Require at least 10 seconds since fill to let Phase 2 arming have a
-        # chance — avoids false triggers on initial orderbook noise.
+        # Require at least 3 seconds since fill to avoid triggering on the very
+        # first tick after fill (orderbook noise). 10s was too long — positions
+        # that crash fast (e.g. 4–8s) were never caught before STOP_50C.
         seconds_since_fill = time.time() - (pos.p1_filled_at or pos.opened_at)
-        if seconds_since_fill < 10.0:
+        if seconds_since_fill < 3.0:
             return
 
         sellable_bid = yes_bid if pos.momentum_side == "YES" else no_bid
