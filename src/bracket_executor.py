@@ -2007,9 +2007,11 @@ class BracketExecutor:
             pos.asset, safe_price, pos.min_opposite_price, y_price,
             x_cost, net_margin, pos.position_id,
         )
-        await self._place_phase2(pos, y_price)
+        await self._place_phase2(pos, y_price, profitable_y_ceiling)
 
-    async def _place_phase2(self, pos: BracketPosition, y_price: float) -> None:
+    async def _place_phase2(
+        self, pos: BracketPosition, y_price: float, fok_ceiling: float
+    ) -> None:
         """
         Place the Phase 2 (opposite_side) buy order.
 
@@ -2019,87 +2021,124 @@ class BracketExecutor:
             reversal price risks missing the fill window entirely.
           - FOLLOW_TAKER fills at current market price or fails immediately.
           - On success we mark BRACKET_COMPLETE immediately (no polling needed).
+
+        FIX #6: one immediate FOK retry on rejection.
+          - If the book moved between reclaim detection and order submission,
+            retry once at y_price + phase2_fok_retry_slippage, capped at
+            fok_ceiling (the profitable_y_ceiling from the caller).
         """
         pos.phase = BracketPhase.PHASE2_PENDING   # prevent re-entry next tick
         pos.p2_last_attempt_ts = time.time()
 
         entry_style = self._cfg.phase2_entry_style
-        # Clamp to valid Polymarket price range (0.01–0.99)
-        entry_price = round(min(max(y_price, 0.01), 0.99), 4)
         shares = pos.p1_shares   # symmetric sizing matches both legs
 
-        logger.info(
-            "BracketExecutor: placing Phase 2  asset={}  style={}  "
-            "token={}  price={:.4f}  shares={:.1f}",
-            pos.asset, entry_style, pos.p2_token_id, entry_price, shares,
-        )
+        # Build attempt price list: base price, then one retry at the FOK ceiling.
+        base_price = round(min(max(y_price, 0.01), 0.99), 4)
+        attempt_prices: list[float] = [base_price]
+        fok_slippage = float(getattr(self._cfg, "phase2_fok_retry_slippage", 0.02) or 0.0)
+        if entry_style == "FOLLOW_TAKER" and fok_slippage > 0:
+            retry_price = round(min(y_price + fok_slippage, fok_ceiling, 0.99), 4)
+            if retry_price >= base_price + 0.005:  # meaningful headroom (≥ half a cent)
+                attempt_prices.append(retry_price)
 
-        try:
-            result = await self._client.place_buy_order(
-                token_id=pos.p2_token_id,
-                price=entry_price,
-                size=shares,
-                entry_style=entry_style,
-                client_order_id=f"{pos.position_id}-p2",
+        for attempt_idx, entry_price in enumerate(attempt_prices):
+            is_retry = attempt_idx > 0
+
+            logger.info(
+                "BracketExecutor: placing Phase 2{}  asset={}  style={}  "
+                "token={}  price={:.4f}  shares={:.1f}",
+                " (FOK retry)" if is_retry else "",
+                pos.asset, entry_style, pos.p2_token_id, entry_price, shares,
             )
-        except Exception as exc:
-            # Revert to PHASE1_FILLED so next tick re-evaluates after cooldown
-            pos.phase = BracketPhase.PHASE1_FILLED
-            logger.error("BracketExecutor: Phase 2 FAILED — {} (retry in {}s)",
-                         exc, self._P2_RETRY_COOLDOWN)
-            self._audit({
-                "type": "PHASE2_ORDER_FAILED",
-                "position_id": pos.position_id,
-                "asset": pos.asset,
-                "attempted_price": entry_price,
-                "error": str(exc),
-            })
-            return
 
-        pos.p2_order_id = result.get("exchange_order_id", "")
-        pos.p2_price = entry_price
-        pos.p2_shares = shares
-        pos.p2_notional_usd = round(entry_price * shares, 4)
-
-        # FOLLOW_TAKER must be explicitly confirmed as filled.
-        if entry_style == "FOLLOW_TAKER":
-            filled, fill_price, fill_payload = await self._confirm_follow_taker_fill(
-                order_result=result,
-                order_id=pos.p2_order_id,
-                expected_size=shares,
-                fallback_price=entry_price,
-            )
-            if not filled:
-                pos.phase = BracketPhase.PHASE1_FILLED
-                logger.warning(
-                    "BracketExecutor: Phase 2 not filled after submission  "
-                    "asset={} status={} position_id={}",
-                    pos.asset,
-                    self._normalized_status(fill_payload),
-                    pos.position_id,
+            try:
+                result = await self._client.place_buy_order(
+                    token_id=pos.p2_token_id,
+                    price=entry_price,
+                    size=shares,
+                    entry_style=entry_style,
+                    client_order_id=f"{pos.position_id}-p2{'r' if is_retry else ''}",
                 )
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                is_fok_rejection = (
+                    "couldn't be fully filled" in exc_str or "fok orders" in exc_str
+                )
+                if not is_retry and is_fok_rejection and len(attempt_prices) > 1:
+                    logger.info(
+                        "BracketExecutor: Phase 2 FOK rejected at {:.4f} — "
+                        "retrying at {:.4f}",
+                        entry_price, attempt_prices[1],
+                    )
+                    continue
+                # Non-FOK error, or last attempt — revert for 15s cooldown retry.
+                pos.phase = BracketPhase.PHASE1_FILLED
+                logger.error("BracketExecutor: Phase 2 FAILED — {} (retry in {}s)",
+                             exc, self._P2_RETRY_COOLDOWN)
                 self._audit({
-                    "type": "PHASE2_NOT_FILLED",
+                    "type": "PHASE2_ORDER_FAILED",
                     "position_id": pos.position_id,
                     "asset": pos.asset,
-                    "order_id": pos.p2_order_id,
-                    "status": self._normalized_status(fill_payload),
-                    "fill_payload": fill_payload,
+                    "attempted_price": entry_price,
+                    "error": str(exc),
                 })
                 return
-            pos.p2_fill_price = fill_price
-            pos.phase = BracketPhase.BRACKET_COMPLETE
-        else:
-            # PASSIVE_LIMIT: order placed, will be confirmed later via poll
-            # Phase stays PHASE2_PENDING until we verify
-            # (Phase 2 PASSIVE_LIMIT poll is handled in _poll_phase2_fill)
-            pos.p2_fill_price = 0.0
+
+            pos.p2_order_id = result.get("exchange_order_id", "")
+            pos.p2_price = entry_price
+            pos.p2_shares = shares
+            pos.p2_notional_usd = round(entry_price * shares, 4)
+
+            # FOLLOW_TAKER must be explicitly confirmed as filled.
+            if entry_style == "FOLLOW_TAKER":
+                filled, fill_price, fill_payload = await self._confirm_follow_taker_fill(
+                    order_result=result,
+                    order_id=pos.p2_order_id,
+                    expected_size=shares,
+                    fallback_price=entry_price,
+                )
+                if not filled:
+                    if not is_retry and len(attempt_prices) > 1:
+                        logger.info(
+                            "BracketExecutor: Phase 2 FOK not filled at {:.4f} — "
+                            "retrying at {:.4f}",
+                            entry_price, attempt_prices[1],
+                        )
+                        continue
+                    pos.phase = BracketPhase.PHASE1_FILLED
+                    logger.warning(
+                        "BracketExecutor: Phase 2 not filled after submission  "
+                        "asset={} status={} position_id={}",
+                        pos.asset,
+                        self._normalized_status(fill_payload),
+                        pos.position_id,
+                    )
+                    self._audit({
+                        "type": "PHASE2_NOT_FILLED",
+                        "position_id": pos.position_id,
+                        "asset": pos.asset,
+                        "order_id": pos.p2_order_id,
+                        "status": self._normalized_status(fill_payload),
+                        "fill_payload": fill_payload,
+                    })
+                    return
+                pos.p2_fill_price = fill_price
+                pos.phase = BracketPhase.BRACKET_COMPLETE
+            else:
+                # PASSIVE_LIMIT: order placed, will be confirmed later via poll
+                # Phase stays PHASE2_PENDING until we verify
+                # (Phase 2 PASSIVE_LIMIT poll is handled in _poll_phase2_fill)
+                pos.p2_fill_price = 0.0
+
+            # Order placed (and filled if FOLLOW_TAKER) — exit the retry loop.
+            break
 
         x_cost = pos.p1_fill_price or pos.p1_price
         guaranteed = round(
             1.0
             - x_cost * (1.0 + taker_fee(x_cost, category="crypto price"))
-            - entry_price * (1.0 + taker_fee(entry_price, category="crypto price")),
+            - pos.p2_price * (1.0 + taker_fee(pos.p2_price, category="crypto price")),
             6,
         )
 
@@ -2107,7 +2146,7 @@ class BracketExecutor:
             "BracketExecutor: Phase 2 PLACED — bracket LOCKED 🔒  "
             "asset={}  p1={:.4f}  p2={:.4f}  "
             "guaranteed_margin={:.4f}  order_id={}",
-            pos.asset, x_cost, entry_price, guaranteed, pos.p2_order_id,
+            pos.asset, x_cost, pos.p2_price, guaranteed, pos.p2_order_id,
         )
         self._audit({
             "type": "PHASE2_ORDER_PLACED",
@@ -2115,7 +2154,7 @@ class BracketExecutor:
             "asset": pos.asset,
             "entry_style": entry_style,
             "p2_token_id": pos.p2_token_id,
-            "p2_price": entry_price,
+            "p2_price": pos.p2_price,
             "p2_fill_price": pos.p2_fill_price,
             "p2_shares": shares,
             "p2_order_id": pos.p2_order_id,

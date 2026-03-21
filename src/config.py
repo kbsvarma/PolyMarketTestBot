@@ -482,6 +482,9 @@ class CryptoDirectionConfig(BaseModel):
     # signal_price + lag_gap * multiplier (capped at entry_range_high).
     # 0.0 = disabled (same price as attempt 0).
     phase1_lag_retry_multiplier: float = 0.0
+    # Phase 2 FOK retry: on FOK rejection, retry once at y_price + slippage
+    # capped at profitable_y_ceiling.  0.0 = disabled.
+    phase2_fok_retry_slippage: float = 0.02
     phase2_entry_style: str = "FOLLOW_TAKER"
     bracket_audit_log_path: str = "logs/bracket_trades.jsonl"
     # Hard exit: sell Phase-1 leg mid-window to cap losses.
