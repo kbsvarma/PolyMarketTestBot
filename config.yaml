@@ -488,8 +488,9 @@ crypto_direction_profiles:
     hard_exit_emergency_min_sell_price: 0.40
     hard_exit_dust_shares: 0.25
     immediate_band_entry_enabled: false
-    poll_interval_seconds: 1.0
-    price_refresh_interval_seconds: 1.0
+    poll_interval_seconds: 0.25          # was 1.0 — tighter poll cuts price-staleness window from 0-1s to 0-0.25s;
+                                          # reduces gap between signal detection and when FOK hits exchange
+    price_refresh_interval_seconds: 0.25 # was 1.0 — match poll cadence
     signal_event_log_path: "logs/crypto_signal_events_pm_btc_15m.jsonl"
     evaluation_log_path: "logs/crypto_signal_evaluations_pm_btc_15m.jsonl"
     window_report_path: "logs/window_report_pm_btc_15m.md"
