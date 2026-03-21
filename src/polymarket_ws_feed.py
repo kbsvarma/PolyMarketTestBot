@@ -212,11 +212,10 @@ class PolymarketWSFeed:
             ping_timeout=10,
             close_timeout=5,
         ) as ws:
-            # Subscribe to market price events
+            # Subscribe to market price events.
+            # Correct Polymarket CLOB WS format: lowercase type, assets_ids only.
             subscribe_msg = json.dumps({
-                "auth": {},
-                "type": "Market",
-                "markets": [self._market_id],
+                "type": "market",
                 "assets_ids": [self._yes_token, self._no_token],
             })
             await ws.send(subscribe_msg)
@@ -251,9 +250,11 @@ class PolymarketWSFeed:
         """
         Parse a raw WebSocket message and update internal price state.
 
-        Supports:
-          - List of event objects (Polymarket often batches)
-          - Single event object
+        Polymarket CLOB WS sends two message shapes:
+          1. Initial snapshot: list of book objects, one per token.
+             Each has asset_id, bids[], asks[].
+          2. Ongoing ticks: dict with price_changes[] array.
+             Each entry has asset_id, best_ask, best_bid directly.
         """
         try:
             payload: Any = json.loads(raw)
@@ -261,53 +262,56 @@ class PolymarketWSFeed:
             return
 
         if isinstance(payload, list):
+            # Initial book snapshot — one entry per subscribed token
             for item in payload:
-                self._handle_event(item)
+                if isinstance(item, dict):
+                    self._handle_book(item)
         elif isinstance(payload, dict):
-            self._handle_event(payload)
+            # Ongoing price_changes ticks
+            changes = payload.get("price_changes")
+            if isinstance(changes, list):
+                for change in changes:
+                    if isinstance(change, dict):
+                        self._handle_price_change(change)
 
-    def _handle_event(self, event: dict[str, Any]) -> None:
-        """Dispatch a single event dict to the appropriate handler."""
-        event_type = event.get("event_type", "")
-        if event_type == "price_change":
-            self._handle_price_change(event)
-        elif event_type == "book":
-            self._handle_book(event)
-        # Ignore heartbeats, last_trade_price, and other event types
-
-    def _handle_price_change(self, event: dict[str, Any]) -> None:
+    def _handle_price_change(self, change: dict[str, Any]) -> None:
         """
-        Handle a `price_change` tick.
+        Handle one entry from a price_changes tick.
 
-        Only SELL-side (ask) updates are relevant — that is what we pay to
-        BUY a YES or NO token.
+        Polymarket sends best_ask and best_bid directly in each entry —
+        no need to parse book levels. We only care about best_ask (what
+        we pay to BUY a YES or NO token).
         """
-        side = event.get("side", "").upper()
-        if side != "SELL":
-            return   # BID update — not relevant for entry cost
-
-        asset_id = event.get("asset_id", "")
+        asset_id = change.get("asset_id", "")
+        best_ask_str = change.get("best_ask")
+        if not best_ask_str:
+            return
         try:
-            price = float(event.get("price", 0))
-            size = float(event.get("size", 0))
+            best_ask = float(best_ask_str)
+            # size not directly available at best_ask in tick; use 0 as sentinel
+            # (AssetWatcher only gates on size for depth checks, not signal logic)
+            best_ask_size = 0.0
         except (TypeError, ValueError):
             return
 
+        if best_ask <= 0:
+            return
+
         if asset_id == self._yes_token:
-            self._yes_ask = price
-            self._yes_ask_size = size
+            self._yes_ask = best_ask
+            self._yes_ask_size = best_ask_size
             self._last_update_ts = time.time()
         elif asset_id == self._no_token:
-            self._no_ask = price
-            self._no_ask_size = size
+            self._no_ask = best_ask
+            self._no_ask_size = best_ask_size
             self._last_update_ts = time.time()
 
     def _handle_book(self, event: dict[str, Any]) -> None:
         """
-        Handle a `book` snapshot event.
+        Handle one token's initial book snapshot (from the list on connect).
 
-        Extracts the best ask (lowest priced ask) from the asks list and
-        updates yes_ask or no_ask depending on the asset_id.
+        Extracts the best ask (lowest price in asks[]) and seeds the
+        internal price state before the first price_change tick arrives.
         """
         asset_id = event.get("asset_id", "")
         asks: list[dict[str, Any]] = event.get("asks", [])
@@ -316,7 +320,6 @@ class PolymarketWSFeed:
         best_ask_size: float = 0.0
 
         if asks:
-            # asks may be sorted ascending already; find the minimum just in case
             try:
                 best = min(asks, key=lambda x: float(x.get("price", 9999)))
                 best_ask_price = float(best.get("price", 0))
