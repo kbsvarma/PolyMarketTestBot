@@ -2044,11 +2044,17 @@ class BracketExecutor:
                 )
 
         if fill_price is not None:
-            pnl = round((fill_price - entry) * pos.p1_shares, 4)
+            entry_cost = entry * (1.0 + taker_fee(entry, category="crypto price"))
+            exit_proceeds = fill_price * (1.0 - taker_fee(fill_price, category="crypto price"))
+            pnl = round((exit_proceeds - entry_cost) * pos.p1_shares, 4)
+            filled_shares = pos.p1_shares
             pos.phase = BracketPhase.HARD_EXITED
             pos.hard_exit_reason = "SHALLOW_REVERSAL_SELL"
             pos.hard_exit_fill_price = fill_price
-            pos.hard_exit_filled_shares = pos.p1_shares
+            pos.hard_exit_filled_shares = filled_shares
+            pos.actual_pnl_usd = pnl   # keep accounting consistent with hard-exit path
+            pos.p1_shares = 0.0        # prevent on_window_close from double-counting
+            pos.closed_at = time.time()
             self._audit({
                 "type": "SHALLOW_REVERSAL_SELL",
                 "position_id": pos.position_id,
@@ -2058,7 +2064,7 @@ class BracketExecutor:
                 "momentum_price_at_sell": round(momentum_ask, 4),
                 "drop_from_peak": round(pos.peak_momentum_price - momentum_ask, 4),
                 "fill_price": fill_price,
-                "shares": pos.p1_shares,
+                "shares": filled_shares,
                 "actual_pnl_usd": pnl,
                 "execution_mode": self._execution_mode,
             })
@@ -2158,11 +2164,17 @@ class BracketExecutor:
                 )
 
         if fill_price is not None:
-            pnl = round((fill_price - entry) * pos.p1_shares, 4)
+            entry_cost = entry * (1.0 + taker_fee(entry, category="crypto price"))
+            exit_proceeds = fill_price * (1.0 - taker_fee(fill_price, category="crypto price"))
+            pnl = round((exit_proceeds - entry_cost) * pos.p1_shares, 4)
+            filled_shares = pos.p1_shares
             pos.phase = BracketPhase.HARD_EXITED
             pos.hard_exit_reason = "CROSSBACK_STOP"
             pos.hard_exit_fill_price = fill_price
-            pos.hard_exit_filled_shares = pos.p1_shares
+            pos.hard_exit_filled_shares = filled_shares
+            pos.actual_pnl_usd = pnl   # keep accounting consistent with hard-exit path
+            pos.p1_shares = 0.0        # prevent on_window_close from double-counting
+            pos.closed_at = time.time()
             self._audit({
                 "type": "CROSSBACK_STOP",
                 "position_id": pos.position_id,
@@ -2171,7 +2183,7 @@ class BracketExecutor:
                 "momentum_price_at_exit": round(momentum_ask, 4),
                 "buffer_used": buffer,
                 "fill_price": fill_price,
-                "shares": pos.p1_shares,
+                "shares": filled_shares,
                 "actual_pnl_usd": pnl,
                 "execution_mode": self._execution_mode,
             })
