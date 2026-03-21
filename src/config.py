@@ -348,11 +348,18 @@ class CryptoDirectionConfig(BaseModel):
     time_gate_minutes: float = 9.0
 
     # ---- Gate 3: Momentum side price range ----
-    # Signal only fires when the momentum_side ask is in this range.
-    # 57-68¢ = aggressive 5m profile: still directional, but not so tight that
-    # we miss clean continuation windows before they become executable.
-    entry_range_low: float = 0.57
-    entry_range_high: float = 0.63
+    # Signal only fires when the momentum-side ask is inside the approved band.
+    # Current safer 5m approach loosens the low side slightly while keeping a
+    # tighter ceiling, then treats the top of the band as a stricter "stretch"
+    # lane rather than a normal entry.
+    entry_range_low: float = 0.55
+    entry_range_high: float = 0.61
+    entry_core_range_high: float = 0.60
+    stretch_entry_range_high: float = 0.61
+    stretch_min_asset_move_pct: float = 0.0
+    stretch_min_chop_score: float = 0.0
+    stretch_min_lag_gap: float = 0.0
+    stretch_min_consecutive_polls: int = 1
 
     # ---- Gate 5: Chop filter ----
     # How many recent :00-second checkpoints to evaluate for directional cleanliness.
@@ -386,7 +393,7 @@ class CryptoDirectionConfig(BaseModel):
     immediate_band_entry_high: float = 0.61
     continuation_hard_exit_grace_seconds: float = 0.0
     continuation_catastrophic_stop_price: float = 0.0
-    safe_arm_suspend_stop: bool = True
+    safe_arm_suspend_stop: bool = False
     safe_arm_catastrophic_stop_price: float = 0.0
 
     # ---- Post-signal bracket tracking ----
@@ -468,6 +475,13 @@ class CryptoDirectionConfig(BaseModel):
     phase1_follow_taker_retry_attempts: int = 1
     phase1_follow_taker_retry_delay_seconds: float = 0.10
     phase1_follow_taker_retry_to_strategy_cap: bool = False
+    # Skip the pre-submission orderbook fetch on attempt 0 to reduce latency.
+    # The FOK exchange rejection is the protection; saves ~100-300ms on hot path.
+    phase1_skip_depth_precheck: bool = False
+    # Lag-conditioned retry ceiling multiplier.  On retry, the ceiling is
+    # signal_price + lag_gap * multiplier (capped at entry_range_high).
+    # 0.0 = disabled (same price as attempt 0).
+    phase1_lag_retry_multiplier: float = 0.0
     phase2_entry_style: str = "FOLLOW_TAKER"
     bracket_audit_log_path: str = "logs/bracket_trades.jsonl"
     # Hard exit: sell Phase-1 leg mid-window to cap losses.
