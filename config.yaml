@@ -487,6 +487,8 @@ crypto_direction_profiles:
                                           # and FOK submission; 4c buffer catches partial-recovery market
                                           # while staying within fok_ceiling (profitable_y_ceiling)
     phase2_fok_retry_slippage: 0.04       # was 0.02 (default) — retry with same extra room as initial buffer
+    use_websocket_feed: true              # stream YES/NO ask prices via Polymarket CLOB WS instead of REST;
+                                          # eliminates ~250ms poll staleness; falls back to REST if feed stale
     hard_exit_emergency_min_sell_price: 0.40
     hard_exit_dust_shares: 0.25
     immediate_band_entry_enabled: false
