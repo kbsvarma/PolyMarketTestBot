@@ -55,7 +55,7 @@ RTDS_STALENESS_THRESHOLD_SECONDS = 3.0
 RECV_TIMEOUT_SECONDS = 6.0
 
 # Back-off cap between reconnect attempts (seconds)
-MAX_RECONNECT_BACKOFF_SECONDS = 30.0
+MAX_RECONNECT_BACKOFF_SECONDS = 90.0
 
 
 @dataclass

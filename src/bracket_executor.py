@@ -127,6 +127,8 @@ class BracketPosition:
     hard_exit_fill_price: float = 0.0
     hard_exit_filled_shares: float = 0.0
     hard_exit_order_ids:  list[str] = field(default_factory=list)
+    peak_momentum_price: float = 0.0    # running max of momentum-side ask since Phase 1 fill
+    phase2_tightened:    bool  = False   # True once Phase 2 safe_y has been tightened to target_y
 
     # ── Outcome (filled at window close) ─────────────────────────────────
     outcome:        str   = ""    # "YES_WINS" | "NO_WINS" | "UNKNOWN"
@@ -1397,8 +1399,24 @@ class BracketExecutor:
             if pos.phase == BracketPhase.PHASE1_PENDING:
                 await self._poll_phase1_fill(pos)
             elif pos.phase == BracketPhase.PHASE1_FILLED:
-                # Hard exit check takes priority over Phase 2.
-                # If it fires, phase becomes HARD_EXITED and Phase 2 is skipped.
+                # Update running peak of momentum-side ask since fill.
+                _momentum_ask = yes_ask if pos.momentum_side == "YES" else no_ask
+                if _momentum_ask > 0 and _momentum_ask > pos.peak_momentum_price:
+                    pos.peak_momentum_price = _momentum_ask
+
+                # Layer 1: Shallow reversal sell — armed but never tightened, price
+                # reversed from peak.  Fires before hard exit (at a better price).
+                await self._check_shallow_reversal_sell(pos, yes_ask, no_ask, yes_bid=yes_bid, no_bid=no_bid)
+                if pos.phase != BracketPhase.PHASE1_FILLED:
+                    continue
+
+                # Layer 3: Pre-arm crossback stop — never armed, price drifted below
+                # entry by the configured buffer.  Cuts loss before hard-exit level.
+                await self._check_crossback_stop(pos, yes_ask, no_ask, yes_bid=yes_bid, no_bid=no_bid)
+                if pos.phase != BracketPhase.PHASE1_FILLED:
+                    continue
+
+                # Layer 4: Hard exit — existing last-resort stop (50c or final window).
                 await self._check_hard_exit(pos, yes_ask, no_ask, yes_bid=yes_bid, no_bid=no_bid)
                 if pos.phase == BracketPhase.PHASE1_FILLED and self._cfg.phase2_enabled and not pos.hard_exit_reason:
                     await self._check_phase2(pos, yes_ask, no_ask)
@@ -1924,6 +1942,230 @@ class BracketExecutor:
                 "asset": pos.asset,
             })
 
+    # ── Layer 1: Shallow reversal sell ───────────────────────────────────
+
+    async def _check_shallow_reversal_sell(
+        self,
+        pos: BracketPosition,
+        yes_ask: float,
+        no_ask: float,
+        *,
+        yes_bid: float = 0.0,
+        no_bid: float = 0.0,
+    ) -> None:
+        """
+        Sell the Phase-1 leg when the position armed Phase 2 (price moved in our
+        favour) but never reached the deep target_y level (phase2_tightened is
+        False), and the momentum price has since reversed at least
+        shallow_reversal_drop_threshold cents from its peak.
+
+        Data shows 3/3 "armed-but-not-tightened" positions hard-exited (100%).
+        Selling on reversal here captures a small profit instead of waiting for
+        the 0.50 hard exit.  Phase 2 bracket is NOT attempted for these positions
+        because the margin is too thin (< 0.003 net margin at arm time).
+
+        This runs before _check_hard_exit so it fires at a better price.
+        The hard exit remains as the backstop if this sell fails.
+        """
+        if pos.phase != BracketPhase.PHASE1_FILLED:
+            return
+        if pos.hard_exit_reason:
+            return
+        # Only fires when armed (price moved our way) but NOT tightened (shallow move)
+        if pos.safe_opposite_price <= 0:
+            return
+        if pos.phase2_tightened:
+            return
+
+        threshold = float(
+            getattr(self._cfg, "shallow_reversal_drop_threshold", 0.02) or 0.02
+        )
+        momentum_ask = yes_ask if pos.momentum_side == "YES" else no_ask
+        if momentum_ask <= 0 or pos.peak_momentum_price <= 0:
+            return
+        if momentum_ask > pos.peak_momentum_price - threshold:
+            return  # reversal not confirmed yet
+
+        # Sell at bid, walk down two steps if needed
+        sellable_bid = yes_bid if pos.momentum_side == "YES" else no_bid
+        start_price = round(sellable_bid if sellable_bid > 0 else max(0.01, momentum_ask - 0.02), 2)
+        attempt_prices = [
+            start_price,
+            round(max(0.01, start_price - 0.01), 2),
+            round(max(0.01, start_price - 0.02), 2),
+        ]
+
+        entry = pos.p1_fill_price or pos.p1_price
+        logger.info(
+            "BracketExecutor: ▶ Shallow reversal sell  asset={}  entry={:.4f}  "
+            "peak={:.4f}  now={:.4f}  drop={:.4f}  start_price={:.4f}  position_id={}",
+            pos.asset, entry, pos.peak_momentum_price, momentum_ask,
+            pos.peak_momentum_price - momentum_ask, start_price, pos.position_id,
+        )
+
+        fill_price: float | None = None
+        for attempt_price in attempt_prices:
+            try:
+                result = await self._client.place_sell_order(
+                    token_id=pos.p1_token_id,
+                    price=attempt_price,
+                    size=pos.p1_shares,
+                    entry_style="FOLLOW_TAKER_PARTIAL",
+                    client_order_id=f"{pos.position_id}-shallow-rev-sell",
+                )
+                if result:
+                    fill_price = attempt_price
+                    break
+            except Exception as exc:
+                logger.warning(
+                    "BracketExecutor: shallow reversal sell attempt failed  "
+                    "asset={}  price={:.4f}  error={}  position_id={}",
+                    pos.asset, attempt_price, exc, pos.position_id,
+                )
+
+        if fill_price is not None:
+            pnl = round((fill_price - entry) * pos.p1_shares, 4)
+            pos.phase = BracketPhase.HARD_EXITED
+            pos.hard_exit_reason = "SHALLOW_REVERSAL_SELL"
+            pos.hard_exit_fill_price = fill_price
+            pos.hard_exit_filled_shares = pos.p1_shares
+            self._audit({
+                "type": "SHALLOW_REVERSAL_SELL",
+                "position_id": pos.position_id,
+                "asset": pos.asset,
+                "entry_price": entry,
+                "peak_momentum_price": round(pos.peak_momentum_price, 4),
+                "momentum_price_at_sell": round(momentum_ask, 4),
+                "drop_from_peak": round(pos.peak_momentum_price - momentum_ask, 4),
+                "fill_price": fill_price,
+                "shares": pos.p1_shares,
+                "actual_pnl_usd": pnl,
+                "execution_mode": self._execution_mode,
+            })
+            logger.info(
+                "BracketExecutor: ✅ Shallow reversal sell filled  asset={}  "
+                "fill={:.4f}  entry={:.4f}  pnl={:.4f}  position_id={}",
+                pos.asset, fill_price, entry, pnl, pos.position_id,
+            )
+        else:
+            logger.warning(
+                "BracketExecutor: shallow reversal sell ALL ATTEMPTS FAILED — "
+                "hard exit remains as backstop  asset={}  position_id={}",
+                pos.asset, pos.position_id,
+            )
+
+    # ── Layer 3: Pre-arm crossback stop ──────────────────────────────────
+
+    async def _check_crossback_stop(
+        self,
+        pos: BracketPosition,
+        yes_ask: float,
+        no_ask: float,
+        *,
+        yes_bid: float = 0.0,
+        no_bid: float = 0.0,
+    ) -> None:
+        """
+        Sell the Phase-1 leg when the price never moved in our favour (Phase 2
+        was never armed) and the momentum price has fallen crossback_stop_buffer
+        below the entry price.
+
+        Data shows 9/9 "never-armed" positions hard-exited (0% settle rate).
+        Exiting early at entry-minus-buffer saves ~$0.30–0.55 versus waiting for
+        the 0.50 hard exit, since all prices pass through this level on the way
+        down anyway.
+
+        This runs before _check_hard_exit so it fires at a better price.
+        The hard exit remains as the backstop if this sell fails.
+        """
+        if pos.phase != BracketPhase.PHASE1_FILLED:
+            return
+        if pos.hard_exit_reason:
+            return
+        # Only fires when Phase 2 was NEVER armed
+        if pos.safe_opposite_price > 0:
+            return
+
+        buffer = float(
+            getattr(self._cfg, "crossback_stop_buffer", 0.05) or 0.05
+        )
+        entry = pos.p1_fill_price or pos.p1_price
+        momentum_ask = yes_ask if pos.momentum_side == "YES" else no_ask
+        if momentum_ask <= 0:
+            return
+        if momentum_ask > entry - buffer:
+            return  # not dropped enough yet
+
+        # Require at least 10 seconds since fill to let Phase 2 arming have a
+        # chance — avoids false triggers on initial orderbook noise.
+        seconds_since_fill = time.time() - (pos.p1_filled_at or pos.opened_at)
+        if seconds_since_fill < 10.0:
+            return
+
+        sellable_bid = yes_bid if pos.momentum_side == "YES" else no_bid
+        start_price = round(sellable_bid if sellable_bid > 0 else max(0.01, momentum_ask - 0.02), 2)
+        attempt_prices = [
+            start_price,
+            round(max(0.01, start_price - 0.01), 2),
+            round(max(0.01, start_price - 0.02), 2),
+        ]
+
+        logger.info(
+            "BracketExecutor: ▶ Crossback stop (never armed)  asset={}  entry={:.4f}  "
+            "now={:.4f}  buffer={:.4f}  start_price={:.4f}  position_id={}",
+            pos.asset, entry, momentum_ask, buffer, start_price, pos.position_id,
+        )
+
+        fill_price: float | None = None
+        for attempt_price in attempt_prices:
+            try:
+                result = await self._client.place_sell_order(
+                    token_id=pos.p1_token_id,
+                    price=attempt_price,
+                    size=pos.p1_shares,
+                    entry_style="FOLLOW_TAKER_PARTIAL",
+                    client_order_id=f"{pos.position_id}-crossback-stop",
+                )
+                if result:
+                    fill_price = attempt_price
+                    break
+            except Exception as exc:
+                logger.warning(
+                    "BracketExecutor: crossback stop attempt failed  "
+                    "asset={}  price={:.4f}  error={}  position_id={}",
+                    pos.asset, attempt_price, exc, pos.position_id,
+                )
+
+        if fill_price is not None:
+            pnl = round((fill_price - entry) * pos.p1_shares, 4)
+            pos.phase = BracketPhase.HARD_EXITED
+            pos.hard_exit_reason = "CROSSBACK_STOP"
+            pos.hard_exit_fill_price = fill_price
+            pos.hard_exit_filled_shares = pos.p1_shares
+            self._audit({
+                "type": "CROSSBACK_STOP",
+                "position_id": pos.position_id,
+                "asset": pos.asset,
+                "entry_price": entry,
+                "momentum_price_at_exit": round(momentum_ask, 4),
+                "buffer_used": buffer,
+                "fill_price": fill_price,
+                "shares": pos.p1_shares,
+                "actual_pnl_usd": pnl,
+                "execution_mode": self._execution_mode,
+            })
+            logger.info(
+                "BracketExecutor: ✅ Crossback stop filled  asset={}  "
+                "fill={:.4f}  entry={:.4f}  pnl={:.4f}  position_id={}",
+                pos.asset, fill_price, entry, pnl, pos.position_id,
+            )
+        else:
+            logger.warning(
+                "BracketExecutor: crossback stop ALL ATTEMPTS FAILED — "
+                "hard exit remains as backstop  asset={}  position_id={}",
+                pos.asset, pos.position_id,
+            )
+
     # ── Phase 2 — trigger evaluation ─────────────────────────────────────
 
     async def _check_phase2(
@@ -2000,6 +2242,7 @@ class BracketExecutor:
         ):
             pos.safe_opposite_price = round(y_price, 6)
             safe_price = pos.safe_opposite_price
+            pos.phase2_tightened = True
             logger.info(
                 "BracketExecutor: Phase 2 safe tightened  asset={}  safe_y={:.4f}  "
                 "profit_ceiling={:.4f}  x_cost={:.4f}  net_margin={:.4f}  position_id={}",

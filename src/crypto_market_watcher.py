@@ -25,6 +25,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+import aiohttp
+
 try:
     from loguru import logger  # type: ignore[import]
 except ImportError:
@@ -158,6 +160,10 @@ class AssetWatcher:
         self._yes_ask_size: float = 0.0
         self._no_ask_size: float = 0.0
         self._last_price_ts: float = 0.0        # time() when prices were last refreshed
+
+        # --- Binance REST fallback (used when RTDS WebSocket is stale) ---
+        self._rest_fallback_price: float = 0.0
+        self._last_rest_poll_ts: float = 0.0
 
     def _reset_market_state(self, window_ts: int) -> None:
         """Clear market/orderbook state before resolving a new window."""
@@ -352,6 +358,10 @@ class AssetWatcher:
             if not self._market_resolved:
                 return
 
+        # Binance REST fallback: keep price warm when RTDS WebSocket is stale
+        if not self._rtds.snapshot().is_fresh():
+            await self._fetch_rest_price_fallback()
+
         # ---- WebSocket fast path (skips REST fetch when feed is fresh) ----
         if (
             self._cfg_use_ws
@@ -426,9 +436,61 @@ class AssetWatcher:
     # Public accessors
     # ------------------------------------------------------------------ #
 
+    async def _fetch_rest_price_fallback(self) -> None:
+        """
+        One-shot Binance REST poll to get the current spot price when the RTDS
+        WebSocket feed is stale.  Updates _rest_fallback_price.
+
+        Cooldown: at most once every 5 seconds to avoid hammering the API.
+        Errors are caught silently (logged at DEBUG only).
+        """
+        now = time.time()
+        if now - self._last_rest_poll_ts < 5.0:
+            return
+        self._last_rest_poll_ts = now
+
+        # Derive symbol from the binance_ws_url, e.g.
+        # wss://stream.binance.com/ws/btcusdt@aggTrade → BTCUSDT
+        ws_url = self._asset_cfg.binance_ws_url
+        symbol = "BTCUSDT"
+        try:
+            stream_part = ws_url.rstrip("/").split("/ws/")[-1]  # e.g. "btcusdt@aggTrade"
+            pair = stream_part.split("@")[0].upper()            # e.g. "BTCUSDT"
+            if pair:
+                symbol = pair
+        except Exception:
+            pass
+
+        url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    data = await resp.json()
+                    price = float(data["price"])
+                    if price > 0:
+                        self._rest_fallback_price = price
+                        logger.info(
+                            "RTDS stale — using Binance REST fallback price={}",
+                            price,
+                        )
+        except Exception as exc:
+            logger.debug(
+                "Binance REST fallback fetch failed asset={} symbol={} error={}",
+                self.asset, symbol, exc,
+            )
+
     def asset_price(self) -> float:
-        """Current BTC/USD or ETH/USD price from the Binance feed."""
-        return self._rtds.snapshot().binance_price
+        """Current BTC/USD or ETH/USD price from the Binance feed.
+
+        Returns the RTDS WebSocket price when live; falls back to the last
+        successful REST poll price when the WebSocket feed is stale.
+        """
+        snap = self._rtds.snapshot()
+        if snap.is_fresh() and snap.binance_price > 0:
+            return snap.binance_price
+        if self._rest_fallback_price > 0:
+            return self._rest_fallback_price
+        return snap.binance_price
 
     def rtds_is_fresh(self) -> bool:
         """True if the Binance price feed is live and not stale."""

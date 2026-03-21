@@ -24,6 +24,7 @@ from src.crypto_direction_signal import (
     GATE_LAG,
     GATE_MOVE,
     GATE_NO_STATE,
+    GATE_PERSISTENCE,
     GATE_RANGE,
     GATE_STALE,
     GATE_TIME,
@@ -257,6 +258,71 @@ class TestGateFailures:
         with _patch_time(NOW_IN_WINDOW), _patch_gbm(0.70):
             result = ev._run_gates(ASSET_PRICE_UP, YES_ASK_IN_RANGE, 0.0)
         assert result["result"] == GATE_STALE
+
+
+class TestTieredLagLane:
+    def test_core_lane_fires_immediately(self, tmp_path):
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=9.0,
+            entry_range_low=0.55,
+            entry_range_high=0.61,
+            entry_core_range_high=0.60,
+            stretch_entry_range_high=0.61,
+            stretch_min_asset_move_pct=0.0025,
+            stretch_min_chop_score=0.8,
+            stretch_min_lag_gap=0.08,
+            stretch_min_consecutive_polls=2,
+        )
+        seed_clean_checkpoints_up(ev)
+        with _patch_time(NOW_IN_WINDOW), _patch_gbm(0.70):
+            result = ev._run_gates(ASSET_PRICE_UP, 0.59, NO_ASK_OPPOSITE)
+        assert result["result"] == GATE_FIRED
+        assert result["entry_model"] == "lag"
+        assert result["entry_tier"] == "core"
+
+    def test_stretch_lane_requires_two_polls(self, tmp_path):
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=9.0,
+            entry_range_low=0.55,
+            entry_range_high=0.61,
+            entry_core_range_high=0.60,
+            stretch_entry_range_high=0.61,
+            stretch_min_asset_move_pct=0.002,
+            stretch_min_chop_score=0.6,
+            stretch_min_lag_gap=0.08,
+            stretch_min_consecutive_polls=2,
+        )
+        seed_clean_checkpoints_up(ev)
+        with _patch_time(NOW_IN_WINDOW), _patch_gbm(0.71):
+            first = ev._run_gates(ASSET_PRICE_UP, 0.61, NO_ASK_OPPOSITE)
+            second = ev._run_gates(ASSET_PRICE_UP, 0.61, NO_ASK_OPPOSITE)
+        assert first["result"] == GATE_PERSISTENCE
+        assert first["entry_tier"] == "stretch"
+        assert first["consecutive_polls"] == 1
+        assert second["result"] == GATE_FIRED
+        assert second["entry_tier"] == "stretch"
+
+    def test_stretch_lane_uses_stronger_lag_requirement(self, tmp_path):
+        ev = make_evaluator(
+            tmp_path,
+            time_gate_minutes=9.0,
+            entry_range_low=0.55,
+            entry_range_high=0.61,
+            entry_core_range_high=0.60,
+            stretch_entry_range_high=0.61,
+            stretch_min_asset_move_pct=0.002,
+            stretch_min_chop_score=0.6,
+            stretch_min_lag_gap=0.08,
+            stretch_min_consecutive_polls=2,
+        )
+        seed_clean_checkpoints_up(ev)
+        with _patch_time(NOW_IN_WINDOW), _patch_gbm(0.67):
+            result = ev._run_gates(ASSET_PRICE_UP, 0.61, NO_ASK_OPPOSITE)
+        assert result["result"] == GATE_LAG
+        assert result["entry_tier"] == "stretch"
+        assert result["min_required"] == pytest.approx(0.08, abs=1e-9)
 
     def test_stale_yes_ask_zero_blocked(self, tmp_path):
         """Signal blocked when YES ask is 0 (gate 3 fails before gate 4, still blocked)."""

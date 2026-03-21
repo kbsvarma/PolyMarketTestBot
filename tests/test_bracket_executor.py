@@ -260,6 +260,26 @@ def test_phase1_follow_taker_does_not_chase_above_entry_band_high(tmp_path) -> N
     assert client.buy_calls[0]["price"] == 0.63
 
 
+def test_phase1_follow_taker_lag_capture_can_lift_two_cents_but_stays_below_62(tmp_path) -> None:
+    client = _DummyClient()
+    cfg = CryptoDirectionConfig(
+        execute_enabled=True,
+        phase1_shares=5.0,
+        phase1_max_chase_cents=0.02,
+        entry_range_high=0.61,
+        min_bracket_shares=1.0,
+        bracket_audit_log_path=str(tmp_path / "bracket_trades.jsonl"),
+    )
+    executor = BracketExecutor(cfg, client)
+    event = _signal_event().model_copy(update={"momentum_price": 0.59, "entry_model": "lag"})
+
+    submitted = asyncio.run(executor.on_signal(event))
+
+    assert submitted is True
+    assert len(client.buy_calls) == 1
+    assert client.buy_calls[0]["price"] == 0.61
+
+
 def test_band_touch_phase1_chase_stays_inside_band_cap(tmp_path) -> None:
     client = _DummyClient()
     cfg = CryptoDirectionConfig(
@@ -339,6 +359,46 @@ def test_phase1_follow_taker_retries_once_after_fok_error_and_fills(tmp_path) ->
     positions = executor.active_positions()
     assert len(positions) == 1
     assert positions[0].phase == BracketPhase.PHASE1_FILLED
+
+
+def test_phase1_follow_taker_steps_down_to_min_block_after_fok_error(tmp_path) -> None:
+    client = _DummyClient()
+    client.next_buy_errors = [
+        "Real live order placement failed: order couldn't be fully filled. FOK orders are fully filled or killed.",
+    ]
+    client.next_buy_result = {
+        "exchange_order_id": "test-order-stepdown",
+        "status": "MATCHED",
+        "filled_size": 5.0,
+        "average_fill_price": 0.59,
+        "remaining_size": 0.0,
+    }
+    cfg = CryptoDirectionConfig(
+        execute_enabled=True,
+        phase1_shares=10.0,
+        min_bracket_shares=5.0,
+        phase1_max_chase_cents=0.01,
+        phase1_follow_taker_retry_attempts=0,
+        phase1_follow_taker_retry_delay_seconds=0.0,
+        phase1_follow_taker_retry_to_strategy_cap=False,
+        entry_range_high=0.63,
+        bracket_audit_log_path=str(tmp_path / "bracket_trades.jsonl"),
+    )
+    executor = BracketExecutor(cfg, client)
+
+    submitted = asyncio.run(executor.on_signal(_signal_event()))
+
+    assert submitted is True
+    assert len(client.buy_calls) == 2
+    assert client.buy_calls[0]["size"] == 10.0
+    assert client.buy_calls[1]["size"] == 5.0
+    assert client.buy_calls[0]["price"] == 0.59
+    assert client.buy_calls[1]["price"] == 0.59
+    positions = executor.active_positions()
+    assert len(positions) == 1
+    assert positions[0].phase == BracketPhase.PHASE1_FILLED
+    assert positions[0].p1_shares == 5.0
+    assert positions[0].p1_fill_price == 0.59
 
 
 def test_phase1_follow_taker_request_exception_fails_safe_without_blind_retry(tmp_path, monkeypatch) -> None:
@@ -808,6 +868,60 @@ def test_hard_exit_steps_down_within_same_tick_when_50c_does_not_fill(tmp_path, 
             "average_fill_price": 0.48,
             "remaining_size": 0.0,
         },
+    ]
+    cfg = CryptoDirectionConfig(
+        execute_enabled=True,
+        phase1_shares=10.0,
+        phase1_max_chase_cents=0.0,
+        min_bracket_shares=1.0,
+        hard_exit_stop_price=0.50,
+        hard_exit_market_through_cents=0.0,
+        hard_exit_fallback_step_cents=0.02,
+        hard_exit_min_sell_price=0.40,
+        bracket_audit_log_path=str(tmp_path / "bracket_trades.jsonl"),
+    )
+    executor = BracketExecutor(cfg, client)
+    asyncio.run(executor.on_signal(_signal_event()))
+
+    pos = executor.active_positions()[0]
+    pos.p1_filled_at = 1_000.0
+    pos.window_close_ts = 2_000
+    monkeypatch.setattr("src.bracket_executor.time.time", lambda: 1_050.0)
+
+    asyncio.run(executor._check_hard_exit(pos, yes_ask=0.48, no_ask=0.48))
+
+    assert pos.phase == BracketPhase.HARD_EXITED
+    assert pos.hard_exit_fill_price == 0.48
+    assert [call["price"] for call in client.sell_calls] == [0.50, 0.48]
+
+
+def test_hard_exit_steps_down_within_same_tick_when_fak_no_match_error_occurs(
+    tmp_path, monkeypatch
+) -> None:
+    client = _DummyClient()
+    client.orderbook = OrderbookSnapshot(
+        token_id="yes-1",
+        bids=[OrderbookLevel(price=0.49, size=20.0)],
+        asks=[OrderbookLevel(price=0.58, size=20.0)],
+    )
+    client.positions = [
+        {
+            "token_id": "yes-1",
+            "quantity": 10.0,
+            "avg_price": 0.58,
+        }
+    ]
+    client.next_sell_errors = [
+        "PolyApiException[status_code=400, error_message={'error': 'no orders found to match with FAK order. FAK orders are partially filled or killed if no match is found.'}]"
+    ]
+    client.next_sell_results = [
+        {
+            "exchange_order_id": "test-sell-stop-fill-48-after-fak-miss",
+            "status": "MATCHED",
+            "filled_size": 10.0,
+            "average_fill_price": 0.48,
+            "remaining_size": 0.0,
+        }
     ]
     cfg = CryptoDirectionConfig(
         execute_enabled=True,
@@ -1421,6 +1535,41 @@ def test_safe_arm_protection_expires_after_safe_breach(tmp_path, monkeypatch) ->
     pos.window_close_ts = 2_000
     pos.safe_opposite_price = 0.34
     pos.dipped_below_safe_price = True
+    monkeypatch.setattr("src.bracket_executor.time.time", lambda: 1_050.0)
+
+    asyncio.run(executor._check_hard_exit(pos, yes_ask=0.49, no_ask=0.49))
+
+    assert pos.phase == BracketPhase.HARD_EXITED
+    assert pos.hard_exit_reason == "STOP_50C"
+    assert pos.hard_exit_fill_price == 0.50
+    assert len(client.sell_calls) == 1
+
+
+def test_safe_arm_does_not_suspend_stop_in_default_live_profile(tmp_path, monkeypatch) -> None:
+    client = _DummyClient()
+    client.next_sell_result = {
+        "exchange_order_id": "test-sell-safe-arm-default-off",
+        "status": "MATCHED",
+        "filled_size": 10.0,
+        "average_fill_price": 0.50,
+        "remaining_size": 0.0,
+    }
+    cfg = CryptoDirectionConfig(
+        execute_enabled=True,
+        phase1_shares=10.0,
+        phase1_max_chase_cents=0.0,
+        min_bracket_shares=1.0,
+        hard_exit_stop_price=0.50,
+        safe_arm_suspend_stop=False,
+        bracket_audit_log_path=str(tmp_path / "bracket_trades.jsonl"),
+    )
+    executor = BracketExecutor(cfg, client)
+    asyncio.run(executor.on_signal(_signal_event().model_copy(update={"entry_model": "lag"})))
+
+    pos = executor.active_positions()[0]
+    pos.p1_filled_at = 1_000.0
+    pos.window_close_ts = 2_000
+    pos.safe_opposite_price = 0.34
     monkeypatch.setattr("src.bracket_executor.time.time", lambda: 1_050.0)
 
     asyncio.run(executor._check_hard_exit(pos, yes_ask=0.49, no_ask=0.49))

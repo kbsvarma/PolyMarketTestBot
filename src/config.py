@@ -515,6 +515,10 @@ class CryptoDirectionConfig(BaseModel):
     hard_exit_dust_shares: float = 0.25
     hard_exit_final_seconds: int = 30
 
+    # ── Early exit layers ────────────────────────────────────────────────────
+    shallow_reversal_drop_threshold: float = 0.02  # cents drop from peak to trigger reversal sell (Layer 1)
+    crossback_stop_buffer: float = 0.05            # cents below entry to trigger crossback stop (Layer 3)
+
 
 class AppConfig(BaseModel):
     mode: Mode = Mode.RESEARCH
