@@ -718,7 +718,11 @@ class BracketExecutor:
         return None
 
     def _build_hard_exit_attempt_prices(
-        self, primary_sell_price: float, *, include_emergency: bool = False
+        self,
+        primary_sell_price: float,
+        *,
+        include_emergency: bool = False,
+        mark: float | None = None,
     ) -> list[float]:
         primary_sell_price = round(max(0.01, primary_sell_price), 4)
         market_through_cents = max(
@@ -752,6 +756,15 @@ class BracketExecutor:
         for candidate in fallback_prices:
             if candidate < primary_sell_price and candidate not in attempt_prices:
                 attempt_prices.append(candidate)
+        # Mark-anchored floor extension: when the market has crashed below the
+        # configured ladder floor (hard_exit_min_sell_price), append a last-resort
+        # price just below the current mark so we always have at least one attempt
+        # in the same price neighbourhood as actual buyers.  Without this, every
+        # retry tick tries [0.50 → 0.40] while buyers are at 0.25 and we never fill.
+        if mark is not None and mark > 0:
+            mark_floor = round(max(0.01, mark - 0.02), 4)
+            if mark_floor < (min(attempt_prices) - 1e-6):
+                attempt_prices.append(mark_floor)
         return attempt_prices
 
     # ================================================================== #
@@ -1511,6 +1524,7 @@ class BracketExecutor:
         attempt_prices = self._build_hard_exit_attempt_prices(
             hard_exit_stop_price,
             include_emergency=hard_exit_in_progress,
+            mark=mark,
         )
         sell_price = attempt_prices[-1]
         logger.info(
@@ -1612,16 +1626,25 @@ class BracketExecutor:
                     # position is visible/spendable, send a partial-capable
                     # sell anyway and let the exchange fill whatever is truly
                     # executable instead of silently riding to settlement.
-                    if visible_position_shares is not None and sell_target_shares > 1e-6:
+                    #
+                    # Also bypass when visible_position_shares is None (API
+                    # hasn't propagated the balance yet) but we have a confirmed
+                    # Phase 1 fill — the exchange is the authoritative source for
+                    # whether we hold the token; not the positions API.  Without
+                    # this bypass, a propagation delay causes EVERY ladder price
+                    # to be skipped and the position rides to full settlement loss.
+                    confirmed_fill = float(pos.p1_fill_price or 0.0) > 0 and sell_target_shares > 1e-6
+                    if (visible_position_shares is not None and sell_target_shares > 1e-6) or confirmed_fill:
                         executable_shares = self._round_shares(sell_target_shares)
                         logger.warning(
                             "BracketExecutor: hard exit proceeding without prechecked depth  "
-                            "asset={} reason={} attempt_price={:.4f} visible_position={:.3f} "
-                            "best_bid_hint={:.4f} position_id={}",
+                            "asset={} reason={} attempt_price={:.4f} visible_position={} "
+                            "confirmed_fill={} best_bid_hint={:.4f} position_id={}",
                             pos.asset,
                             reason,
                             attempt_price,
                             visible_position_shares,
+                            confirmed_fill,
                             float(sell_context.get("best_price") or 0.0),
                             pos.position_id,
                         )
