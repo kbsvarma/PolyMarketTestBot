@@ -450,7 +450,9 @@ crypto_direction_profiles:
     time_gate_minutes: 2.0  # was 5.0 — the 5-min gate was cutting off valid late-developing moves;
                             # 2 min is the minimum needed for FOK fill; hard exit covers P1 downside
     entry_range_low: 0.55   # was 0.57 — widen to match 5m lower bound; 0.57 was blocking valid 55-57c entries
-    entry_range_high: 0.65  # was 0.63 — widen upper bound; 93% of PRICE_RANGE_FAIL was above 0.63; stay below hard_skip_price_ceiling of 0.65
+    entry_range_high: 0.62  # was 0.65 — data shows 8/12 hard-exit losses entered at 0.61-0.63 (compressed P2 ceiling);
+                            # tightening to 0.62 cuts worst-margin entries; WebSocket will recover missed
+                            # 0.58-0.60 entries that REST latency was pushing to 0.63-0.65
     entry_core_range_high: 0.0
     stretch_entry_range_high: 0.0
     stretch_min_asset_move_pct: 0.0
@@ -468,7 +470,7 @@ crypto_direction_profiles:
     continuation_min_minutes_remaining: 5.0
     continuation_min_asset_move_pct: 0.00030  # was 0.00045 — scaled down proportionally with the base move threshold reduction
     continuation_min_chop_score: 0.66
-    continuation_max_momentum_price: 0.63
+    continuation_max_momentum_price: 0.62  # match new entry_range_high
     continuation_max_opposite_price: 0.43
     continuation_max_negative_lag_gap: 0.04
     continuation_ignore_lag_veto: false
