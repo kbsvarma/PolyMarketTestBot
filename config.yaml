@@ -434,7 +434,7 @@ crypto_direction_profiles:
     instance_name: "polymarket_btc_15m"
     btc:
       slug_prefix: "btc-updown-15m"
-      min_asset_move_pct: 0.0006
+      min_asset_move_pct: 0.00035  # was 0.0006 — 0.06% threshold was blocking 42% of evals; actual 15m BTC moves avg ~0.004%; 0.035% still requires real momentum
     track_btc: true
     track_eth: false
     prefer_higher_liquidity: false
@@ -442,8 +442,8 @@ crypto_direction_profiles:
     window_settle_seconds: 30
     time_gate_minutes: 2.0  # was 5.0 — the 5-min gate was cutting off valid late-developing moves;
                             # 2 min is the minimum needed for FOK fill; hard exit covers P1 downside
-    entry_range_low: 0.57
-    entry_range_high: 0.63
+    entry_range_low: 0.55   # was 0.57 — widen to match 5m lower bound; 0.57 was blocking valid 55-57c entries
+    entry_range_high: 0.65  # was 0.63 — widen upper bound; 93% of PRICE_RANGE_FAIL was above 0.63; stay below hard_skip_price_ceiling of 0.65
     entry_core_range_high: 0.0
     stretch_entry_range_high: 0.0
     stretch_min_asset_move_pct: 0.0
@@ -451,11 +451,11 @@ crypto_direction_profiles:
     stretch_min_lag_gap: 0.0
     stretch_min_consecutive_polls: 1
     chop_window: 4
-    chop_min_score: 0.60
+    chop_min_score: 0.55    # was 0.60 — 5m uses 0.51; loosen slightly while keeping quality floor above noise
     lag_threshold: 0.015
     continuation_enabled: true
     continuation_min_minutes_remaining: 5.0
-    continuation_min_asset_move_pct: 0.00045
+    continuation_min_asset_move_pct: 0.00030  # was 0.00045 — scaled down proportionally with the base move threshold reduction
     continuation_min_chop_score: 0.66
     continuation_max_momentum_price: 0.63
     continuation_max_opposite_price: 0.43
