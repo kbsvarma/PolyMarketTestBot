@@ -473,11 +473,18 @@ crypto_direction_profiles:
     continuation_max_negative_lag_gap: 0.04
     continuation_ignore_lag_veto: false
     continuation_hard_exit_grace_seconds: 0.0
-    phase1_max_chase_cents: 0.01
+    phase1_max_chase_cents: 0.02          # was 0.01 — covers 1-2c slippage between signal snapshot and FOK submission;
+                                          # fixed 41c510a5 (ask 1c above submit) and similar latency misses
     phase1_follow_taker_retry_attempts: 1
-    phase1_follow_taker_retry_to_strategy_cap: false
+    phase1_follow_taker_retry_to_strategy_cap: true   # was false — on retry, go up to entry_range_high (0.65);
+                                                       # 15m Phase 2 provides downside protection so paying
+                                                       # 2-3c more on retry is justified; fixed 8d19b490
     phase1_skip_depth_precheck: true       # Fix1: skip orderbook pre-check on attempt 0; submit FOK directly to save ~100-300ms latency
     phase1_lag_retry_multiplier: 0.5       # Fix2: on retry, chase up to signal_price + lag_gap*0.5 (capped at entry_range_high)
+    phase2_fok_entry_buffer: 0.04         # was 0.01 (default) — price bounces 3-5c between breach detection
+                                          # and FOK submission; 4c buffer catches partial-recovery market
+                                          # while staying within fok_ceiling (profitable_y_ceiling)
+    phase2_fok_retry_slippage: 0.04       # was 0.02 (default) — retry with same extra room as initial buffer
     hard_exit_emergency_min_sell_price: 0.40
     hard_exit_dust_shares: 0.25
     immediate_band_entry_enabled: false
