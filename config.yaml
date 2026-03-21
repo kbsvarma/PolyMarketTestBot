@@ -440,7 +440,8 @@ crypto_direction_profiles:
     prefer_higher_liquidity: false
     window_duration_seconds: 900
     window_settle_seconds: 30
-    time_gate_minutes: 5.0
+    time_gate_minutes: 2.0  # was 5.0 — the 5-min gate was cutting off valid late-developing moves;
+                            # 2 min is the minimum needed for FOK fill; hard exit covers P1 downside
     entry_range_low: 0.57
     entry_range_high: 0.63
     entry_core_range_high: 0.0
