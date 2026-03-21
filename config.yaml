@@ -357,6 +357,11 @@ crypto_direction_profiles:
     stretch_min_consecutive_polls: 2
     core_min_consecutive_polls: 3     # require signal to hold 3 consecutive polls (~3s) before firing;
                                       # filters BTC noise spikes that reverse within 6-27s of entry
+    lag_threshold: -0.01              # was 0.015 — same bracket logic as 15m: Phase 2 handles direction
+                                      # uncertainty so pure GBM edge isn't required. 5m lag is nearly
+                                      # centered at 0 (median -0.0095), so -0.01 is conservative vs 15m's
+                                      # -0.02. Simulated impact: 37% → 52% window hit rate.
+                                      # Persistence gate (3 polls) guards against fast-reversal noise.
     continuation_enabled: false
     continuation_min_minutes_remaining: 1.5
     continuation_min_asset_move_pct: 0.00035
