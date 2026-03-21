@@ -33,6 +33,7 @@ except ImportError:
 
 from src.config import AssetVolConfig, CryptoDirectionConfig
 from src.models import MarketInfo
+from src.polymarket_ws_feed import PolymarketWSFeed
 from src.rtds_client import RTDSClient
 
 
@@ -142,6 +143,10 @@ class AssetWatcher:
         self._market_title: str = ""            # for verification logging
         self._market_resolved: bool = False
         self._resolve_retry_due_at: float = 0.0
+
+        # --- WebSocket feed (optional) ---
+        self._cfg_use_ws: bool = cfg.use_websocket_feed
+        self._ws_feed: PolymarketWSFeed | None = None
 
         # --- Live YES/NO prices ---
         self._yes_bid: float = 0.0
@@ -279,7 +284,49 @@ class AssetWatcher:
             self._no_token_id or "MISSING",
             self._market_liquidity,
         )
+
+        # --- Start WebSocket feed for the new window (if enabled) ---
+        if self._cfg_use_ws:
+            await self._start_ws_feed()
+
         return True
+
+    async def _start_ws_feed(self) -> None:
+        """
+        Stop any previous WS feed and start a fresh one for the current
+        market window.  Called after market resolution succeeds.
+        """
+        # Stop the previous feed cleanly before starting a new one
+        if self._ws_feed is not None:
+            try:
+                await self._ws_feed.stop()
+            except Exception as exc:
+                logger.debug("WS feed stop error asset={} error={}", self.asset, exc)
+            self._ws_feed = None
+
+        if not self._market_id or not self._yes_token_id or not self._no_token_id:
+            logger.warning(
+                "Cannot start WS feed asset={} — market IDs not fully resolved",
+                self.asset,
+            )
+            return
+
+        self._ws_feed = PolymarketWSFeed()
+        await self._ws_feed.start(
+            self._market_id,
+            self._yes_token_id,
+            self._no_token_id,
+        )
+        logger.info("WS feed started asset={} market_id={}", self.asset, self._market_id)
+
+    async def _stop_ws_feed(self) -> None:
+        """Stop the WS feed cleanly (called on window close / watcher shutdown)."""
+        if self._ws_feed is not None:
+            try:
+                await self._ws_feed.stop()
+            except Exception as exc:
+                logger.debug("WS feed stop error asset={} error={}", self.asset, exc)
+            self._ws_feed = None
 
     # ------------------------------------------------------------------ #
     # Price refreshing
@@ -289,8 +336,13 @@ class AssetWatcher:
         """
         Fetch the latest YES and NO best-ask prices from the Polymarket orderbook.
 
-        Uses the CLOB orderbook endpoint directly (not WebSocket) since we
-        only need snapshots every 2 seconds, not tick-by-tick streaming.
+        When use_websocket_feed is True and the WS feed has delivered a price
+        update within the last 2 seconds, the WS values are copied directly
+        into the internal price fields and the REST orderbook fetch is skipped
+        (saving ~150 ms per poll cycle).
+
+        If the WS feed is stale (no update for > 2 s) or not connected, the
+        method falls through to the existing REST fetch path automatically.
         The ask price is what we'd pay to BUY — correct for entry cost calc.
         """
         if not self._market_resolved or (not self._yes_token_id and not self._no_token_id):
@@ -299,6 +351,28 @@ class AssetWatcher:
                 await self.resolve_market(current_window_ts(self._cfg.window_duration_seconds))
             if not self._market_resolved:
                 return
+
+        # ---- WebSocket fast path (skips REST fetch when feed is fresh) ----
+        if (
+            self._cfg_use_ws
+            and self._ws_feed is not None
+            and self._ws_feed.is_connected
+        ):
+            ws_age = time.time() - self._ws_feed.last_update_ts
+            if ws_age < 2.0 and self._ws_feed.last_update_ts > 0:
+                # Feed is live and fresh — copy prices and skip REST
+                self._yes_ask = self._ws_feed.yes_ask
+                self._yes_ask_size = self._ws_feed.yes_ask_size
+                self._no_ask = self._ws_feed.no_ask
+                self._no_ask_size = self._ws_feed.no_ask_size
+                self._last_price_ts = time.time()
+                return
+            else:
+                logger.warning(
+                    "WS feed stale asset={} age={:.2f}s, falling back to REST",
+                    self.asset,
+                    ws_age,
+                )
 
         # Fetch YES orderbook
         if self._yes_token_id:
