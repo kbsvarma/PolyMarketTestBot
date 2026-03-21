@@ -120,6 +120,7 @@ class BracketPosition:
     closed_at:            float = 0.0
     fill_check_attempts:  int = 0        # poll counter for PASSIVE_LIMIT P1
     p2_last_attempt_ts:   float = 0.0   # last Phase 2 placement attempt time
+    p2_breach_ts:         float = 0.0   # when PHASE2_SAFE_BREACHED was first recorded (latency tracking)
     hard_exit_attempted:  bool = False   # prevents repeated hard-exit attempts
     hard_exit_last_attempt_ts: float = 0.0
     hard_exit_reason:     str = ""
@@ -829,6 +830,9 @@ class BracketExecutor:
             )
             return False
 
+        # ── Latency tracking: stamp when signal enters the executor ─────
+        signal_enter_ts = time.time()
+
         # ── Size: fixed share count for parity with the observer report ──
         signal_price = round(event.momentum_price, 4)
         target_shares = max(
@@ -880,6 +884,7 @@ class BracketExecutor:
         retry_ceiling_price = self._phase1_retry_ceiling(event, entry_price)
         attempt_log: list[dict[str, Any]] = []
         result: dict[str, Any] | None = None
+        fok_submit_ts: float = 0.0  # stamped just before place_buy_order; 0 if never reached
         order_id = ""
         fill_payload: dict[str, Any] = {}
         fill_price = 0.0
@@ -955,6 +960,7 @@ class BracketExecutor:
                 shares = executable_shares
 
             try:
+                fok_submit_ts = time.time()
                 result = await self._client.place_buy_order(
                     token_id=momentum_token_id,
                     price=attempt_price,
@@ -1241,6 +1247,7 @@ class BracketExecutor:
                 "asset": event.asset,
                 "signal_price": signal_price,
                 "submit_limit_price": entry_price,
+                "code_path_ms": round((fok_submit_ts - signal_enter_ts) * 1000, 1) if fok_submit_ts > 0 else None,
                 "status": str(last_attempt.get("status") or "RETRY_SKIPPED"),
                 "shares": shares,
                 "fill_payload": fill_payload,
@@ -1294,6 +1301,8 @@ class BracketExecutor:
                 "fill_price": pos.p1_fill_price,
                 "signal_price": signal_price,
                 "submit_limit_price": entry_price,
+                "fill_vs_signal_slippage": round(pos.p1_fill_price - signal_price, 4),
+                "code_path_ms": round((fok_submit_ts - signal_enter_ts) * 1000, 1),
                 "shares": shares,
                 "style": "FOLLOW_TAKER",
                 "execution_mode": self.execution_mode,
@@ -2014,6 +2023,7 @@ class BracketExecutor:
                 "safe_y={:.4f}  floor_now={:.4f}  position_id={}",
                 pos.asset, safe_price, pos.min_opposite_price, pos.position_id,
             )
+            pos.p2_breach_ts = time.time()   # stamp breach time for latency tracking
             self._audit({
                 "type": "PHASE2_SAFE_BREACHED",
                 "position_id": pos.position_id,
@@ -2067,7 +2077,9 @@ class BracketExecutor:
             fok_ceiling (the profitable_y_ceiling from the caller).
         """
         pos.phase = BracketPhase.PHASE2_PENDING   # prevent re-entry next tick
-        pos.p2_last_attempt_ts = time.time()
+        p2_fok_submit_ts = time.time()
+        pos.p2_last_attempt_ts = p2_fok_submit_ts
+        breach_to_submit_ms = round((p2_fok_submit_ts - pos.p2_breach_ts) * 1000, 1) if pos.p2_breach_ts > 0 else None
 
         entry_style = self._cfg.phase2_entry_style
         shares = pos.p1_shares   # symmetric sizing matches both legs
@@ -2139,6 +2151,7 @@ class BracketExecutor:
                     "position_id": pos.position_id,
                     "asset": pos.asset,
                     "attempted_price": entry_price,
+                    "breach_to_submit_ms": breach_to_submit_ms,
                     "error": str(exc),
                 })
                 return
@@ -2218,6 +2231,7 @@ class BracketExecutor:
             "p2_order_id": pos.p2_order_id,
             "p1_fill_price": pos.p1_fill_price or pos.p1_price,
             "guaranteed_margin": guaranteed,
+            "breach_to_submit_ms": breach_to_submit_ms,
             "execution_mode": self.execution_mode,
         })
 

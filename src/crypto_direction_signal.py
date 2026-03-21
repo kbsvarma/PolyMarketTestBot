@@ -1283,6 +1283,12 @@ def _log_evaluation(
         if momentum_price > high:
             record["range_side"] = "HIGH"
             record["range_distance"] = round(momentum_price - high, 4)
+            # ws_latency_miss: price is above range ceiling by ≤ 3c.
+            # With REST polling the signal fires 0-0.25s after the actual tick;
+            # these entries were likely in-range at the real price event and
+            # drifted high by the time we detected them. WebSocket would catch them.
+            if momentum_price - high <= 0.03:
+                record["ws_latency_miss"] = True
         elif momentum_price < low:
             record["range_side"] = "LOW"
             record["range_distance"] = round(low - momentum_price, 4)
