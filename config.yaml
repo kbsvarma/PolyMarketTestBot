@@ -454,7 +454,11 @@ crypto_direction_profiles:
     stretch_min_consecutive_polls: 1
     chop_window: 4
     chop_min_score: 0.55    # was 0.60 — 5m uses 0.51; loosen slightly while keeping quality floor above noise
-    lag_threshold: 0.015
+    lag_threshold: -0.02  # was 0.015 — the bracket strategy doesn't need GBM directional edge;
+                          # 83% of qualified 15m evals have negative lag (market priced in the move),
+                          # but Phase 2 profits from the reversal regardless. Allowing up to -2¢ negative
+                          # lag doubles signal frequency (21% → 37% of windows) while still blocking
+                          # extreme overpriced setups (lag < -0.02 = market 2c+ above GBM fair value).
     continuation_enabled: true
     continuation_min_minutes_remaining: 5.0
     continuation_min_asset_move_pct: 0.00030  # was 0.00045 — scaled down proportionally with the base move threshold reduction
