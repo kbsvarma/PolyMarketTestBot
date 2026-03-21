@@ -496,6 +496,10 @@ class CryptoDirectionConfig(BaseModel):
     # capped at profitable_y_ceiling.  0.0 = disabled.
     phase2_fok_retry_slippage: float = 0.02
     phase2_entry_style: str = "FOLLOW_TAKER"
+    # WebSocket price feed toggle — set true to stream YES/NO ask prices
+    # via wss://ws-subscriptions-clob.polymarket.com instead of REST polling.
+    # Default false = existing REST path unchanged.
+    use_websocket_feed: bool = False
     bracket_audit_log_path: str = "logs/bracket_trades.jsonl"
     # Hard exit: sell Phase-1 leg mid-window to cap losses.
     # Triggers if mark drops to stop_price OR we're in the final N seconds losing.
