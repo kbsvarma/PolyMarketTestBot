@@ -2584,24 +2584,62 @@ class BracketExecutor:
         reversal = self._cfg.phase2_reversal_threshold
         safe_price = pos.safe_opposite_price
 
+        # Compute the y2 "ideal anchor" — the price at which the bracket would
+        # lock in phase2_target_profit_per_share net profit per share.  This is
+        # computed dynamically from the actual Phase 1 fill price so it adapts
+        # to every entry rather than using a hardcoded target.
+        # OG design: y1 = safe_y (thin profit), y2 = ideal_y (fat profit).
+        # Do NOT buy Phase 2 while momentum is still going our way — only buy
+        # when price reverses BACK to whichever level it last visited.
+        target_profit = float(
+            getattr(self._cfg, "phase2_target_profit_per_share", 0.0) or 0.0
+        )
+        if target_profit > 0:
+            ideal_y = max_profitable_opposite_price(
+                x_cost,
+                min_net_margin=target_profit,
+                category="crypto price",
+            )
+        else:
+            # Legacy fallback: use the fixed target_y_price from config
+            ideal_y = float(self._cfg.target_y_price)
+
+        # Tighten the Phase 2 anchor from y1 (safe_y) down to y2 (ideal_y) if
+        # momentum has carried the opposite price all the way to the ideal level.
+        # This means the next reversal buys at y2, locking in fat profit instead
+        # of the thin profit available at y1.
         if (
-            safe_price > self._cfg.target_y_price
-            and y_price <= self._cfg.target_y_price
-            and y_price < safe_price
+            not pos.phase2_tightened
+            and ideal_y > 0
+            and ideal_y < safe_price
+            and y_price <= ideal_y
         ):
+            y1_price = safe_price  # capture y1 before overwriting
             pos.safe_opposite_price = round(y_price, 6)
             safe_price = pos.safe_opposite_price
             pos.phase2_tightened = True
+            # The price was already below the old safe_y (y1) to get here,
+            # so the breach is already confirmed against the old anchor.
+            # Preserve dipped_below_safe_price = True so the reclaim at the
+            # new anchor (y2) can fire immediately on the bounce — without this
+            # the breach check against the new safe_price would reset the flag
+            # and the bot would miss the y2 buy entirely.
+            pos.dipped_below_safe_price = True
             logger.info(
-                "BracketExecutor: Phase 2 safe tightened  asset={}  safe_y={:.4f}  "
+                "BracketExecutor: Phase 2 tightened to ideal y2  asset={}  "
+                "y1={:.4f}  y2={:.4f}  ideal_y_target={:.4f}  "
                 "profit_ceiling={:.4f}  x_cost={:.4f}  net_margin={:.4f}  position_id={}",
-                pos.asset, safe_price, profitable_y_ceiling, x_cost, net_margin, pos.position_id,
+                pos.asset, y1_price, safe_price, ideal_y,
+                profitable_y_ceiling, x_cost, net_margin, pos.position_id,
             )
             self._audit({
                 "type": "PHASE2_SAFE_TIGHTENED",
                 "position_id": pos.position_id,
                 "asset": pos.asset,
+                "y1_safe_price": round(y1_price, 6),
+                "y2_ideal_price": round(safe_price, 6),
                 "safe_opposite_price": safe_price,
+                "ideal_y_target": round(ideal_y, 6),
                 "profit_ceiling": round(profitable_y_ceiling, 6),
                 "net_margin": round(net_margin, 6),
             })
@@ -2630,7 +2668,14 @@ class BracketExecutor:
                 pos.dipped_below_safe_price = True  # set before async call
                 await self._post_phase2_resting_order(pos, safe_price)
                 return
-        pos.dipped_below_safe_price = bool(breached_safe)
+        # Preserve breach confirmation across the tighten event.  When tighten
+        # fires (y2 reached), dipped_below_safe_price is forced True above
+        # because the price was already below the old y1 anchor.  The
+        # breached_safe recomputation against the new y2 anchor would otherwise
+        # reset the flag to False (price is AT y2, not yet below it) and the
+        # bot would never buy on the y2 reclaim.
+        if not (pos.phase2_tightened and pos.dipped_below_safe_price):
+            pos.dipped_below_safe_price = bool(breached_safe)
         if y_price <= safe_price - reversal:
             return
 

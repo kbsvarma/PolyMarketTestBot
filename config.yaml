@@ -257,7 +257,10 @@ crypto_direction:
   safe_arm_catastrophic_stop_price: 0.0
 
   # Bracket parameters
-  target_y_price: 0.34                # Target entry for the second leg (opposite side)
+  target_y_price: 0.34                # legacy fallback — only used when phase2_target_profit_per_share is 0
+  phase2_target_profit_per_share: 0.05  # y2 (ideal anchor) computed from Phase 1 fill price:
+                                        # max price where bracket nets >=5c/share after fees
+                                        # set to 0.0 to revert to legacy target_y_price behaviour
   phase2_min_locked_profit_per_share: 0.00   # dynamic safe-y can arm above 34c as long as the bracket is still profitable after fees
   phase2_reversal_threshold: 0.01     # Opposite side must bounce >= 1c from its floor
 

@@ -1,0 +1,56 @@
+# Security — never commit these
+.env
+.env.*
+*.pem
+*.key
+secrets/
+derive_keys.py
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Runtime data — changes every run, not source
+data/app_state.json
+data/health_status.json
+data/live_audit.jsonl
+data/live_decisions.jsonl
+data/live_orders.json
+data/paper_audit.jsonl
+data/paper_trade_history.csv
+data/positions.json
+data/daily_summary.json
+data/daily_summary_history.jsonl
+data/paper_decision_trace.jsonl
+data/paper_quality_summary.json
+data/research_snapshot.json
+data/shadow/
+data/shadow_live_decisions.jsonl
+data/shadow_live_summary.json
+data/strategy_signal_log.jsonl
+data/strategy_signal_log.prev.jsonl
+data/official_event_signals.json
+data/source_quality_summary.json
+data/_codex_backup_current_run/
+data/wallet_discovery_diagnostics.json
+data/wallet_scoring_diagnostics.json
+data/category_wallet_scorecard_diagnostics.json
+
+# Logs — runtime output, not source
+logs/*.log
+logs/*.log.bak
+logs/*.jsonl
+logs/*.md
+logs/instances/
+logs/system.*.log
+
+# OS
+.DS_Store
+
+# Claude internal
+.claude/
+memory/

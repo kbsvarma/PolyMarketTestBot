@@ -404,7 +404,13 @@ class CryptoDirectionConfig(BaseModel):
     # Target price for the opposite-side (second leg of the bracket).
     # If x=0.58 is paid for leg 1, we want x+y+fees < $1.00.
     # With fees ~1.5-2% total, y_target ~0.34 gives ~6% net bracket margin.
-    target_y_price: float = 0.34
+    target_y_price: float = 0.34  # legacy fallback — overridden by phase2_target_profit_per_share when > 0
+    # Minimum net profit per share required for the Phase 2 "ideal Y" (y2) anchor.
+    # When > 0, y2 is computed dynamically from Phase 1 fill price using
+    # max_profitable_opposite_price(min_net_margin=this value), replacing the
+    # hardcoded target_y_price.  E.g. 0.05 = tighten only when bracket locks
+    # in at least 5¢/share net profit.  0.0 = use legacy target_y_price.
+    phase2_target_profit_per_share: float = 0.0
     # Smallest locked profit/share we still consider worth arming for Phase 2.
     # 0.00 means "strictly profitable after fees"; raise later if we want a
     # larger safety cushion before committing the opposite leg.
