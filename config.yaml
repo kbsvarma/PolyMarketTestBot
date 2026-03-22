@@ -441,18 +441,20 @@ crypto_direction_profiles:
     instance_name: "polymarket_btc_15m"
     btc:
       slug_prefix: "btc-updown-15m"
-      min_asset_move_pct: 0.00035  # was 0.0006 — 0.06% threshold was blocking 42% of evals; actual 15m BTC moves avg ~0.004%; 0.035% still requires real momentum
+      min_asset_move_pct: 0.00010  # was 0.00020 — timing-gap fix; analysis of 160 windows showed
+                                   # 9,999 cycles where move=0.010-0.020% AND price is in range were
+                                   # blocked ONLY by this gate; price+chop+lag gates remain intact;
+                                   # 0.010% (~$8 on $84k BTC) still requires a real directional move
     track_btc: true
     track_eth: false
     prefer_higher_liquidity: false
     window_duration_seconds: 900
     window_settle_seconds: 30
-    time_gate_minutes: 2.0  # was 5.0 — the 5-min gate was cutting off valid late-developing moves;
-                            # 2 min is the minimum needed for FOK fill; hard exit covers P1 downside
-    entry_range_low: 0.55   # was 0.57 — widen to match 5m lower bound; 0.57 was blocking valid 55-57c entries
-    entry_range_high: 0.63  # was 0.65 — data shows 8/12 hard-exit losses entered at 0.61-0.63 (compressed P2 ceiling);
-                            # tightening to 0.62 cuts worst-margin entries; WebSocket will recover missed
-                            # 0.58-0.60 entries that REST latency was pushing to 0.63-0.65
+    time_gate_minutes: 2.0
+    entry_range_low: 0.55
+    entry_range_high: 0.65  # was 0.63 — widens band to 65c; captures strong-momentum windows where
+                            # YES reaches 64-65c; Phase 2 margin check still gates unprofitable brackets;
+                            # hard_exit_high_entry_price=0.64 tightens stop to 54c for these fills
     entry_core_range_high: 0.0
     stretch_entry_range_high: 0.0
     stretch_min_asset_move_pct: 0.0
@@ -460,43 +462,65 @@ crypto_direction_profiles:
     stretch_min_lag_gap: 0.0
     stretch_min_consecutive_polls: 1
     chop_window: 4
-    chop_min_score: 0.55    # was 0.60 — 5m uses 0.51; loosen slightly while keeping quality floor above noise
-    lag_threshold: -0.02  # was 0.015 — the bracket strategy doesn't need GBM directional edge;
-                          # 83% of qualified 15m evals have negative lag (market priced in the move),
-                          # but Phase 2 profits from the reversal regardless. Allowing up to -2¢ negative
-                          # lag doubles signal frequency (21% → 37% of windows) while still blocking
-                          # extreme overpriced setups (lag < -0.02 = market 2c+ above GBM fair value).
+    chop_min_score: 0.51    # was 0.55 — minor loosening; aligns with 5m bot; chop gate only blocked
+                            # 15/29948 cycles (<0.1%) so impact is tiny but removes edge cases
+    lag_threshold: -0.02
     continuation_enabled: true
-    continuation_min_minutes_remaining: 5.0
-    continuation_min_asset_move_pct: 0.00030  # was 0.00045 — scaled down proportionally with the base move threshold reduction
+    continuation_min_minutes_remaining: 4.0  # was 5.0 — resting GTC needs less runway than reactive FOK;
+                                             # bracket locks on post, not on reclaim; 4min is plenty
+    continuation_min_asset_move_pct: 0.00008  # was 0.00015 — proportional reduction matching base threshold
+                                              # cut (0.00020→0.00010); requires at least 0.008% move before
+                                              # continuation fires; chop+lag gates still gate quality
     continuation_min_chop_score: 0.66
-    continuation_max_momentum_price: 0.63  # match new entry_range_high
+    continuation_max_momentum_price: 0.65  # was 0.63 — match new entry_range_high
     continuation_max_opposite_price: 0.43
     continuation_max_negative_lag_gap: 0.04
     continuation_ignore_lag_veto: false
     continuation_hard_exit_grace_seconds: 0.0
-    phase1_max_chase_cents: 0.02          # was 0.01 — covers 1-2c slippage between signal snapshot and FOK submission;
-                                          # fixed 41c510a5 (ask 1c above submit) and similar latency misses
+    phase1_max_chase_cents: 0.02
     phase1_follow_taker_retry_attempts: 1
-    phase1_follow_taker_retry_to_strategy_cap: true   # was false — on retry, go up to entry_range_high (0.65);
-                                                       # 15m Phase 2 provides downside protection so paying
-                                                       # 2-3c more on retry is justified; fixed 8d19b490
-    phase1_skip_depth_precheck: true       # Fix1: skip orderbook pre-check on attempt 0; submit FOK directly to save ~100-300ms latency
-    phase1_lag_retry_multiplier: 0.5       # Fix2: on retry, chase up to signal_price + lag_gap*0.5 (capped at entry_range_high)
-    phase2_fok_entry_buffer: 0.04         # was 0.01 (default) — price bounces 3-5c between breach detection
-                                          # and FOK submission; 4c buffer catches partial-recovery market
-                                          # while staying within fok_ceiling (profitable_y_ceiling)
-    phase2_fok_retry_slippage: 0.04       # was 0.02 (default) — retry with same extra room as initial buffer
-    shallow_reversal_drop_threshold: 0.02  # Layer 1: sell when armed-not-tightened and price drops 2c from peak
-    crossback_stop_buffer: 0.05            # Layer 3: sell when never-armed and price drops 5c below entry
-    use_websocket_feed: true              # stream YES/NO ask prices via Polymarket CLOB WS instead of REST;
-                                          # eliminates ~250ms poll staleness; falls back to REST if feed stale
-    hard_exit_emergency_min_sell_price: 0.40
+    phase1_follow_taker_retry_to_strategy_cap: true
+    phase1_skip_depth_precheck: true
+    phase1_lag_retry_multiplier: 0.5
+    phase2_resting_limit_enabled: true
+    phase2_fok_entry_buffer: 0.04
+    phase2_fok_retry_slippage: 0.04
+    # Entry filter — tuned from live data: 29,948 eval cycles, 1 signal fired.
+    # Goal: 5-10x more executions without opening unprofitable setups.
+    # Changes vs previous:
+    #   entry_filter_skip_lag_model: false  (was true)  — re-enables lag signals;
+    #     previous rationale was "lag arms 17% vs continuation 45%" but with resting
+    #     GTC the arm concept is different; we now post on breach regardless of model.
+    #     chop + gap filters still block low-quality lag signals.
+    #   entry_filter_min_minutes_remaining: 5.0  (was 7.0)  — resting GTC order only
+    #     needs ~3-4 min to fill; 7min gate was blocking all signals after minute 8
+    #     of a 15-min window; 5min still gives full P2 development time.
+    #   entry_filter_max_gap_to_ceiling: 0.030  (was 0.025)  — slight loosening;
+    #     data showed 2 signals with gap > 0.025 both at 0% arm rate, but next cohort
+    #     at 0.025-0.030 had better arm rates; 3c gap is still a meaningful quality gate.
+    entry_filter_enabled: true
+    entry_filter_skip_lag_model: false     # was true — re-enable lag signals; chop+gap gates maintain quality
+    entry_filter_max_gap_to_ceiling: 0.030 # was 0.025 — slight loosening based on cohort data
+    entry_filter_min_minutes_remaining: 5.0 # was 7.0 — resting GTC needs ~3-4min; 5min is conservative
+    shallow_reversal_drop_threshold: 0.02
+    crossback_stop_buffer: 0.05
+    use_websocket_feed: true
+    hard_exit_emergency_min_sell_price: 0.15  # was 0.40 — token-invisible crash (9:15PM): bot tried 0.40
+                                               # but actual bid was 0.17; 0.40 floor blocked all sells;
+                                               # 0.15 allows recovery even in deep liquidity collapse
     hard_exit_dust_shares: 0.25
+    hard_exit_high_entry_price: 0.64      # explicit override: entries ≥64c use tighter stop
+    hard_exit_high_entry_stop_price: 0.54 # tighter stop for 64c+ fills; max loss = (0.65-0.54)*5 = $0.55
+    # Post-fill grace period: prevents hard exit from firing on stale bid prices
+    # immediately after a FOK taker fill (before market-maker re-quotes).
+    # Evidence: 3 hard exits today all fired within 0.25s at mark=0.50 (the post-fill
+    # bid) — all on winning signals. Holding 45s costs at most 45s of exposure.
+    # hard_exit_min_hold_catastrophic_stop=0.35 still fires if price genuinely collapses.
+    hard_exit_min_hold_seconds: 45        # grace period after Phase-1 fill before ordinary stop fires
+    hard_exit_min_hold_catastrophic_stop: 0.35  # emergency floor during grace period
     immediate_band_entry_enabled: false
-    poll_interval_seconds: 0.25          # was 1.0 — tighter poll cuts price-staleness window from 0-1s to 0-0.25s;
-                                          # reduces gap between signal detection and when FOK hits exchange
-    price_refresh_interval_seconds: 0.25 # was 1.0 — match poll cadence
+    poll_interval_seconds: 0.25
+    price_refresh_interval_seconds: 0.25
     signal_event_log_path: "logs/crypto_signal_events_pm_btc_15m.jsonl"
     evaluation_log_path: "logs/crypto_signal_evaluations_pm_btc_15m.jsonl"
     window_report_path: "logs/window_report_pm_btc_15m.md"

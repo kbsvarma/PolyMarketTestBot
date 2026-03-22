@@ -496,6 +496,19 @@ class CryptoDirectionConfig(BaseModel):
     # capped at profitable_y_ceiling.  0.0 = disabled.
     phase2_fok_retry_slippage: float = 0.02
     phase2_entry_style: str = "FOLLOW_TAKER"
+    # Phase 2 resting limit: post a GTC buy at safe_y on first BREACH instead
+    # of firing a reactive FOK on reclaim.  The exchange fills it passively when
+    # price recovers, eliminating the tick-timing gap that caused FOK misses.
+    # Cancelled automatically on hard exit or window close.
+    phase2_resting_limit_enabled: bool = False
+    # Entry filter — refuse Phase 1 when Phase 2 is historically unlikely to arm.
+    # Based on signal data: lag model arms 17% vs continuation 45%; large gaps
+    # (>0.025) arm 0% of the time; <7 minutes leaves too little Phase 2 runway.
+    # All three checks are independent; any failing check skips Phase 1 entirely.
+    entry_filter_enabled: bool = False
+    entry_filter_skip_lag_model: bool = True        # skip entry_model="lag" signals (17% arm rate)
+    entry_filter_max_gap_to_ceiling: float = 0.025  # skip if opposite_price - profitable_ceiling > N
+    entry_filter_min_minutes_remaining: float = 7.0 # skip if < N minutes left in the window
     # WebSocket price feed toggle — set true to stream YES/NO ask prices
     # via wss://ws-subscriptions-clob.polymarket.com instead of REST polling.
     # Default false = existing REST path unchanged.
@@ -514,6 +527,11 @@ class CryptoDirectionConfig(BaseModel):
     hard_exit_retry_cooldown_seconds: float = 2.0
     hard_exit_dust_shares: float = 0.25
     hard_exit_final_seconds: int = 30
+    # Post-fill grace period: suppresses ordinary stop for N seconds after Phase-1
+    # fill, preventing premature exits on the wide bid-ask spread right after a FOK
+    # taker fill. Only a deep catastrophic stop fires during the grace window.
+    hard_exit_min_hold_seconds: float = 0.0
+    hard_exit_min_hold_catastrophic_stop: float = 0.0
 
     # ── Early exit layers ────────────────────────────────────────────────────
     shallow_reversal_drop_threshold: float = 0.02  # cents drop from peak to trigger reversal sell (Layer 1)

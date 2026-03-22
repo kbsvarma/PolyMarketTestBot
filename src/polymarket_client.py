@@ -216,6 +216,34 @@ class PolymarketClient:
             if numeric > 0:
                 return numeric
 
+        # Polymarket's CLOB API returns actual execution prices inside an
+        # "ordersFilled" list on the placement response.  Compute the
+        # size-weighted average fill price from those fills so we record
+        # the real execution price, not just the limit price the order was
+        # submitted at (which can be materially different for taker fills
+        # where the market offers a better price than the limit).
+        for source in (payload, raw if isinstance(raw, dict) else {}):
+            fills = source.get("ordersFilled") or source.get("fills") or source.get("trades") or []
+            if fills and isinstance(fills, list):
+                total_notional = 0.0
+                total_size = 0.0
+                for fill in fills:
+                    if not isinstance(fill, dict):
+                        continue
+                    try:
+                        fp = float(fill.get("price") or fill.get("avg_price") or 0.0)
+                        fs = float(fill.get("size") or fill.get("matched_amount") or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    if fp > 0 and fs > 0:
+                        total_notional += fp * fs
+                        total_size += fs
+                if total_size > 0:
+                    return round(total_notional / total_size, 6)
+
+        # Last resort: use the order's limit price as the fill price.
+        # This is correct for resting limit orders that filled exactly at
+        # their limit, but may understate profit for taker fills.
         if self._extract_order_filled_size(payload) > 0:
             fallback_candidates = [payload.get("price")]
             if isinstance(raw, dict):
