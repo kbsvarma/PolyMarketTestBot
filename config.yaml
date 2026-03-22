@@ -508,9 +508,10 @@ crypto_direction_profiles:
     shallow_reversal_drop_threshold: 0.02
     crossback_stop_buffer: 0.05
     use_websocket_feed: true
-    hard_exit_emergency_min_sell_price: 0.15  # was 0.40 — token-invisible crash (9:15PM): bot tried 0.40
-                                               # but actual bid was 0.17; 0.40 floor blocked all sells;
-                                               # 0.15 allows recovery even in deep liquidity collapse
+    hard_exit_min_sell_price: 0.10             # override base 0.40 — ladder goes down to 10c normally
+    hard_exit_emergency_min_sell_price: 0.01   # was 0.15; code NOW reads this on retries (include_emergency=True)
+                                               # 0.40 floor was blocking ALL sells when bid crashed to 0.24
+    hard_exit_market_through_cents: 0.02       # enable mark-anchored floor extension (required for has_fallback_ladder gate)
     hard_exit_dust_shares: 0.25
     hard_exit_high_entry_price: 0.64      # explicit override: entries ≥64c use tighter stop
     hard_exit_high_entry_stop_price: 0.54 # tighter stop for 64c+ fills; max loss = (0.65-0.54)*5 = $0.55
@@ -529,6 +530,10 @@ crypto_direction_profiles:
     window_report_path: "logs/window_report_pm_btc_15m.md"
     shadow_execution_log_path: "logs/bracket_trades_pm_btc_15m.jsonl"
     bracket_audit_log_path: "logs/bracket_trades_pm_btc_15m.jsonl"
+    # Allow up to 2 concurrent brackets: once BRACKET_COMPLETE (both legs locked),
+    # the slot is freed immediately so the next window can enter.  A second slot
+    # is needed for the overlap window while the first bracket waits for settlement.
+    max_concurrent_brackets: 2
 
   kalshi_btc_5m:
     venue: "kalshi"

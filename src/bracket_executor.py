@@ -109,6 +109,9 @@ class BracketPosition:
     p2_notional_usd: float = 0.0
     p2_order_id:     str = ""
     p2_fill_price:   float = 0.0  # = p2_price for FOLLOW_TAKER
+    # Actual shares filled by Phase 2 (may be < p2_shares for near-full fills).
+    # Used at settlement instead of p2_shares so fractional remainders are ignored.
+    p2_actual_filled_shares: float = 0.0
 
     # ── Runtime monitoring ───────────────────────────────────────────────
     phase:                BracketPhase = BracketPhase.PHASE1_PENDING
@@ -780,13 +783,25 @@ class BracketExecutor:
             float(getattr(self._cfg, "hard_exit_fallback_step_cents", 0.0) or 0.0),
             0.0,
         )
-        min_sell_price = round(
+        normal_floor = round(
             max(
                 0.01,
                 float(getattr(self._cfg, "hard_exit_min_sell_price", 0.01) or 0.01),
             ),
             4,
         )
+        # On emergency retries, use the emergency floor — which must be ≤ normal
+        # floor so the ladder extends further down into crashing markets.
+        # This is the ONLY path that wires hard_exit_emergency_min_sell_price into
+        # the sell-price ladder; without it the config key has no effect.
+        emergency_floor = round(
+            max(
+                0.01,
+                float(getattr(self._cfg, "hard_exit_emergency_min_sell_price", normal_floor) or normal_floor),
+            ),
+            4,
+        )
+        min_sell_price = min(normal_floor, emergency_floor) if include_emergency else normal_floor
         attempt_prices = [primary_sell_price]
         fallback_prices: list[float] = []
         if market_through_cents > 0:
@@ -804,14 +819,16 @@ class BracketExecutor:
             if candidate < primary_sell_price and candidate not in attempt_prices:
                 attempt_prices.append(candidate)
         # Mark-anchored floor extension: when the market has crashed below the
-        # configured ladder floor (hard_exit_min_sell_price), append a last-resort
-        # price just below the current mark so we always have at least one attempt
-        # in the same price neighbourhood as actual buyers.  Without this, every
-        # retry tick tries [0.50 → 0.40] while buyers are at 0.25 and we never fill.
-        # Only applies when a fallback ladder is active (market_through_cents > 0);
-        # when market_through is explicitly disabled, no implicit fallback is added.
-        if mark is not None and mark > 0 and market_through_cents > 0:
-            mark_floor = round(max(0.01, mark - 0.02), 4)
+        # ladder floor, append a last-resort price just below the current mark so
+        # we always have at least one attempt in the same price neighbourhood as
+        # actual buyers.  Without this, the bot retries [0.54→0.40] every tick
+        # while real buyers sit at 0.24 and we never fill.
+        # NOTE: this is intentionally independent of market_through_cents — the
+        # old gate (market_through_cents > 0) was the bug that disabled it.
+        if mark is not None and mark > 0 and has_fallback_ladder:
+            # Offset 0.08 instead of 0.02: thin Polymarket books have wide spreads;
+            # the bid is often 5–15c below the mark and 0.02 never reaches it.
+            mark_floor = round(max(0.01, mark - 0.08), 4)
             if mark_floor < (min(attempt_prices) - 1e-6):
                 attempt_prices.append(mark_floor)
         return attempt_prices
@@ -891,18 +908,22 @@ class BracketExecutor:
             return False
 
         # ── Guard: max concurrent positions ──────────────────────────────
+        # BRACKET_COMPLETE is intentionally excluded: both legs are already locked
+        # (profit guaranteed) and the position is just waiting for window settlement.
+        # Excluding it frees the slot immediately after Phase 2 fills, so the next
+        # window can enter without waiting up to ~15 minutes for the window to close.
         active = sum(
             1 for p in self._positions.values()
             if p.phase in (
                 BracketPhase.PHASE1_PENDING,
                 BracketPhase.PHASE1_FILLED,
                 BracketPhase.PHASE2_PENDING,
-                BracketPhase.BRACKET_COMPLETE,
             )
         )
         if active >= self._cfg.max_concurrent_brackets:
             logger.warning(
-                "BracketExecutor: max_concurrent_brackets={} reached — skip",
+                "BracketExecutor: max_concurrent_brackets={} reached — skip  "
+                "(BRACKET_COMPLETE positions do not count toward this limit)",
                 self._cfg.max_concurrent_brackets,
             )
             self._filter_stats["CONCURRENT_SKIP"] = self._filter_stats.get("CONCURRENT_SKIP", 0) + 1
@@ -2211,14 +2232,17 @@ class BracketExecutor:
             if catastrophic_floor <= 0 or momentum_ask > catastrophic_floor:
                 return  # inside grace window — wait for confirmed reversal
 
-        # Sell at bid, walk down two steps if needed
+        # Sell at bid, walk down to capture real buyers in thin/crashing books
         sellable_bid = yes_bid if pos.momentum_side == "YES" else no_bid
         start_price = round(sellable_bid if sellable_bid > 0 else max(0.01, momentum_ask - 0.02), 2)
-        attempt_prices = [
-            start_price,
-            round(max(0.01, start_price - 0.01), 2),
-            round(max(0.01, start_price - 0.02), 2),
-        ]
+        sr_floor = round(max(0.01, start_price - 0.15), 2)
+        attempt_prices: list[float] = []
+        p = start_price
+        while p >= sr_floor - 1e-9:
+            attempt_prices.append(round(p, 2))
+            p = round(p - 0.02, 2)
+        if not attempt_prices:
+            attempt_prices = [start_price]
 
         entry = pos.p1_fill_price or pos.p1_price
         logger.info(
@@ -2390,11 +2414,16 @@ class BracketExecutor:
 
         sellable_bid = yes_bid if pos.momentum_side == "YES" else no_bid
         start_price = round(sellable_bid if sellable_bid > 0 else max(0.01, momentum_ask - 0.02), 2)
-        attempt_prices = [
-            start_price,
-            round(max(0.01, start_price - 0.01), 2),
-            round(max(0.01, start_price - 0.02), 2),
-        ]
+        # Extended ladder — old 3-price [start, -1c, -2c] stopped at 0.40 while
+        # actual bid was at 0.26–0.37. Chase 15c below start to find real buyers.
+        cb_floor = round(max(0.01, start_price - 0.15), 2)
+        attempt_prices: list[float] = []
+        p = start_price
+        while p >= cb_floor - 1e-9:
+            attempt_prices.append(round(p, 2))
+            p = round(p - 0.02, 2)
+        if not attempt_prices:
+            attempt_prices = [start_price]
 
         logger.info(
             "BracketExecutor: ▶ Crossback stop (never armed)  asset={}  entry={:.4f}  "
@@ -2839,6 +2868,7 @@ class BracketExecutor:
                     })
                     return
                 pos.p2_fill_price = fill_price
+                pos.p2_actual_filled_shares = pos.p2_shares   # FOK fills fully or not at all
                 pos.phase = BracketPhase.BRACKET_COMPLETE
             else:
                 # PASSIVE_LIMIT: order placed, will be confirmed later via poll
@@ -2985,13 +3015,16 @@ class BracketExecutor:
         filled_size = float(payload.get("filled_size") or 0.0)
         avg_price = float(payload.get("average_fill_price") or 0.0) or pos.p2_price
 
+        # Tolerance of 0.5 shares handles API rounding noise (e.g. 4.9999 vs 5.0)
+        # and genuine near-full fills — fractional remainder is silently ignored.
         fully_filled = (
             status in {"FILLED", "MATCHED"}
-            or (filled_size > 0 and filled_size >= pos.p2_shares - 1e-6)
+            or (filled_size > 0 and filled_size >= pos.p2_shares - 0.5)
         )
 
         if fully_filled:
             pos.p2_fill_price = avg_price
+            pos.p2_actual_filled_shares = filled_size if filled_size > 0 else pos.p2_shares
             pos.p2_resting_order_id = ""
             pos.phase = BracketPhase.BRACKET_COMPLETE
             x_cost = pos.p1_fill_price or pos.p1_price
@@ -3118,8 +3151,15 @@ class BracketExecutor:
                     x * (1.0 + taker_fee(x, category="crypto price"))
                     + y * (1.0 + taker_fee(y, category="crypto price"))
                 )
+                # Use the smaller of the two leg sizes — near-full Phase 2 fills
+                # (e.g. 4.7 of 5.0 shares) leave a tiny unhedged remainder that
+                # we intentionally ignore rather than try to trade out.
+                settled_shares = min(
+                    pos.p1_shares,
+                    pos.p2_actual_filled_shares if pos.p2_actual_filled_shares > 0 else pos.p1_shares,
+                )
                 # One token pays $1/share, other pays $0/share → net = $1/share
-                pos.actual_pnl_usd = round(pos.actual_pnl_usd + (1.0 - cost) * pos.p1_shares, 4)
+                pos.actual_pnl_usd = round(pos.actual_pnl_usd + (1.0 - cost) * settled_shares, 4)
                 # Terminal state — frees concurrency slot for next window
                 pos.phase = BracketPhase.BRACKET_SETTLED
                 logger.info(
@@ -3265,18 +3305,21 @@ class BracketExecutor:
         filled_size = float(payload.get("filled_size") or 0.0)
         avg_price   = float(payload.get("average_fill_price") or 0.0) or pos.p2_price
 
+        # Tolerance of 0.5 shares handles API rounding noise and near-full fills;
+        # fractional remainder is silently ignored (see p2_actual_filled_shares).
         fully_filled = (
             status in {"FILLED", "MATCHED"}
-            or (filled_size > 0 and filled_size >= pos.p2_shares - 1e-6)
+            or (filled_size > 0 and filled_size >= pos.p2_shares - 0.5)
         )
 
         if fully_filled:
             # Race: the order filled between our cancel decision and the exchange
             # processing it.  Treat as a successful bracket — no hard exit needed.
-            pos.p2_fill_price       = avg_price
-            pos.p2_resting_order_id = ""
-            pos.p2_order_id         = ""
-            pos.phase               = BracketPhase.BRACKET_COMPLETE
+            pos.p2_fill_price             = avg_price
+            pos.p2_actual_filled_shares   = filled_size if filled_size > 0 else pos.p2_shares
+            pos.p2_resting_order_id       = ""
+            pos.p2_order_id               = ""
+            pos.phase                     = BracketPhase.BRACKET_COMPLETE
             x_cost = pos.p1_fill_price or pos.p1_price
             guaranteed = round(
                 1.0
